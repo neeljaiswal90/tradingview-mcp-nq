@@ -44,7 +44,7 @@
 import type { CandidateSetup, MarketRegime, MarketSnapshot, SetupFamily, IndicatorConfig } from '../types.js';
 import type { ExtensionFeatures } from './extension.js';
 import type { MicrostructureScoreResult } from './microstructure-score.js';
-import { getSetupFamily } from '../management-profiles.js';
+import { getSetupFamily, getManagementProfile, resolveProfile } from '../management-profiles.js';
 
 // ── Result Type ──────────────────────────────────────────────────────────────
 
@@ -206,47 +206,36 @@ function computeStructureAdj(
 
 // ── Management PT Offset Resolution ──────────────────────────────────────────
 //
-// Resolve management-aligned PT1/PT2 offsets using the same logic as
-// management-profiles.ts resolveProfile(), but without requiring the full
-// ManagementProfile object. Uses config management_profiles when available.
+// Uses the CANONICAL resolveProfile() from management-profiles.ts to compute
+// PT1/PT2 offsets. This ensures the reward plan and live management use
+// exactly the same resolution path — no duplicate ATR/fallback logic.
 
 interface PtOffsets {
   pt1_offset_pts: number;
   pt2_offset_pts: number;
 }
 
+/** NQ/MNQ tick size used for ContractSpec stub when only PT offsets are needed. */
+const NQ_TICK_SIZE = 0.25;
+
 function resolvePtOffsets(
-  family: SetupFamily,
+  setupType: string,
+  regime: MarketRegime,
   atr: number | null,
   config: IndicatorConfig,
-  tickSize: number,
 ): PtOffsets {
-  const profiles = config.management_profiles;
-  const profile = profiles?.[family] ?? profiles?.['default'];
-
-  if (!profile) {
-    // Absolute fallback: 0.5 ATR for PT1, 1.2 ATR for PT2, or fixed points
-    const atrValid = atr !== null && atr > 0;
-    return {
-      pt1_offset_pts: atrValid ? Math.max(tickSize, atr * 0.5) : 6,
-      pt2_offset_pts: atrValid ? Math.max(tickSize * 5, atr * 1.2) : 15,
-    };
-  }
-
-  const atrValid = atr !== null && atr > 0;
-  const pt1Raw = (profile.pt1_offset_atr > 0 && atrValid)
-    ? atr! * profile.pt1_offset_atr
-    : profile.pt1_offset_pts_fallback;
-  const pt2Raw = (profile.pt2_offset_atr > 0 && atrValid)
-    ? atr! * profile.pt2_offset_atr
-    : profile.pt2_offset_pts_fallback;
-
-  const pt1 = Math.max(tickSize, pt1Raw);
-  let pt2 = Math.max(tickSize, pt2Raw);
-  const minPt2 = pt1 + 4 * tickSize;
-  if (pt2 <= minPt2) pt2 = minPt2;
-
-  return { pt1_offset_pts: round2(pt1), pt2_offset_pts: round2(pt2) };
+  // Use the same profile lookup + ATR resolution as live management.
+  // The ContractSpec stub only needs tick_size for PT offset clamping.
+  const profile = getManagementProfile(setupType as import('../types.js').SetupType, regime, config);
+  const resolved = resolveProfile(profile, atr, {
+    root: 'NQ', display: 'NQ', tv_symbol: 'CME_MINI:NQ1!', app_symbol: 'NQ1!',
+    venue: 'CME_MINI', point_value: 20, tick_size: NQ_TICK_SIZE,
+    tick_value: 5, price_decimals: 2, is_micro: false,
+  } as import('../contracts.js').ContractSpec);
+  return {
+    pt1_offset_pts: round2(resolved.pt1_offset_pts),
+    pt2_offset_pts: round2(resolved.pt2_offset_pts),
+  };
 }
 
 // ── Quality Band Classification ──────────────────────────────────────────────
@@ -288,7 +277,6 @@ export function buildDynamicRewardPlan(
   const family = getSetupFamily(setup.setup_type);
   const direction = setup.direction as 'long' | 'short';
   const atr = snap.indicators_1m?.atr_14 ?? null;
-  const tickSize = 0.25; // NQ/MNQ tick size
 
   // ── Step 1: Resolve baseline min RR by family ───────────────────────
   const rr_base = dynamicConfig.family_baselines[family]
@@ -318,7 +306,7 @@ export function buildDynamicRewardPlan(
   const rr_gate_pass = setup.rr_t1 >= dynamic_min_rr;
 
   // ── Step 7: Resolve management-aligned PT offsets ───────────────────
-  const pt = resolvePtOffsets(family, atr, config, tickSize);
+  const pt = resolvePtOffsets(setup.setup_type, regime, atr, config);
   const mgmt_pt1_implied_rr = setup.risk_pts > 0
     ? round2(pt.pt1_offset_pts / setup.risk_pts)
     : 0;
@@ -362,8 +350,8 @@ export function buildLegacyRewardPlan(
 ): DynamicRewardPlan {
   const family = getSetupFamily(setup.setup_type);
   const atr = snap.indicators_1m?.atr_14 ?? null;
-  const tickSize = 0.25;
-  const pt = resolvePtOffsets(family, atr, config, tickSize);
+  const regime: MarketRegime = 'trending_up'; // legacy plan doesn't vary by regime
+  const pt = resolvePtOffsets(setup.setup_type, regime, atr, config);
 
   return {
     dynamic_min_rr: config.min_rr,

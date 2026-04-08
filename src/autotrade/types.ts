@@ -585,6 +585,8 @@ export interface DirectionalCandidate {
   scoreBreakdown: ScoreBreakdown;
   hardGateFailures: string[];
   passedHardGates: boolean;
+  /** Dynamic reward plan built at candidate evaluation time (null when disabled). */
+  rewardPlan: import('./features/dynamic-reward-plan.js').DynamicRewardPlan | null;
 }
 
 /**
@@ -628,6 +630,10 @@ export interface DualDirectionResult {
   tradeAllowed: boolean;
   skipReasons: string[];
   mlFeatures: SignalContextSnapshot;
+  /** Whether upstream dynamic RR was active for this signal cycle. */
+  dynamicRrUpstreamActive: boolean;
+  /** Source of the upstream dynamic RR config: 'default' | 'config' | 'argument' | 'explicit_disable'. */
+  dynamicRrSource: string;
 }
 
 // ─── Signal (logged for every cycle) ────────────────────────────────────────

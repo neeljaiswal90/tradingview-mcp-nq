@@ -923,12 +923,14 @@ async function main(): Promise<void> {
     let microAdj: MicroAdjustmentResult | null = null;
     let microInfluencedSelection = false;
 
-    // Dynamic reward plan — canonical source for RR gating and management alignment
+    // Dynamic reward plan — the upstream plan from generateSignal() handles the
+    // canonical family+regime RR gate. Here we refine it with extension/micro data.
     const dynamicRewardConfig: DynamicRewardConfig = {
       ...DEFAULT_DYNAMIC_REWARD_CONFIG,
       ...effectiveConfig.dynamic_reward_planning,
     };
-    let rewardPlan: DynamicRewardPlan | null = null;
+    // Start with the upstream plan already computed inside generateSignal()
+    let rewardPlan: DynamicRewardPlan | null = dualResult.chosen?.rewardPlan ?? null;
 
     if (bestSetup) {
       const entryMid = (bestSetup.entry_low + bestSetup.entry_high) / 2;
@@ -995,15 +997,26 @@ async function main(): Promise<void> {
         );
       }
 
-      // ── Dynamic reward plan ────────────────────────────────────────────────
-      // Build the canonical reward plan: dynamic min RR + management-aligned PT offsets.
-      // Uses extension features and microstructure score when available.
-      if (dynamicRewardConfig.enabled) {
+      // ── Dynamic reward plan: two-stage design ────────────────────────────
+      //
+      // Stage 1 ("strategy_base"): Built inside generateSignal() per-candidate.
+      //   Uses: setup family + market regime. No extension/micro data yet.
+      //   Purpose: canonical upstream RR gate — decides which candidates survive.
+      //
+      // Stage 2 ("runner_refined"): Rebuilt here with full context.
+      //   Uses: family + regime + extension features + microstructure score.
+      //   Purpose: refined RR gate for risk check, and diagnostics logging.
+      //   The upstream plan already allowed the candidate through; this refinement
+      //   can only make the dynamic_min_rr MORE or LESS strict via structure/micro
+      //   adjustments, but the candidate was already selected.
+      //
+      if (dynamicRewardConfig.enabled && (extensionFeatures || microScore)) {
         rewardPlan = buildDynamicRewardPlan(
           bestSetup, snap, regime, effectiveConfig,
           extensionFeatures, microScore, dynamicRewardConfig,
         );
-      } else {
+      } else if (!rewardPlan) {
+        // Fallback: no upstream plan (dynamic explicitly disabled) — build legacy
         rewardPlan = buildLegacyRewardPlan(bestSetup, effectiveConfig, snap);
       }
 
@@ -1072,6 +1085,12 @@ async function main(): Promise<void> {
         dynamic_mgmt_pt1_offset_pts: rewardPlan?.mgmt_pt1_offset_pts ?? null,
         dynamic_mgmt_pt2_offset_pts: rewardPlan?.mgmt_pt2_offset_pts ?? null,
         dynamic_quality_band: rewardPlan?.quality_band ?? null,
+        // Upstream dynamic RR activation diagnostics
+        dynamic_rr_upstream_active: dualResult.dynamicRrUpstreamActive,
+        dynamic_rr_source: dualResult.dynamicRrSource,
+        // Two-stage plan: 'strategy_base' = upstream family+regime only;
+        // 'runner_refined' = after extension+micro adjustments in runner
+        dynamic_rr_stage: (extensionFeatures || microScore) ? 'runner_refined' : 'strategy_base',
       });
 
       if (extensionVetoed) {
@@ -1191,14 +1210,38 @@ async function main(): Promise<void> {
           const tradeId = `TRADE_${sessionId}_${String(totalSignals).padStart(4, '0')}`;
 
           // ── Resolve management profile for this setup type ─────────────
+          // The profile provides trailing, BE, time-stop parameters.
+          // PT1/PT2 offsets are unified with the reward plan when available,
+          // so entry validation and live management use the same targets.
           const atrAtEntry = snap.indicators_1m?.atr_14 ?? null;
           const mgmtProfile = getManagementProfile(bestSetup.setup_type, regime, effectiveConfig);
           const resolvedMgmt = resolveProfile(mgmtProfile, atrAtEntry, contract);
+
+          // ── Unify PT1/PT2 with reward plan (canonical target truth) ─────
+          // When the reward plan provides PT offsets, override the resolved
+          // management PT1/PT2 so the position manager uses the same values
+          // that the RR gate validated. Trail/BE/time-stop stay profile-driven.
+          let targetTruthSource = 'management_profile';
+          if (rewardPlan && rewardPlan.mgmt_pt1_offset_pts > 0) {
+            const profilePt1 = resolvedMgmt.pt1_offset_pts;
+            const profilePt2 = resolvedMgmt.pt2_offset_pts;
+            resolvedMgmt.pt1_offset_pts = rewardPlan.mgmt_pt1_offset_pts;
+            resolvedMgmt.pt2_offset_pts = rewardPlan.mgmt_pt2_offset_pts;
+            targetTruthSource = 'reward_plan';
+            if (Math.abs(profilePt1 - rewardPlan.mgmt_pt1_offset_pts) > 0.01 ||
+                Math.abs(profilePt2 - rewardPlan.mgmt_pt2_offset_pts) > 0.01) {
+              console.log(
+                `[MGMT] PT unified: profile PT1=${profilePt1.toFixed(1)} PT2=${profilePt2.toFixed(1)} ` +
+                `→ reward_plan PT1=${rewardPlan.mgmt_pt1_offset_pts.toFixed(1)} PT2=${rewardPlan.mgmt_pt2_offset_pts.toFixed(1)}`,
+              );
+            }
+          }
+
           console.log(
             `[MGMT] Resolved: profile='${resolvedMgmt.profile_name}' ` +
             `PT1=${resolvedMgmt.pt1_offset_pts.toFixed(1)}pts PT2=${resolvedMgmt.pt2_offset_pts.toFixed(1)}pts ` +
             `Trail=${resolvedMgmt.trail_ticks_post_t1}tk TimeStop=${resolvedMgmt.time_stop_minutes}min ` +
-            `ATR=${atrAtEntry?.toFixed(1) ?? 'n/a'}`,
+            `ATR=${atrAtEntry?.toFixed(1) ?? 'n/a'} source=${targetTruthSource}`,
           );
 
           const position = PositionManager.buildPosition(
@@ -1244,6 +1287,15 @@ async function main(): Promise<void> {
               mgmt_pt2_pts: rewardPlan.mgmt_pt2_offset_pts,
               rr_components: rewardPlan.rr_components,
             } : null,
+            // Unified target diagnostics — confirms entry and management are aligned
+            target_truth: {
+              source: targetTruthSource,
+              live_pt1_offset_pts: resolvedMgmt.pt1_offset_pts,
+              live_pt2_offset_pts: resolvedMgmt.pt2_offset_pts,
+              setup_target_1: bestSetup.target_1,
+              setup_target_2: bestSetup.target_2,
+              setup_rr_t1: bestSetup.rr_t1,
+            },
           });
 
           cycleChangeNote = `NEW TRADE: ${bestSetup.direction.toUpperCase()} ${sizing.quantity} ${contract.root} @ ${entryResult.fill_price} | Stop: ${bestSetup.stop} | T1: ${bestSetup.target_1} (${bestSetup.rr_t1}R)`;

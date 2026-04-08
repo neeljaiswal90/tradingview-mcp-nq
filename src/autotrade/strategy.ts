@@ -31,7 +31,8 @@ import type {
 import type { IndicatorConfig } from './types.js';
 import type { ContractSpec } from './contracts.js';
 import { roundToTickAwayFromEntry, priceToTicks } from './contracts.js';
-import type { DynamicRewardPlan } from './features/dynamic-reward-plan.js';
+import { buildDynamicRewardPlan, buildLegacyRewardPlan, DEFAULT_DYNAMIC_REWARD_CONFIG } from './features/dynamic-reward-plan.js';
+import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-reward-plan.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -674,8 +675,10 @@ function genBreakdownRetestShort(snap: MarketSnapshot): CandidateSetup | null {
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
 
-  if (rrt1 < 1.0) return null; // T1 must have at least 1R potential
-  if (rrt1 <= 0 || rrt2 <= 0) return null; // defensive: reject invalid R:R
+  // Structural sanity: target must be at least 1R from entry.
+  // Policy-level RR gating is handled by the dynamic reward plan in applyHardGates().
+  if (rrt1 < 1.0) return null;
+  if (rrt1 <= 0 || rrt2 <= 0) return null;
 
   const factors: string[] = ['breakdown_retest_zone_identified', 'bos_sell_overhead'];
   if (ind.supertrend_direction === 'down') factors.push('supertrend_down_confirming');
@@ -735,7 +738,8 @@ function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
 
-  if (rrt1 < 1.5) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
   if (rrt1 <= 0 || rrt2 <= 0) return null;
 
   const setup = {
@@ -795,7 +799,8 @@ function genBreakdownMomentumShort(snap: MarketSnapshot): CandidateSetup | null 
 
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
-  if (rrt1 < 1.5) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
   if (rrt1 <= 0 || rrt2 <= 0) return null;
 
   const setup = {
@@ -857,7 +862,8 @@ function genTrendPullbackLong(snap: MarketSnapshot): CandidateSetup | null {
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
 
-  if (rrt1 < 1.5) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
   if (rrt1 <= 0 || rrt2 <= 0) return null;
 
   const setup = {
@@ -917,7 +923,8 @@ function genBreakoutRetestLong(snap: MarketSnapshot): CandidateSetup | null {
   const t2 = clampTarget(kl.pivot_resistance[1] ?? null, entryMid, riskPts, 4, dir);
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
-  if (rrt1 < 1.5) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
   if (rrt1 <= 0 || rrt2 <= 0) return null;
 
   const setup = {
@@ -971,7 +978,8 @@ function genOpeningDriveContinuationLong(snap: MarketSnapshot): CandidateSetup |
   const t2 = entryMid + orRange * 1.75;
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
-  if (rrt1 < 1.2) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
 
   const setup = {
     direction: dir,
@@ -1016,7 +1024,8 @@ function genOpeningDriveContinuationShort(snap: MarketSnapshot): CandidateSetup 
   const t2 = entryMid - orRange * 1.75;
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
-  if (rrt1 < 1.2) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
 
   const setup = {
     direction: dir,
@@ -1071,7 +1080,8 @@ function genFailedOrBreakShort(snap: MarketSnapshot): CandidateSetup | null {
   const t2 = orLow;
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
-  if (rrt1 < 1.2) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
 
   const setup = {
     direction: dir,
@@ -1119,7 +1129,8 @@ function genFailedOrBreakLong(snap: MarketSnapshot): CandidateSetup | null {
   const t2 = orHigh;
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
-  if (rrt1 < 1.2) return null;
+  // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
+  if (rrt1 < 1.0) return null;
 
   const setup = {
     direction: dir,
@@ -1827,9 +1838,39 @@ export function generateSignal(
   snap: MarketSnapshot,
   config: IndicatorConfig,
   contract?: ContractSpec,
+  dynamicRewardConfig?: DynamicRewardConfig | null,
 ): DualDirectionResult {
   const regime = classifyRegime(snap);
   const bias = assessMultiTfBias(snap);
+  // Resolve dynamic reward config.
+  //
+  // Priority order:
+  //   1. Explicit argument (passed by caller, e.g., tests)
+  //   2. Config-embedded block (merged with defaults for any missing fields)
+  //   3. DEFAULT_DYNAMIC_REWARD_CONFIG (active by default when config is silent)
+  //
+  // Dynamic RR is ONLY disabled when config.dynamic_reward_planning.enabled === false.
+  // Absence of the config block means "use defaults" — NOT "disable."
+  // This is consistent with the config printer and runner, which both treat
+  // absence as active.
+  let drpSource: 'argument' | 'config' | 'default' | 'explicit_disable' = 'default';
+  const drpConfig: DynamicRewardConfig | null = (() => {
+    // 1. Explicit argument takes precedence
+    if (dynamicRewardConfig !== undefined) {
+      drpSource = dynamicRewardConfig === null ? 'explicit_disable' : 'argument';
+      return dynamicRewardConfig;
+    }
+    // 2. Config block present — merge with defaults, respect enabled flag
+    if (config.dynamic_reward_planning) {
+      const merged = { ...DEFAULT_DYNAMIC_REWARD_CONFIG, ...config.dynamic_reward_planning };
+      if (!merged.enabled) { drpSource = 'explicit_disable'; return null; }
+      drpSource = 'config';
+      return merged;
+    }
+    // 3. Config block absent — active by default
+    drpSource = 'default';
+    return DEFAULT_DYNAMIC_REWARD_CONFIG;
+  })();
 
   // ── Step 1: Generate all candidate setups ────────────────────────────────
   const generators: Array<(s: MarketSnapshot) => CandidateSetup | null> = [
@@ -1884,14 +1925,30 @@ export function generateSignal(
   function buildDirectionalCandidate(scored: ScoredCandidate | undefined): DirectionalCandidate | null {
     if (!scored) return null;
     const { setup, breakdown } = scored;
+
+    // Build dynamic reward plan for THIS candidate (family+regime aware).
+    // Extension features and microstructure score are not yet available at
+    // strategy time — they'll be added as a second-pass refinement in runner.ts.
+    // The core family baseline + regime adjustment is sufficient for the RR gate.
+    let rewardPlan: DynamicRewardPlan | null = null;
+    if (drpConfig && drpConfig.enabled) {
+      rewardPlan = buildDynamicRewardPlan(
+        setup, snap, regime, config,
+        null,  // extension features (not yet computed)
+        null,  // microstructure score (not yet available)
+        drpConfig,
+      );
+    }
+
     // Reuse the pre-computed breakdown — no second scoreConfidenceDetailed() call
-    const gates = applyHardGates(setup, setup.confidence, bias, regime, snap, config);
+    const gates = applyHardGates(setup, setup.confidence, bias, regime, snap, config, rewardPlan);
     return {
       setup,
       score: setup.confidence,
       scoreBreakdown: breakdown,
       hardGateFailures: gates,
       passedHardGates: gates.length === 0,
+      rewardPlan,
     };
   }
 
@@ -1952,5 +2009,7 @@ export function generateSignal(
     tradeAllowed,
     skipReasons,
     mlFeatures,
+    dynamicRrUpstreamActive: drpConfig !== null,
+    dynamicRrSource: drpSource,
   };
 }
