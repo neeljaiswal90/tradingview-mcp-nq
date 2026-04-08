@@ -13,6 +13,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   computeMicrostructureScore,
+  computeMicroAdjustment,
   getSetupFamily,
   DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG,
 } from '../../src/autotrade/features/microstructure-score.js';
@@ -460,5 +461,116 @@ describe('Configuration', () => {
 
   it('default config is enabled', () => {
     expect(DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG.enabled).toBe(true);
+  });
+
+  it('default config has asymmetric bounds', () => {
+    expect(DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG.max_positive_adj).toBeGreaterThan(0);
+    expect(DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG.max_negative_adj).toBeGreaterThan(0);
+    // Positive cap >= negative cap (easier to boost than demote)
+    expect(DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG.max_positive_adj)
+      .toBeGreaterThanOrEqual(DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG.max_negative_adj);
+  });
+});
+
+// ── computeMicroAdjustment ───────────────────────────────────────────────────
+
+describe('computeMicroAdjustment', () => {
+  const cfg = DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG;
+
+  function makeScore(total: number, quality: 'good' | 'partial' | 'minimal' | 'none' = 'partial'): MicrostructureScoreResult {
+    return {
+      total,
+      directional: total * 0.5, imbalance: total * 0.2, absorption: total * 0.1,
+      queue: total * 0.1, sweep: total * 0.1, profile: 0,
+      reasons: [], warnings: [],
+      data_quality: quality, setup_family: 'trend_continuation',
+      components_available: quality === 'none' ? 0 : 3,
+    };
+  }
+
+  it('returns no adjustment when overlay is disabled', () => {
+    const result = computeMicroAdjustment(makeScore(1.0), 8.0, { ...cfg, enabled: false });
+    expect(result.applied).toBe(false);
+    expect(result.adjustment).toBe(0);
+    expect(result.final_confidence).toBe(8.0);
+  });
+
+  it('returns no adjustment when multiplier is zero', () => {
+    const result = computeMicroAdjustment(makeScore(1.0), 8.0, { ...cfg, multiplier: 0 });
+    expect(result.applied).toBe(false);
+    expect(result.adjustment).toBe(0);
+  });
+
+  it('returns no adjustment when data quality is none', () => {
+    const result = computeMicroAdjustment(makeScore(1.0, 'none'), 8.0, cfg);
+    expect(result.applied).toBe(false);
+    expect(result.reason).toContain('no_lob_data');
+  });
+
+  it('positive score increases confidence within bounds', () => {
+    const result = computeMicroAdjustment(makeScore(1.5), 7.5, cfg);
+    expect(result.applied).toBe(true);
+    expect(result.adjustment).toBeGreaterThan(0);
+    expect(result.final_confidence).toBeGreaterThan(7.5);
+    // Bounded by max_positive_adj
+    expect(result.adjustment).toBeLessThanOrEqual(cfg.max_positive_adj);
+  });
+
+  it('negative score decreases confidence within bounds', () => {
+    const result = computeMicroAdjustment(makeScore(-1.5), 8.0, cfg);
+    expect(result.applied).toBe(true);
+    expect(result.adjustment).toBeLessThan(0);
+    expect(result.final_confidence).toBeLessThan(8.0);
+    // Bounded by max_negative_adj
+    expect(Math.abs(result.adjustment)).toBeLessThanOrEqual(cfg.max_negative_adj);
+  });
+
+  it('caps positive adjustment at max_positive_adj', () => {
+    // score=2.0 × multiplier=0.5 = 1.0, but max_positive_adj=0.8
+    const result = computeMicroAdjustment(makeScore(2.0), 7.0, cfg);
+    expect(result.adjustment).toBeLessThanOrEqual(cfg.max_positive_adj);
+  });
+
+  it('caps negative adjustment at max_negative_adj', () => {
+    // score=-2.0 × multiplier=0.5 = -1.0, but max_negative_adj=0.6
+    const result = computeMicroAdjustment(makeScore(-2.0), 8.0, cfg);
+    expect(Math.abs(result.adjustment)).toBeLessThanOrEqual(cfg.max_negative_adj);
+  });
+
+  it('confidence stays clamped to [0, 10]', () => {
+    const highResult = computeMicroAdjustment(makeScore(2.0), 9.8, cfg);
+    expect(highResult.final_confidence).toBeLessThanOrEqual(10);
+
+    const lowResult = computeMicroAdjustment(makeScore(-2.0), 0.3, cfg);
+    expect(lowResult.final_confidence).toBeGreaterThanOrEqual(0);
+  });
+
+  it('includes reason string with raw score and multiplier', () => {
+    const result = computeMicroAdjustment(makeScore(1.0), 7.5, cfg);
+    expect(result.reason).toContain('micro:');
+    expect(result.reason).toContain('raw=');
+  });
+
+  it('near-miss promotion: boost from 7.3 to above 7.5 threshold', () => {
+    // Score +1.2 × 0.5 = +0.6 → rounds to +0.5 confidence
+    // 7.3 + 0.5 = 7.8 → above typical min_confidence of 7.5
+    const result = computeMicroAdjustment(makeScore(1.2), 7.3, cfg);
+    expect(result.applied).toBe(true);
+    expect(result.final_confidence).toBeGreaterThanOrEqual(7.5);
+  });
+
+  it('marginal demotion: penalty from 7.7 below 7.5 threshold', () => {
+    // Score -1.0 × 0.5 = -0.5 → rounds to -0.5
+    // 7.7 - 0.5 = 7.2 → below 7.5
+    const result = computeMicroAdjustment(makeScore(-1.0), 7.7, cfg);
+    expect(result.applied).toBe(true);
+    expect(result.final_confidence).toBeLessThan(7.5);
+  });
+
+  it('does not act like a hard veto — cannot push to zero', () => {
+    // Even with worst score, confidence should not collapse
+    const result = computeMicroAdjustment(makeScore(-2.0), 5.0, cfg);
+    expect(result.final_confidence).toBeGreaterThanOrEqual(5.0 - cfg.max_negative_adj);
+    expect(result.final_confidence).toBeGreaterThan(0);
   });
 });

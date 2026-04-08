@@ -112,6 +112,16 @@ export interface MicrostructureOverlayConfig {
    */
   multiplier: number;
   /**
+   * Maximum positive confidence adjustment allowed.
+   * Caps the upward boost so micro can't promote a weak setup too far.
+   */
+  max_positive_adj: number;
+  /**
+   * Maximum negative confidence adjustment allowed (as a positive number).
+   * Caps the downward penalty so micro can't hard-veto a structurally valid setup.
+   */
+  max_negative_adj: number;
+  /**
    * Minimum data quality to produce a non-zero score.
    * 'minimal' = at least directional flow available.
    * 'partial' = at least 2 sub-components have data.
@@ -123,8 +133,81 @@ export interface MicrostructureOverlayConfig {
 export const DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG: MicrostructureOverlayConfig = {
   enabled: true,
   multiplier: 0.5,
+  max_positive_adj: 0.8,   // max +0.8 confidence boost
+  max_negative_adj: 0.6,   // max -0.6 confidence penalty (asymmetric — harder to demote than promote)
   require_min_data_quality: 'minimal',
 };
+
+// ── Confidence Adjustment Helper ─────────────────────────────────────────────
+
+/**
+ * Compute the bounded confidence adjustment from a microstructure score result.
+ *
+ * This is the canonical function for translating a raw microstructure score
+ * into a confidence delta that can be applied to bestSetup.confidence.
+ *
+ * Returns an object with:
+ *   - adjustment: the bounded delta (positive = boost, negative = penalty)
+ *   - applied: whether the adjustment is non-zero and should be used
+ *   - base: the pre-adjustment confidence (for logging)
+ *   - final: the post-adjustment confidence (for logging)
+ *   - reason: human-readable explanation
+ */
+export interface MicroAdjustmentResult {
+  adjustment: number;
+  applied: boolean;
+  base_confidence: number;
+  final_confidence: number;
+  reason: string;
+}
+
+export function computeMicroAdjustment(
+  score: MicrostructureScoreResult,
+  baseConfidence: number,
+  config: MicrostructureOverlayConfig,
+): MicroAdjustmentResult {
+  const noOp: MicroAdjustmentResult = {
+    adjustment: 0,
+    applied: false,
+    base_confidence: baseConfidence,
+    final_confidence: baseConfidence,
+    reason: 'no_adjustment',
+  };
+
+  if (!config.enabled || config.multiplier === 0) {
+    return { ...noOp, reason: 'overlay_disabled_or_zero_multiplier' };
+  }
+  if (score.data_quality === 'none') {
+    return { ...noOp, reason: 'no_lob_data' };
+  }
+
+  // Raw adjustment = score × multiplier
+  let rawAdj = score.total * config.multiplier;
+
+  // Apply asymmetric bounds
+  if (rawAdj > 0) {
+    rawAdj = Math.min(rawAdj, config.max_positive_adj);
+  } else {
+    rawAdj = Math.max(rawAdj, -config.max_negative_adj);
+  }
+
+  // Round to 0.1 precision (same as confidence scoring)
+  const adjustment = Math.round(rawAdj * 10) / 10;
+
+  if (adjustment === 0) {
+    return { ...noOp, reason: 'adjustment_rounds_to_zero' };
+  }
+
+  const finalConf = Math.max(0, Math.min(10, Math.round((baseConfidence + adjustment) * 10) / 10));
+
+  return {
+    adjustment,
+    applied: true,
+    base_confidence: baseConfidence,
+    final_confidence: finalConf,
+    reason: `micro:${adjustment > 0 ? '+' : ''}${adjustment.toFixed(1)}(raw=${score.total.toFixed(2)}×${config.multiplier})`,
+  };
+}
 
 // ── Internal Helpers ─────────────────────────────────────────────────────────
 

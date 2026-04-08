@@ -48,8 +48,8 @@ import { ExecutionPolicyEngine, DEFAULT_EXECUTION_POLICY_CONFIG } from './execut
 import { computeExtensionFeatures, evaluateExtensionVeto, DEFAULT_EXTENSION_FILTER_CONFIG } from './features/extension.js';
 import type { ExtensionFeatures, EntryExtensionFilterConfig } from './features/extension.js';
 import { extractMboDiagnostics, buildMboTradeContext, buildMboHealthSummary, formatMboStatusLine } from './mbo-diagnostics.js';
-import { computeMicrostructureScore, DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG } from './features/microstructure-score.js';
-import type { MicrostructureScoreResult, MicrostructureOverlayConfig } from './features/microstructure-score.js';
+import { computeMicrostructureScore, computeMicroAdjustment, DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG } from './features/microstructure-score.js';
+import type { MicrostructureScoreResult, MicrostructureOverlayConfig, MicroAdjustmentResult } from './features/microstructure-score.js';
 import { buildDynamicRewardPlan, buildLegacyRewardPlan, DEFAULT_DYNAMIC_REWARD_CONFIG } from './features/dynamic-reward-plan.js';
 import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-reward-plan.js';
 import type { ExecutionPolicyConfig } from './execution-policy/index.js';
@@ -830,7 +830,10 @@ async function main(): Promise<void> {
 
     const dualResult: DualDirectionResult =
       generateSignal(snap, effectiveConfig, contract);
-    const { regime, bias, bestSetup, confidence, tradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
+    const { regime, bias, bestSetup, tradeAllowed: baseTradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
+    // confidence is mutable — micro overlay may adjust it below
+    let confidence = dualResult.confidence;
+    let tradeAllowed = baseTradeAllowed;
     lastRegime = regime;
     lastAlignmentScore = bias.alignment_score;
     lastConfidence = confidence;
@@ -917,6 +920,8 @@ async function main(): Promise<void> {
       ...effectiveConfig.microstructure_overlay,
     };
     let microScore: MicrostructureScoreResult | null = null;
+    let microAdj: MicroAdjustmentResult | null = null;
+    let microInfluencedSelection = false;
 
     // Dynamic reward plan — canonical source for RR gating and management alignment
     const dynamicRewardConfig: DynamicRewardConfig = {
@@ -937,6 +942,9 @@ async function main(): Promise<void> {
       const mboDiagnostics = extractMboDiagnostics(candidateLobSnap);
 
       // ── Microstructure score overlay ──────────────────────────────────────
+      // Computed for every candidate. When enabled, this ACTUALLY adjusts
+      // bestSetup.confidence and the downstream confidence/tradeAllowed flags.
+      // This is NOT just telemetry — it enters the decision path.
       microScore = computeMicrostructureScore(
         candidateLobSnap,
         bestSetup.direction as 'long' | 'short',
@@ -944,18 +952,47 @@ async function main(): Promise<void> {
         microOverlayConfig,
       );
 
-      // Apply score adjustment to confidence (bounded, reversible via multiplier=0)
-      const microAdjustment = microScore.total * microOverlayConfig.multiplier;
-      if (microAdjustment !== 0 && microScore.data_quality !== 'none') {
-        const adjustedConfidence = Math.max(0, Math.min(10, Math.round((confidence + microAdjustment) * 10) / 10));
-        if (adjustedConfidence !== confidence) {
-          console.log(
-            `[MICRO] ${bestSetup.direction} ${bestSetup.setup_type} ` +
-            `overlay=${microScore.total > 0 ? '+' : ''}${microScore.total.toFixed(2)} ` +
-            `(×${microOverlayConfig.multiplier}) → conf ${confidence}→${adjustedConfidence} ` +
-            `[${microScore.setup_family}] ${microScore.reasons.join(', ') || 'neutral'}`,
-          );
+      // Compute bounded adjustment and APPLY it to the live confidence
+      microAdj = computeMicroAdjustment(microScore, confidence, microOverlayConfig);
+      if (microAdj.applied) {
+        const baseConf = confidence;
+        // Write the adjusted confidence back into the decision path
+        confidence = microAdj.final_confidence;
+        bestSetup.confidence = microAdj.final_confidence;
+        signal.confidence = microAdj.final_confidence;
+
+        // Re-evaluate tradeAllowed: the micro adjustment may push a near-miss
+        // above threshold or a marginal signal below it.
+        if (!tradeAllowed && skipReasons.length > 0) {
+          // Check if the ONLY reason was confidence below threshold
+          const confSkipPattern = /^confidence_[\d.]+_below_threshold_[\d.]+$/;
+          const onlyConfidenceBlock = skipReasons.length === 1 && confSkipPattern.test(skipReasons[0] ?? '');
+          if (onlyConfidenceBlock && confidence >= effectiveConfig.min_confidence) {
+            // Micro boost promoted this above threshold — allow it
+            skipReasons.length = 0;
+            signal.reason_for_skip = null;
+            signal.trade_allowed = true;
+            signal.no_trade = false;
+            tradeAllowed = true;
+            microInfluencedSelection = true;
+          }
+        } else if (tradeAllowed && confidence < effectiveConfig.min_confidence) {
+          // Micro penalty demoted this below threshold
+          skipReasons.push(`confidence_${confidence}_below_threshold_${effectiveConfig.min_confidence}(micro_demoted)`);
+          signal.reason_for_skip = (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') +
+            `confidence_${confidence}_below_threshold_${effectiveConfig.min_confidence}(micro_demoted)`;
+          signal.trade_allowed = false;
+          signal.no_trade = true;
+          tradeAllowed = false;
+          microInfluencedSelection = true;
         }
+
+        console.log(
+          `[MICRO] ${bestSetup.direction} ${bestSetup.setup_type} ` +
+          `conf ${baseConf}→${confidence} (${microAdj.reason}) ` +
+          `[${microScore.setup_family}] ${microScore.reasons.join(', ') || 'neutral'}` +
+          (microInfluencedSelection ? ' ★ INFLUENCED SELECTION' : ''),
+        );
       }
 
       // ── Dynamic reward plan ────────────────────────────────────────────────
@@ -988,6 +1025,10 @@ async function main(): Promise<void> {
         setup_type: bestSetup.setup_type,
         regime: regime,
         confidence: confidence,
+        base_confidence: microAdj?.base_confidence ?? confidence,
+        micro_adjustment: microAdj?.adjustment ?? 0,
+        micro_adjustment_reason: microAdj?.reason ?? 'none',
+        micro_influenced_selection: microInfluencedSelection,
         score_margin: dualMargin,
         trade_allowed: tradeAllowed,
         cooldown_blocked: cooldownBlock !== null,

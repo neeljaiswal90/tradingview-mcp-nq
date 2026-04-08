@@ -205,22 +205,55 @@ export class IndicatorConfigManager {
     console.log(`│  MAX_DAILY_LOSS_PCT:  ${c.max_daily_loss_pct}%`);
     console.log(`│  MAX_CONSEC_LOSSES:   ${c.max_consecutive_losses}`);
     console.log(`│  MIN_CONFIDENCE:      ${c.min_confidence}`);
-    console.log(`│  MIN_RR:              ${c.min_rr}`);
     console.log(`│  TIME_STOP:           ${c.time_stop_minutes}min`);
     console.log(`│  ANALYSIS_INTERVAL:   ${c.analysis_interval_seconds}s`);
     console.log(`│  OPENING_RANGE:       ${c.opening_range_minutes}min`);
+    console.log(`│  DUAL_MIN_SCORE:      ${c.dual_min_score}`);
+    console.log(`│  DUAL_MARGIN:         ${c.dual_score_margin}`);
+
+    // ── Dynamic Reward Planning ──────────────────────────────────────────
+    const drp = c.dynamic_reward_planning;
+    const drpEnabled = drp?.enabled !== false; // default true when absent
+    if (drpEnabled) {
+      const baselines = drp?.family_baselines ?? {
+        trend_pullback: 1.6, breakout_retest: 1.7, opening_drive: 1.5,
+        failed_or_break: 1.8, default: 1.8,
+      };
+      const floor = drp?.rr_floor ?? 1.3;
+      const ceiling = drp?.rr_ceiling ?? 3.0;
+      console.log(`├─ Dynamic Reward Planning (ACTIVE) ────────────────────`);
+      console.log(`│  RR_FLOOR:            ${floor}`);
+      console.log(`│  RR_CEILING:          ${ceiling}`);
+      console.log(`│  LEGACY_MIN_RR:       ${c.min_rr} (fallback only)`);
+      const familyStrs = Object.entries(baselines)
+        .map(([f, v]) => `${f}=${v}`)
+        .join(' ');
+      console.log(`│  BASELINES:           ${familyStrs}`);
+    } else {
+      console.log(`├─ Dynamic Reward Planning (DISABLED) ───────────────────`);
+      console.log(`│  MIN_RR:              ${c.min_rr} (legacy fixed gate)`);
+    }
+
+    // ── Microstructure Overlay ────────────────────────────────────────────
+    const micro = c.microstructure_overlay;
+    const microEnabled = micro?.enabled !== false; // default true when absent
+    console.log(`├─ Microstructure Overlay (${microEnabled ? 'ACTIVE' : 'DISABLED'}) ─────────────────`);
+    if (microEnabled) {
+      console.log(`│  MULTIPLIER:          ${micro?.multiplier ?? 0.5}`);
+      console.log(`│  MIN_DATA_QUALITY:    ${micro?.require_min_data_quality ?? 'minimal'}`);
+    }
+
+    // ── Management ───────────────────────────────────────────────────────
+    console.log(`├─ Trade Management ────────────────────────────────────`);
     console.log(`│  TRAIL_TICKS_POST_T1: ${c.trail_ticks_post_t1}`);
     console.log(`│  BE_TRIGGER_R:        ${c.breakeven_trigger_r}`);
     console.log(`│  PRE_T1_TRAIL_R:      ${c.pre_t1_trail_trigger_r}`);
     console.log(`│  PRE_T1_TRAIL_TICKS:  ${c.pre_t1_trail_distance_ticks}`);
-    console.log(`│  DUAL_MIN_SCORE:      ${c.dual_min_score}`);
-    console.log(`│  DUAL_MARGIN:         ${c.dual_score_margin}`);
-    console.log(`│  PT1_OFFSET_PTS:      ${c.pt1_offset_pts}`);
-    console.log(`│  PT2_OFFSET_PTS:      ${c.pt2_offset_pts}`);
     console.log(`│  PT1_EXIT_FRACTION:   ${c.pt1_exit_fraction}`);
     console.log(`│  PT2_EXIT_FRACTION:   ${c.pt2_exit_fraction}`);
     console.log(`│  PT1_MOVE_TO_BE:      ${c.pt1_move_to_be}`);
     console.log(`│  PT1_ACTIVATE_TRAIL:  ${c.pt1_activate_trailing}`);
+
     // Management profiles summary
     if (c.management_profiles) {
       const profiles = Object.entries(c.management_profiles);
