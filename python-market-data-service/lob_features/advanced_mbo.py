@@ -53,6 +53,18 @@ class AdvancedMboAnalyzer:
         self._level_sizes: dict[str, dict[float, int]] = {"bid": {}, "ask": {}}  # side -> price -> visible_size
         self.enabled = True
 
+    def _snapshot_events(self) -> list[RichMboEvent]:
+        """Return a safe copy of _events for iteration.
+
+        The WebSocket ingest handler appends to _events on the async event
+        loop while snapshot computation (REST endpoints, recording timer)
+        iterates it.  Iterating a deque that is concurrently mutated raises
+        ``RuntimeError: deque mutated during iteration``.  Taking a list
+        copy is O(n) but n is bounded by max_window_sec (~60 s of events)
+        and avoids the need for locks in this single-process async design.
+        """
+        return list(self._events)
+
     def add_event(self, evt: RichMboEvent) -> None:
         if not self.enabled:
             return
@@ -110,7 +122,7 @@ class AdvancedMboAnalyzer:
         now = now or time.time()
         cutoff = now - 10
         adds = cr = 0
-        for e in self._events:
+        for e in self._snapshot_events():
             if e.ts >= cutoff:
                 if e.action == "add": adds += 1
                 elif e.action in ("cancel", "replace"): cr += 1
@@ -121,7 +133,7 @@ class AdvancedMboAnalyzer:
         now = now or time.time()
         cutoff = now - 10
         modifies = total = 0
-        for e in self._events:
+        for e in self._snapshot_events():
             if e.ts >= cutoff:
                 total += 1
                 if e.action == "modify": modifies += 1
@@ -140,7 +152,7 @@ class AdvancedMboAnalyzer:
         level_executed: dict[float, int] = {}
         level_visible: dict[float, int] = {}
 
-        for e in self._events:
+        for e in self._snapshot_events():
             if e.ts >= cutoff:
                 if e.action == "add":
                     level_visible[e.price] = level_visible.get(e.price, 0) + e.size
@@ -170,7 +182,7 @@ class AdvancedMboAnalyzer:
         cutoff = now - window_sec
         top_adds = top_consumed = 0
 
-        for e in self._events:
+        for e in self._snapshot_events():
             if e.ts >= cutoff and e.side == side and e.is_top_of_book:
                 if e.action == "add":
                     top_adds += 1
@@ -188,7 +200,7 @@ class AdvancedMboAnalyzer:
         """
         now = now or time.time()
         cutoff = now - 10
-        cancels = [(e.ts, e.price, e.side) for e in self._events
+        cancels = [(e.ts, e.price, e.side) for e in self._snapshot_events()
                    if e.ts >= cutoff and e.action == "cancel"]
 
         if len(cancels) < 3:
@@ -215,7 +227,7 @@ class AdvancedMboAnalyzer:
         lifetimes: list[float] = []
 
         add_times: dict[str, float] = {}
-        for e in self._events:
+        for e in self._snapshot_events():
             if e.ts >= cutoff and e.order_id:
                 if e.action == "add":
                     add_times[e.order_id] = e.ts

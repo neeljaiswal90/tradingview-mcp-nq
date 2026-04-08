@@ -47,7 +47,7 @@ class RollingTradeBuffer:
         now = now or time.time()
         cutoff = now - window_sec
         delta = 0.0
-        for t in self._trades:
+        for t in list(self._trades):
             if t.ts >= cutoff:
                 delta += t.size if t.is_buy else -t.size
         return delta
@@ -58,7 +58,7 @@ class RollingTradeBuffer:
         cutoff = now - window_sec
         buy_vol = 0
         total_vol = 0
-        for t in self._trades:
+        for t in list(self._trades):
             if t.ts >= cutoff:
                 total_vol += t.size
                 if t.is_buy:
@@ -166,7 +166,7 @@ class RollingMboAggregator:
         now = now or time.time()
         cutoff = now - window_sec
         adds = cancels = 0
-        for e in self._events:
+        for e in list(self._events):
             if e.ts >= cutoff:
                 if e.action == "add":
                     adds += 1
@@ -180,7 +180,7 @@ class RollingMboAggregator:
         cutoff = now - window_sec
         execs = adds_after_exec = 0
         last_exec_ts = 0.0
-        for e in self._events:
+        for e in list(self._events):
             if e.ts >= cutoff:
                 if e.action == "execute":
                     execs += 1
@@ -195,7 +195,7 @@ class RollingMboAggregator:
         cutoff = now - window_sec
         executed_vol = 0
         total_add_vol = 0
-        for e in self._events:
+        for e in list(self._events):
             if e.ts >= cutoff:
                 if e.action == "execute":
                     executed_vol += e.size
@@ -209,7 +209,7 @@ class RollingMboAggregator:
         cutoff = now - window_sec
         lifetimes: list[float] = []
         add_times: dict[str, float] = {}
-        for e in self._events:
+        for e in list(self._events):
             if e.ts >= cutoff and e.is_top_of_book:
                 key = f"{e.side}:{e.price}"
                 if e.action == "add":
@@ -224,7 +224,7 @@ class RollingMboAggregator:
         now = now or time.time()
         cutoff = now - window_sec
         penetrations: list[int] = []
-        for e in self._events:
+        for e in list(self._events):
             if e.ts >= cutoff and e.action == "execute" and e.levels_penetrated > 0:
                 penetrations.append(e.levels_penetrated)
         return round(sum(penetrations) / len(penetrations), 2) if penetrations else None
@@ -233,7 +233,7 @@ class RollingMboAggregator:
         """Count of executions that penetrated 3+ levels (sweeps)."""
         now = now or time.time()
         cutoff = now - window_sec
-        return sum(1 for e in self._events
+        return sum(1 for e in list(self._events)
                    if e.ts >= cutoff and e.action == "execute" and e.levels_penetrated >= 3)
 
     @property

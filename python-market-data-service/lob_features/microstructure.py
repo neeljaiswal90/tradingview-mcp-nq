@@ -54,7 +54,7 @@ class AbsorptionDetector:
         """Group trades by price level and compute absorption metrics."""
         cutoff = now - self.window_sec
         levels: dict[float, dict] = defaultdict(lambda: {"buy_vol": 0, "sell_vol": 0, "count": 0})
-        for ts, price, size, is_buy in self._trades:
+        for ts, price, size, is_buy in list(self._trades):
             if ts >= cutoff:
                 rounded = round(price / self.tick_size) * self.tick_size
                 entry = levels[rounded]
@@ -134,28 +134,28 @@ class SweepDetector:
     def sweep_volume(self, window_sec: float | None = None, now: float | None = None) -> int:
         now = now or time.time()
         ws = window_sec or self.window_sec
-        return sum(v for ts, _, _, v, _ in self._sweeps if ts >= now - ws)
+        return sum(v for ts, _, _, v, _ in list(self._sweeps) if ts >= now - ws)
 
     def max_sweep_levels(self, window_sec: float | None = None, now: float | None = None) -> int:
         now = now or time.time()
         ws = window_sec or self.window_sec
-        recent = [lvl for ts, _, _, _, lvl in self._sweeps if ts >= now - ws]
+        recent = [lvl for ts, _, _, _, lvl in list(self._sweeps) if ts >= now - ws]
         return max(recent) if recent else 0
 
     def last_sweep_side(self, now: float | None = None) -> Optional[str]:
         now = now or time.time()
-        recent = [(ts, side) for ts, side, _, _, _ in self._sweeps if ts >= now - self.window_sec]
+        recent = [(ts, side) for ts, side, _, _, _ in list(self._sweeps) if ts >= now - self.window_sec]
         return recent[-1][1] if recent else None
 
     def last_sweep_price(self, now: float | None = None) -> Optional[float]:
         now = now or time.time()
-        recent = [(ts, price) for ts, _, price, _, _ in self._sweeps if ts >= now - self.window_sec]
+        recent = [(ts, price) for ts, _, price, _, _ in list(self._sweeps) if ts >= now - self.window_sec]
         return recent[-1][1] if recent else None
 
     def sweep_count(self, window_sec: float | None = None, now: float | None = None) -> int:
         now = now or time.time()
         ws = window_sec or self.window_sec
-        return sum(1 for ts, _, _, _, _ in self._sweeps if ts >= now - ws)
+        return sum(1 for ts, _, _, _, _ in list(self._sweeps) if ts >= now - ws)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -180,14 +180,14 @@ class FootprintTracker:
         """Buy volume - sell volume over window."""
         now = now or time.time()
         cutoff = now - window_sec
-        return sum(sz if ib else -sz for ts, _, sz, ib in self._trades if ts >= cutoff)
+        return sum(sz if ib else -sz for ts, _, sz, ib in list(self._trades) if ts >= cutoff)
 
     def imbalance_ratio(self, window_sec: float, now: float | None = None) -> Optional[float]:
         """Absolute delta / total volume. 0 = balanced, 1 = fully one-sided."""
         now = now or time.time()
         cutoff = now - window_sec
-        buy_vol = sum(sz for ts, _, sz, ib in self._trades if ts >= cutoff and ib)
-        sell_vol = sum(sz for ts, _, sz, ib in self._trades if ts >= cutoff and not ib)
+        buy_vol = sum(sz for ts, _, sz, ib in list(self._trades) if ts >= cutoff and ib)
+        sell_vol = sum(sz for ts, _, sz, ib in list(self._trades) if ts >= cutoff and not ib)
         total = buy_vol + sell_vol
         if total == 0:
             return None
@@ -199,7 +199,7 @@ class FootprintTracker:
         now = now or time.time()
         cutoff = now - window_sec
         levels: dict[float, dict] = defaultdict(lambda: {"buy": 0, "sell": 0})
-        for ts, price, size, is_buy in self._trades:
+        for ts, price, size, is_buy in list(self._trades):
             if ts >= cutoff:
                 rounded = round(price / self.tick_size) * self.tick_size
                 if is_buy:
@@ -248,22 +248,22 @@ class LargeTradeTracker:
 
     def count(self, window_sec: float, now: float | None = None) -> int:
         now = now or time.time()
-        return sum(1 for ts, _, _, _ in self._large if ts >= now - window_sec)
+        return sum(1 for ts, _, _, _ in list(self._large) if ts >= now - window_sec)
 
     def volume(self, window_sec: float, now: float | None = None) -> int:
         now = now or time.time()
-        return sum(sz for ts, _, sz, _ in self._large if ts >= now - window_sec)
+        return sum(sz for ts, _, sz, _ in list(self._large) if ts >= now - window_sec)
 
     def largest_size(self, window_sec: float, now: float | None = None) -> int:
         now = now or time.time()
-        sizes = [sz for ts, _, sz, _ in self._large if ts >= now - window_sec]
+        sizes = [sz for ts, _, sz, _ in list(self._large) if ts >= now - window_sec]
         return max(sizes) if sizes else 0
 
     def buy_sell_imbalance(self, window_sec: float, now: float | None = None) -> Optional[float]:
         """buy_vol / total_vol for large trades."""
         now = now or time.time()
-        buy = sum(sz for ts, _, sz, ib in self._large if ts >= now - window_sec and ib)
-        sell = sum(sz for ts, _, sz, ib in self._large if ts >= now - window_sec and not ib)
+        buy = sum(sz for ts, _, sz, ib in list(self._large) if ts >= now - window_sec and ib)
+        sell = sum(sz for ts, _, sz, ib in list(self._large) if ts >= now - window_sec and not ib)
         total = buy + sell
         return round(buy / total, 4) if total > 0 else None
 
