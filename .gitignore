@@ -1,0 +1,29 @@
+node_modules/
+dist/
+screenshots/
+*.tsbuildinfo
+.env
+logs/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+venv/
+.venv/
+.mypy_cache/
+catboost_info/
+
+# Bookmap addon build
+bookmap-addon/build/
+bookmap-addon/*.jar
+
+# Data artifacts (generated, not committed)
+data/*.csv
+data/*.parquet
+data/*.json
+models/xgboost/*.ubj
+models/catboost/*.cbm

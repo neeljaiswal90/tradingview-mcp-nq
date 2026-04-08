@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  typescript:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node-version: [18, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run test:unit
+      - name: Dashboard build
+        run: |
+          cd dashboard
+          npm ci
+          npm run build
+
+  python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python deps
+        run: |
+          pip install fastapi uvicorn pydantic catboost scikit-learn numpy
+          pip install pytest
+      - name: Python syntax check
+        run: python -m compileall python-market-data-service python-ml-service
+      - name: Run Python tests
+        run: |
+          python python-market-data-service/tests/test_lob_features.py
+          python python-market-data-service/tests/test_feature_parity.py
+          python python-market-data-service/tests/test_advanced_mbo.py

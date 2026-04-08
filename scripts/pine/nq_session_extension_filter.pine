@@ -1,0 +1,137 @@
+// NQ Session Extension & Entry Lateness Filter v1.0
+// Purpose: Prevent late entries by measuring how extended price is from key session anchors
+// Shows at-a-glance whether current price is at a good entry zone or overextended
+//
+// PROBLEM IT SOLVES:
+// - Trend pullback setups look great on paper, but if price already moved 3 ATRs from VWAP,
+//   the pullback entry is actually a late chase. This indicator flags that.
+// - Opening range breakouts after price has already extended 2+ ATRs from OR are low quality.
+//
+// LIMITATIONS:
+// - VWAP resets at session start; pre-market VWAP may differ from RTH VWAP
+// - Extension thresholds are configurable but defaults tuned for NQ 1m
+// - Does NOT account for specific setup type (treats all extensions equally)
+//
+//@version=6
+indicator("NQ Entry Lateness Filter", overlay=false)
+
+// ==================== INPUTS ====================
+grp_anchor = "Anchor Settings"
+ema_fast_len = input.int(9, "Fast EMA Length", group=grp_anchor)
+ema_mid_len  = input.int(21, "Mid EMA Length", group=grp_anchor)
+atr_len      = input.int(14, "ATR Length", group=grp_anchor)
+
+grp_thresh = "Extension Thresholds (in ATR multiples)"
+ext_warn     = input.float(1.5, "Warning Level", step=0.1, group=grp_thresh, tooltip="Yellow zone - getting extended")
+ext_danger   = input.float(2.5, "Danger Level", step=0.1, group=grp_thresh, tooltip="Red zone - likely too late")
+ext_extreme  = input.float(3.5, "Extreme Level", step=0.1, group=grp_thresh, tooltip="Snap-back likely")
+
+grp_or = "Opening Range"
+or_minutes   = input.int(15, "OR Window (minutes)", group=grp_or, minval=5, maxval=60)
+
+// ==================== CALCULATIONS ====================
+ema_fast = ta.ema(close, ema_fast_len)
+ema_mid  = ta.ema(close, ema_mid_len)
+atr_val  = ta.atr(atr_len)
+vwap_val = ta.vwap(hlc3)
+
+// Extension from each anchor (in ATR units)
+ext_ema9  = atr_val > 0 ? (close - ema_fast) / atr_val : 0
+ext_ema21 = atr_val > 0 ? (close - ema_mid) / atr_val : 0
+ext_vwap  = atr_val > 0 ? (close - vwap_val) / atr_val : 0
+
+// ==================== OPENING RANGE TRACKING ====================
+// Detect RTH session start
+is_rth = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+var bool or_complete = false
+var float or_high = na
+var float or_low = na
+var int or_bar_count = 0
+
+// Detect new RTH session
+new_session = is_rth and not is_rth[1]
+if new_session
+    or_high := high
+    or_low := low
+    or_bar_count := 1
+    or_complete := false
+else if is_rth and not or_complete
+    or_bar_count += 1
+    or_high := math.max(nz(or_high), high)
+    or_low := math.min(nz(or_low, high), low)
+    if or_bar_count >= or_minutes
+        or_complete := true
+
+or_mid = or_complete ? (or_high + or_low) / 2 : na
+ext_or = or_complete and atr_val > 0 ? (close - or_mid) / atr_val : 0
+
+// ==================== COMPOSITE EXTENSION SCORE ====================
+// Weighted average: VWAP (40%), EMA9 (30%), EMA21 (20%), OR (10%)
+abs_ext_vwap  = math.abs(ext_vwap)
+abs_ext_ema9  = math.abs(ext_ema9)
+abs_ext_ema21 = math.abs(ext_ema21)
+abs_ext_or    = math.abs(ext_or)
+
+composite_ext = abs_ext_vwap * 0.4 + abs_ext_ema9 * 0.3 + abs_ext_ema21 * 0.2 + (or_complete ? abs_ext_or * 0.1 : abs_ext_vwap * 0.1)
+
+// Directional composite (positive = extended long, negative = extended short)
+dir_ext = ext_vwap * 0.4 + ext_ema9 * 0.3 + ext_ema21 * 0.2 + (or_complete ? ext_or * 0.1 : ext_vwap * 0.1)
+
+// ==================== ENTRY QUALITY ZONE ====================
+// 0 = ideal entry zone, higher = worse entry
+entry_quality = composite_ext < ext_warn ? "IDEAL" : composite_ext < ext_danger ? "CAUTION" : composite_ext < ext_extreme ? "LATE" : "EXTREME"
+
+quality_color = switch entry_quality
+    "IDEAL" => color.green
+    "CAUTION" => color.yellow
+    "LATE" => color.orange
+    => color.red
+
+// ==================== PLOTS ====================
+// Directional extension as histogram
+plot(dir_ext, "Directional Extension", color=quality_color, style=plot.style_columns, linewidth=3)
+
+// Threshold lines
+hline(ext_warn, "Warning", color=color.yellow, linestyle=hline.style_dashed)
+hline(-ext_warn, "Warning", color=color.yellow, linestyle=hline.style_dashed)
+hline(ext_danger, "Danger", color=color.orange, linestyle=hline.style_dashed)
+hline(-ext_danger, "Danger", color=color.orange, linestyle=hline.style_dashed)
+hline(ext_extreme, "Extreme", color=color.red, linestyle=hline.style_solid)
+hline(-ext_extreme, "Extreme", color=color.red, linestyle=hline.style_solid)
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dotted)
+
+// Background zones
+bgcolor(composite_ext >= ext_extreme ? color.new(color.red, 90) : composite_ext >= ext_danger ? color.new(color.orange, 93) : na)
+
+// ==================== INFO TABLE ====================
+var table info = table.new(position.bottom_right, columns=2, rows=7, border_width=1, border_color=color.gray, bgcolor=color.new(color.black, 20))
+
+if barstate.islast
+    table.cell(info, 0, 0, "Entry Filter", bgcolor=color.new(color.blue, 60), text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, entry_quality, bgcolor=color.new(quality_color, 30), text_color=color.white, text_size=size.small)
+
+    table.cell(info, 0, 1, "EMA9 Ext", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 1, str.tostring(ext_ema9, "#.##") + " ATR", text_color=color.white, text_size=size.tiny)
+
+    table.cell(info, 0, 2, "EMA21 Ext", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 2, str.tostring(ext_ema21, "#.##") + " ATR", text_color=color.white, text_size=size.tiny)
+
+    table.cell(info, 0, 3, "VWAP Ext", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 3, str.tostring(ext_vwap, "#.##") + " ATR", text_color=color.white, text_size=size.tiny)
+
+    table.cell(info, 0, 4, "OR Ext", text_color=color.white, text_size=size.tiny)
+    or_txt = or_complete ? str.tostring(ext_or, "#.##") + " ATR" : "No OR"
+    table.cell(info, 1, 4, or_txt, text_color=color.white, text_size=size.tiny)
+
+    table.cell(info, 0, 5, "Composite", text_color=color.white, text_size=size.tiny)
+    table.cell(info, 1, 5, str.tostring(composite_ext, "#.##") + " ATR", bgcolor=color.new(quality_color, 50), text_color=color.white, text_size=size.tiny)
+
+    table.cell(info, 0, 6, "Direction", text_color=color.white, text_size=size.tiny)
+    dir_txt = dir_ext > 0.5 ? "Extended LONG" : dir_ext < -0.5 ? "Extended SHORT" : "Neutral"
+    dir_col = dir_ext > 0.5 ? color.green : dir_ext < -0.5 ? color.red : color.gray
+    table.cell(info, 1, 6, dir_txt, bgcolor=color.new(dir_col, 60), text_color=color.white, text_size=size.tiny)
+
+// ==================== ALERTS ====================
+alertcondition(composite_ext >= ext_danger, "Extension Warning", "Price extended beyond danger threshold")
+alertcondition(composite_ext >= ext_extreme, "Extreme Extension", "Price at extreme extension - snap-back likely")
+alertcondition(composite_ext < 0.5, "Ideal Entry Zone", "Price near key anchors - good entry zone")

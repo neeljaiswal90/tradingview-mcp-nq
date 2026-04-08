@@ -1,0 +1,53 @@
+{
+  "name": "tradingview-mcp",
+  "version": "1.0.0",
+  "description": "MCP bridge for TradingView Desktop via Chrome DevTools Protocol",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "tv": "dist/cli/index.js"
+  },
+  "exports": {
+    ".": "./dist/server.js",
+    "./core": "./dist/core/tradingview/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc --watch",
+    "tv": "node dist/cli/index.js",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:smoke": "vitest run tests/smoke",
+    "typecheck": "tsc --noEmit",
+    "auto": "node dist/autotrade/runner.js",
+    "auto:paper": "cross-env MODE=paper node dist/autotrade/runner.js",
+    "auto:signal": "cross-env MODE=signal_only node dist/autotrade/runner.js",
+    "auto:live": "cross-env MODE=live LIVE_TRADING_ENABLED=true node dist/autotrade/runner.js",
+    "historical:replay": "node dist/autotrade/historical/cli.js --config config/historical-config.json",
+    "dashboard:install": "cd dashboard && npm install",
+    "dashboard:build": "cd dashboard && npm run build",
+    "dashboard:dev": "cd dashboard && npm run dev",
+    "start:full": "powershell -ExecutionPolicy Bypass -File scripts/start-full-stack.ps1",
+    "stop:full": "powershell -ExecutionPolicy Bypass -File scripts/stop-full-stack.ps1",
+    "bootstrap": "npm ci && cd dashboard && npm ci && cd ..",
+    "clean": "rimraf dist .tsbuildinfo && cd dashboard && rimraf dist && cd ..",
+    "rebuild": "npm run clean && npm run build && cd dashboard && npm run build && cd ..",
+    "verify": "npm run typecheck && npm run build && npm run test:unit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "chrome-remote-interface": "^0.33.2"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.33.0",
+    "@types/node": "^22",
+    "cross-env": "^10.1.0",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "files": {
+    "1m":  "C:/Users/Neel/Downloads/CME_MINI_NQ1!, 1_5863b.csv",
+    "5m":  "C:/Users/Neel/Downloads/CME_MINI_NQ1!, 5_57549.csv",
+    "15m": "C:/Users/Neel/Downloads/CME_MINI_NQ1!, 15_1cc43.csv",
+    "60m": "C:/Users/Neel/Downloads/CME_MINI_NQ1!, 60_b7508.csv"
+  },
+  "symbol": "NQ1!",
+  "from_unix": null,
+  "to_unix": null,
+  "warmup_bars": 250,
+  "fill": {
+    "entry_model": "next_bar_open",
+    "slippage_ticks": 1,
+    "ambiguity_policy": "conservative"
+  },
+  "output_dir": "./logs/historical",
+  "allow_missing_htf": true,
+  "fixed_qty": 1
+}
