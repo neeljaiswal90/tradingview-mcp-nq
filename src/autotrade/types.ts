@@ -1155,6 +1155,8 @@ export interface IndicatorConfig {
   microstructure_overlay?: import('./features/microstructure-score.js').MicrostructureOverlayConfig;
   /** Dynamic reward planning: setup-family-aware RR gating and target alignment. */
   dynamic_reward_planning?: import('./features/dynamic-reward-plan.js').DynamicRewardConfig;
+  /** Spatial normalization policy: controls scale families for VWAP/room/micro metrics. */
+  normalization?: import('./features/normalization.js').NormalizationConfig;
 }
 
 export interface IndicatorChangeRecord {

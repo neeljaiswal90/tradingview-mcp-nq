@@ -57,8 +57,9 @@ export interface ExtensionFeatures {
 
   // F. Normalization diagnostics
   normalization_mode: string;           // 'sqrt_time' | 'session_range' | 'floor'
-  session_atr: number | null;           // the session-scale normalizer used
-  micro_atr: number | null;             // the 1m ATR used
+  session_atr: number | null;           // session-scale normalizer (for VWAP distance)
+  room_scale_atr: number | null;        // room-scale normalizer (for room-to-structure)
+  micro_atr: number | null;             // 1m ATR (for impulse, bar-scale metrics)
 }
 
 // ─── Veto Config ─────────────────────────────────────────────────────────────
@@ -101,6 +102,7 @@ export function computeExtensionFeatures(
   snap: MarketSnapshot,
   entryMid: number,
   direction: 'long' | 'short',
+  normConfig?: NormalizationConfig,
 ): ExtensionFeatures {
   // Two reference prices with distinct roles:
   //   entryMid  — the intended fill zone (limit mid-price).  Used for all
@@ -118,11 +120,14 @@ export function computeExtensionFeatures(
   const isLong = direction === 'long';
 
   // ── Compute normalizers ────────────────────────────────────────────────
-  // micro_atr: 1m ATR, for bar-scale metrics (impulse, 3-bar return)
-  // session_atr: session-scale normalizer, for VWAP distance and room-to-structure
-  const norms = computeNormalizers(snap);
+  // Three scale families (see normalization.ts):
+  //   micro_atr:   1m ATR (~7 pts) — for impulse, 3-bar return, EMA distance
+  //   room_atr:    HTF proxy (~17 pts) — for room-to-structure filters
+  //   session_atr: session-scale (~54-400+ pts) — for VWAP distance
+  const norms = computeNormalizers(snap, normConfig);
   const microAtr = norms?.micro_atr ?? (atr14 ?? 0);
-  const sessionAtr = norms?.session_atr ?? microAtr; // fallback to micro if session unavailable
+  const roomAtr = norms?.room_atr ?? microAtr;      // fallback to micro
+  const sessionAtr = norms?.session_atr ?? microAtr; // fallback to micro
   const normMode = norms?.session_atr_source ?? 'fallback';
 
   // ── A. Distance from mean (measured from intended fill price) ──────────
@@ -174,11 +179,12 @@ export function computeExtensionFeatures(
 
   // ── D. Room left (measured from intended fill price) ──────────────────
   const room = computeRoomLeft(entryMid, kl, atr14);
-  // Session-scaled room metrics
-  const upside_room_session = room.upside_pts !== null && sessionAtr > 0
-    ? round2(room.upside_pts / sessionAtr) : null;
-  const downside_room_session = room.downside_pts !== null && sessionAtr > 0
-    ? round2(room.downside_pts / sessionAtr) : null;
+  // Room-scaled metrics: use room_atr (HTF proxy, ~17 pts), NOT session_atr (~54-400 pts).
+  // Room-to-structure is a local measurement (~5-30 pts), not a session-scale one.
+  const upside_room_session = room.upside_pts !== null && roomAtr > 0
+    ? round2(room.upside_pts / roomAtr) : null;
+  const downside_room_session = room.downside_pts !== null && roomAtr > 0
+    ? round2(room.downside_pts / roomAtr) : null;
 
   // ── E. Reset / pullback detection ──────────────────────────────────────
   const reset = detectReset(bars, isLong, impulse.impulse_pts);
@@ -212,6 +218,7 @@ export function computeExtensionFeatures(
     // Normalization diagnostics
     normalization_mode: normMode,
     session_atr: norms?.session_atr ?? null,
+    room_scale_atr: norms?.room_atr ?? null,
     micro_atr: norms?.micro_atr ?? null,
   };
 }

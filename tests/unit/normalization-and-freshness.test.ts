@@ -106,6 +106,39 @@ describe('computeNormalizers', () => {
     const norms = computeNormalizers(snap);
     expect(norms).toBeNull();
   });
+
+  // ── Room-scale normalizer ──────────────────────────────────────────────
+
+  it('room_atr is between micro and session', () => {
+    const snap = makeSnap(19500, { atr: 7, session_high: 19520, session_low: 19480 });
+    const norms = computeNormalizers(snap);
+    expect(norms!.room_atr).toBeGreaterThan(norms!.micro_atr);
+    expect(norms!.room_atr).toBeLessThan(norms!.session_atr);
+  });
+
+  it('room_atr is sqrt(5) scaled from micro by default', () => {
+    const snap = makeSnap(19500, { atr: 7, session_high: 19520, session_low: 19480 });
+    const norms = computeNormalizers(snap);
+    // 7 * sqrt(5) ≈ 15.65
+    expect(norms!.room_atr).toBeCloseTo(15.65, 0);
+    expect(norms!.room_atr_source).toBe('sqrt_time');
+  });
+
+  it('room_atr is capped on wide-range days', () => {
+    // ATR=20, sqrt(5)*20 = 44.7 → capped at 40
+    const snap = makeSnap(19500, { atr: 20, session_high: 19520, session_low: 19480 });
+    const norms = computeNormalizers(snap);
+    expect(norms!.room_atr).toBe(DEFAULT_NORMALIZATION_CONFIG.max_room_normalizer_pts);
+    expect(norms!.room_atr_source).toBe('capped');
+  });
+
+  it('room_atr applies floor on thin conditions', () => {
+    // ATR=2, sqrt(5)*2 = 4.47 → floored at 8
+    const snap = makeSnap(19500, { atr: 2, session_high: 19502, session_low: 19498 });
+    const norms = computeNormalizers(snap);
+    expect(norms!.room_atr).toBe(DEFAULT_NORMALIZATION_CONFIG.min_room_normalizer_pts);
+    expect(norms!.room_atr_source).toBe('floor');
+  });
 });
 
 // ── Extension Feature Session-Scale Metrics ──────────────────────────────────
@@ -123,15 +156,19 @@ describe('Extension features with session-scale normalization', () => {
     expect(features.dist_from_vwap_session).toBeGreaterThan(0);
   });
 
-  it('room metrics use session scale', () => {
+  it('room metrics use room scale (not session scale)', () => {
     const snap = makeSnap(19500, { atr: 7, session_high: 19600, session_low: 19400 });
     const features = computeExtensionFeatures(snap, 19500, 'long');
 
-    // Upside room: nearest resistance ~50-100 pts away
-    // Session ATR with 200pt session range = 200
-    // Room/sessionATR should be well under 1.0 for a tight room
+    // room_atr ≈ 7*sqrt(5) ≈ 15.7 (capped at 40 max)
+    // session_atr with 200pt session range = 200
+    // Upside room: nearest resistance ~50 pts
+    // Room-scaled: 50/15.7 ≈ 3.2 (reasonable for room filter)
+    // Session-scaled would be: 50/200 = 0.25 (absurdly low, would fail threshold 1.0)
     expect(features.upside_room_session).not.toBeNull();
-    expect(features.upside_room_session!).toBeLessThan(features.upside_room_atr!);
+    expect(features.upside_room_session!).toBeGreaterThan(1.0); // passes room filter
+    expect(features.room_scale_atr).not.toBeNull();
+    expect(features.room_scale_atr!).toBeLessThan(features.session_atr!); // room < session
   });
 
   it('normalization diagnostics are present', () => {
