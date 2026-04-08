@@ -11,18 +11,24 @@
  */
 
 import type { OhlcvBar, MarketSnapshot, KeyLevels } from '../types.js';
+import { computeNormalizers, normalizeMicro, normalizeSession, DEFAULT_NORMALIZATION_CONFIG } from './normalization.js';
+import type { NormalizationConfig, NormalizationResult } from './normalization.js';
 
 // ─── Extension Feature Snapshot ──────────────────────────────────────────────
 
 export interface ExtensionFeatures {
-  // A. Distance-from-mean (ATR-normalized)
+  // A. Distance-from-mean
+  //    - *_atr fields use 1m ATR (micro-scale, kept for backward compat)
+  //    - *_session fields use session-scale ATR (the correct normalizer for
+  //      session-geometry like VWAP distance and room-to-structure)
   dist_from_vwap_pts: number | null;
-  dist_from_vwap_atr: number | null;
+  dist_from_vwap_atr: number | null;       // micro-normalized (legacy)
+  dist_from_vwap_session: number | null;    // session-normalized (primary for veto)
   dist_from_ema9_atr: number | null;
   dist_from_ema21_atr: number | null;
   dist_from_ema50_atr: number | null;
 
-  // B. Impulse-extension
+  // B. Impulse-extension (micro-scale: correctly uses 1m ATR)
   current_impulse_pts: number;
   current_impulse_atr: number | null;
   bars_since_impulse_start: number;
@@ -36,9 +42,11 @@ export interface ExtensionFeatures {
 
   // D. Room-left (directional)
   upside_room_pts: number | null;
-  upside_room_atr: number | null;
+  upside_room_atr: number | null;           // micro-normalized (legacy)
+  upside_room_session: number | null;       // session-normalized (primary for veto)
   downside_room_pts: number | null;
-  downside_room_atr: number | null;
+  downside_room_atr: number | null;         // micro-normalized (legacy)
+  downside_room_session: number | null;     // session-normalized (primary for veto)
 
   // E. Reset / pullback
   reset_occurred: boolean;
@@ -46,6 +54,11 @@ export interface ExtensionFeatures {
   pullback_depth_pct_of_impulse: number | null;
   bars_in_pullback: number;
   no_reset_extension: boolean;
+
+  // F. Normalization diagnostics
+  normalization_mode: string;           // 'sqrt_time' | 'session_range' | 'floor'
+  session_atr: number | null;           // the session-scale normalizer used
+  micro_atr: number | null;             // the 1m ATR used
 }
 
 // ─── Veto Config ─────────────────────────────────────────────────────────────
@@ -104,18 +117,30 @@ export function computeExtensionFeatures(
   const atr14 = ind.atr_14;
   const isLong = direction === 'long';
 
+  // ── Compute normalizers ────────────────────────────────────────────────
+  // micro_atr: 1m ATR, for bar-scale metrics (impulse, 3-bar return)
+  // session_atr: session-scale normalizer, for VWAP distance and room-to-structure
+  const norms = computeNormalizers(snap);
+  const microAtr = norms?.micro_atr ?? (atr14 ?? 0);
+  const sessionAtr = norms?.session_atr ?? microAtr; // fallback to micro if session unavailable
+  const normMode = norms?.session_atr_source ?? 'fallback';
+
   // ── A. Distance from mean (measured from intended fill price) ──────────
   const vwapVal = ind.vwap;
   const dist_from_vwap_pts = vwapVal !== null ? round2(entryMid - vwapVal) : null;
-  const dist_from_vwap_atr = vwapVal !== null && atr14 !== null && atr14 > 0
-    ? round2(Math.abs(entryMid - vwapVal) / atr14) : null;
+  // Legacy micro-normalized (kept for backward compat and EMA metrics)
+  const dist_from_vwap_atr = vwapVal !== null && microAtr > 0
+    ? round2(Math.abs(entryMid - vwapVal) / microAtr) : null;
+  // Session-normalized: the correct scale for VWAP distance veto
+  const dist_from_vwap_session = vwapVal !== null && sessionAtr > 0
+    ? round2(Math.abs(entryMid - vwapVal) / sessionAtr) : null;
 
-  const dist_from_ema9_atr = ind.ema_9 !== null && atr14 !== null && atr14 > 0
-    ? round2(Math.abs(entryMid - ind.ema_9) / atr14) : null;
-  const dist_from_ema21_atr = ind.ema_21 !== null && atr14 !== null && atr14 > 0
-    ? round2(Math.abs(entryMid - ind.ema_21) / atr14) : null;
-  const dist_from_ema50_atr = ind.ema_50 !== null && atr14 !== null && atr14 > 0
-    ? round2(Math.abs(entryMid - ind.ema_50) / atr14) : null;
+  const dist_from_ema9_atr = ind.ema_9 !== null && microAtr > 0
+    ? round2(Math.abs(entryMid - ind.ema_9) / microAtr) : null;
+  const dist_from_ema21_atr = ind.ema_21 !== null && microAtr > 0
+    ? round2(Math.abs(entryMid - ind.ema_21) / microAtr) : null;
+  const dist_from_ema50_atr = ind.ema_50 !== null && microAtr > 0
+    ? round2(Math.abs(entryMid - ind.ema_50) / microAtr) : null;
 
   // ── B. Impulse extension (market-state — current bars, not fill price) ─
   const impulse = measureImpulse(bars, isLong);
@@ -149,6 +174,11 @@ export function computeExtensionFeatures(
 
   // ── D. Room left (measured from intended fill price) ──────────────────
   const room = computeRoomLeft(entryMid, kl, atr14);
+  // Session-scaled room metrics
+  const upside_room_session = room.upside_pts !== null && sessionAtr > 0
+    ? round2(room.upside_pts / sessionAtr) : null;
+  const downside_room_session = room.downside_pts !== null && sessionAtr > 0
+    ? round2(room.downside_pts / sessionAtr) : null;
 
   // ── E. Reset / pullback detection ──────────────────────────────────────
   const reset = detectReset(bars, isLong, impulse.impulse_pts);
@@ -156,6 +186,7 @@ export function computeExtensionFeatures(
   return {
     dist_from_vwap_pts,
     dist_from_vwap_atr,
+    dist_from_vwap_session,
     dist_from_ema9_atr,
     dist_from_ema21_atr,
     dist_from_ema50_atr,
@@ -169,13 +200,19 @@ export function computeExtensionFeatures(
     range_expansion_ratio: range_expansion,
     upside_room_pts: room.upside_pts,
     upside_room_atr: room.upside_atr,
+    upside_room_session,
     downside_room_pts: room.downside_pts,
     downside_room_atr: room.downside_atr,
+    downside_room_session,
     reset_occurred: reset.occurred,
     pullback_depth_pts: round2(reset.depth_pts),
     pullback_depth_pct_of_impulse: reset.pct_of_impulse,
     bars_in_pullback: reset.bars,
     no_reset_extension: !reset.occurred && impulse.impulse_pts > 0,
+    // Normalization diagnostics
+    normalization_mode: normMode,
+    session_atr: norms?.session_atr ?? null,
+    micro_atr: norms?.micro_atr ?? null,
   };
 }
 
@@ -217,17 +254,24 @@ export function evaluateExtensionVeto(
   const soft: string[] = [];
 
   // ── 1. VWAP distance ────────────────────────────────────────────────────────
-  // Trend pullbacks: VWAP can legitimately be far on strong trend days.
-  //   → goes to soft_reasons only.
-  // All other setups: hard veto (original behaviour preserved).
-  if (features.dist_from_vwap_atr !== null) {
+  // Uses SESSION-SCALED normalization (dist_from_vwap_session) so that a
+  // normal trending-day VWAP distance of ~400 pts registers as ~2-4 session-ATR
+  // rather than the absurd 50-100+ micro-ATR that the old 1m normalization
+  // produced. The config thresholds (max_dist_from_vwap_atr_long/short) are
+  // applied against the session-scaled value.
+  //
+  // Trend pullbacks: VWAP can legitimately be far on strong trend days → soft.
+  // All other setups: hard veto.
+  const vwapDist = features.dist_from_vwap_session ?? features.dist_from_vwap_atr;
+  if (vwapDist !== null) {
     const maxDist = isLong
       ? config.max_dist_from_vwap_atr_long
       : config.max_dist_from_vwap_atr_short;
     const signedDist = features.dist_from_vwap_pts ?? 0;
     const extendedInDirection = isLong ? signedDist > 0 : signedDist < 0;
-    if (extendedInDirection && features.dist_from_vwap_atr > maxDist) {
-      const msg = `extended_from_vwap:${features.dist_from_vwap_atr.toFixed(1)}ATR>${maxDist}`;
+    if (extendedInDirection && vwapDist > maxDist) {
+      const scale = features.dist_from_vwap_session !== null ? 'session' : 'micro';
+      const msg = `extended_from_vwap:${vwapDist.toFixed(1)}${scale}ATR>${maxDist}`;
       if (trendPullback) soft.push(msg);
       else               hard.push(msg);
     }
@@ -279,11 +323,16 @@ export function evaluateExtensionVeto(
     // This is the original behaviour, preserved exactly.
     if (impulseMature) hard.push(impulseMsg);
 
-    if (isLong && features.upside_room_atr !== null && features.upside_room_atr < config.min_upside_room_atr) {
-      hard.push(`insufficient_upside_room:${features.upside_room_atr.toFixed(1)}ATR<${config.min_upside_room_atr}`);
+    // Room checks: prefer session-scaled values, fall back to micro-scaled
+    const upsideRoom = features.upside_room_session ?? features.upside_room_atr;
+    const downsideRoom = features.downside_room_session ?? features.downside_room_atr;
+    if (isLong && upsideRoom !== null && upsideRoom < config.min_upside_room_atr) {
+      const scale = features.upside_room_session !== null ? 'session' : 'micro';
+      hard.push(`insufficient_upside_room:${upsideRoom.toFixed(1)}${scale}ATR<${config.min_upside_room_atr}`);
     }
-    if (!isLong && features.downside_room_atr !== null && features.downside_room_atr < config.min_downside_room_atr) {
-      hard.push(`insufficient_downside_room:${features.downside_room_atr.toFixed(1)}ATR<${config.min_downside_room_atr}`);
+    if (!isLong && downsideRoom !== null && downsideRoom < config.min_downside_room_atr) {
+      const scale = features.downside_room_session !== null ? 'session' : 'micro';
+      hard.push(`insufficient_downside_room:${downsideRoom.toFixed(1)}${scale}ATR<${config.min_downside_room_atr}`);
     }
 
     if (noReset)     hard.push(noResetMsg);
@@ -329,12 +378,16 @@ function _vetoTrendPullback(
 ): void {
   const { impulseMature, impulseMsg, noReset, noResetMsg, tooFast, fastMsg, tooManyPush, pushMsg } = flags;
 
-  // 1. Room: unconditional hard veto for all setup types
-  if (isLong && features.upside_room_atr !== null && features.upside_room_atr < config.min_upside_room_atr) {
-    hard.push(`insufficient_upside_room:${features.upside_room_atr.toFixed(1)}ATR<${config.min_upside_room_atr}`);
+  // 1. Room: unconditional hard veto — uses session-scaled room when available
+  const upsideRoom = features.upside_room_session ?? features.upside_room_atr;
+  const downsideRoom = features.downside_room_session ?? features.downside_room_atr;
+  if (isLong && upsideRoom !== null && upsideRoom < config.min_upside_room_atr) {
+    const scale = features.upside_room_session !== null ? 'session' : 'micro';
+    hard.push(`insufficient_upside_room:${upsideRoom.toFixed(1)}${scale}ATR<${config.min_upside_room_atr}`);
   }
-  if (!isLong && features.downside_room_atr !== null && features.downside_room_atr < config.min_downside_room_atr) {
-    hard.push(`insufficient_downside_room:${features.downside_room_atr.toFixed(1)}ATR<${config.min_downside_room_atr}`);
+  if (!isLong && downsideRoom !== null && downsideRoom < config.min_downside_room_atr) {
+    const scale = features.downside_room_session !== null ? 'session' : 'micro';
+    hard.push(`insufficient_downside_room:${downsideRoom.toFixed(1)}${scale}ATR<${config.min_downside_room_atr}`);
   }
 
   // 2. Mature impulse + no reset: combined chase signal

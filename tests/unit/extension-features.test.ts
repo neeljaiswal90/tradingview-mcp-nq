@@ -87,25 +87,42 @@ describe('Extension Features', () => {
 });
 
 describe('Extension Veto Rules', () => {
-  it('vetoes long entry extended from VWAP', () => {
-    const snap = makeSnap(24230, { vwap: 24200, atr: 10 }); // 3 ATR above VWAP
-    const features = computeExtensionFeatures(snap, 24230, 'long');
+  it('vetoes long entry extended from VWAP (session-scaled)', () => {
+    // With ATR=10, sessionAtr = 10*sqrt(60) ≈ 77.5, so need >155 pts from VWAP
+    // to exceed the 2.0 session-ATR threshold.
+    const snap = makeSnap(24400, { vwap: 24200, atr: 10 }); // 200 pts above VWAP
+    const features = computeExtensionFeatures(snap, 24400, 'long');
+    expect(features.dist_from_vwap_session).toBeGreaterThan(2.0);
     const veto = evaluateExtensionVeto(features, 'long', DEFAULT_EXTENSION_FILTER_CONFIG);
     expect(veto.vetoed).toBe(true);
     expect(veto.reasons.some(r => r.includes('extended_from_vwap'))).toBe(true);
   });
 
-  it('vetoes short entry extended from VWAP', () => {
-    const snap = makeSnap(24170, { vwap: 24200, atr: 10 }); // 3 ATR below VWAP
-    const features = computeExtensionFeatures(snap, 24170, 'short');
+  it('vetoes short entry extended from VWAP (session-scaled)', () => {
+    const snap = makeSnap(24000, { vwap: 24200, atr: 10 }); // 200 pts below VWAP
+    const features = computeExtensionFeatures(snap, 24000, 'short');
+    expect(features.dist_from_vwap_session).toBeGreaterThan(2.0);
     const veto = evaluateExtensionVeto(features, 'short', DEFAULT_EXTENSION_FILTER_CONFIG);
     expect(veto.vetoed).toBe(true);
     expect(veto.reasons.some(r => r.includes('extended_from_vwap'))).toBe(true);
   });
 
-  it('does NOT veto entry close to VWAP', () => {
-    const snap = makeSnap(24205, { vwap: 24200, atr: 10 }); // 0.5 ATR
+  it('does NOT veto entry close to VWAP (session-scaled)', () => {
+    // 5 pts from VWAP with sessionAtr ~77.5 → 0.06 session-ATR — well under 2.0
+    const snap = makeSnap(24205, { vwap: 24200, atr: 10 });
     const features = computeExtensionFeatures(snap, 24205, 'long');
+    expect(features.dist_from_vwap_session).toBeLessThan(1.0);
+    const veto = evaluateExtensionVeto(features, 'long', DEFAULT_EXTENSION_FILTER_CONFIG);
+    expect(veto.reasons.filter(r => r.includes('extended_from_vwap'))).toHaveLength(0);
+  });
+
+  it('does NOT veto moderate VWAP distance that old 1m-ATR would have killed', () => {
+    // 30 pts from VWAP: old system → 30/10 = 3.0 micro-ATR > 2.0 → VETOED
+    // new system → 30/77.5 = 0.39 session-ATR < 2.0 → NOT VETOED
+    const snap = makeSnap(24230, { vwap: 24200, atr: 10 });
+    const features = computeExtensionFeatures(snap, 24230, 'long');
+    expect(features.dist_from_vwap_atr).toBeGreaterThan(2.0); // old system would veto
+    expect(features.dist_from_vwap_session).toBeLessThan(2.0); // new system does not
     const veto = evaluateExtensionVeto(features, 'long', DEFAULT_EXTENSION_FILTER_CONFIG);
     expect(veto.reasons.filter(r => r.includes('extended_from_vwap'))).toHaveLength(0);
   });

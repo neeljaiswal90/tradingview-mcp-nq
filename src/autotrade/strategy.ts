@@ -533,31 +533,88 @@ function validateSetupTargets(setup: {
  * This filters out the "lagging trending_up" scenario where EMA stack is bullish
  * but the market is already distributing (lower highs, bearish 1m, below VWAP).
  */
-function isUptrendFresh(snap: MarketSnapshot): boolean {
-  // Check 1: 5m higher-low structure (the most reliable freshness signal)
+// ─── Unified Directional Freshness ──────────────────────────────────────────
+//
+// Both sides use the SAME conceptual framework:
+//   1. 5m bar structure: higher lows (up) or lower highs (down)
+//   2. 1m momentum: SuperTrend must not have flipped against the direction
+//   3. Session bias: price must be on the correct side of VWAP
+//
+// This replaces the old asymmetry where isUptrendFresh existed but shorts
+// had no equivalent freshness gate.
+
+/**
+ * Evaluate whether the current directional trend is "fresh" enough to
+ * justify a pullback entry. Works for both long and short directions.
+ *
+ * @param snap - Market snapshot
+ * @param direction - 'long' or 'short'
+ * @returns Object with pass/fail and diagnostic reason
+ */
+export function isTrendFresh(
+  snap: MarketSnapshot,
+  direction: 'long' | 'short',
+): { fresh: boolean; reason: string } {
+  const isLong = direction === 'long';
   const bars5m = snap.bars_5m;
-  if (bars5m.length >= 6) {
-    const recent3Lows = bars5m.slice(-3).map(b => b.low);
-    const prior3Lows = bars5m.slice(-6, -3).map(b => b.low);
-    const recentMinLow = Math.min(...recent3Lows);
-    const priorMinLow = Math.min(...prior3Lows);
-    if (recentMinLow <= priorMinLow) return false; // lower lows = not fresh uptrend
-  }
-
-  // Check 2: 1m bias must not be bearish (allows bullish or neutral)
   const ind = snap.indicators_1m;
-  if (ind.supertrend_direction === 'down') {
-    // If 1m SuperTrend has flipped down, the uptrend is stale
-    // (the EMA stack may still be bullish but momentum has reversed)
-    // Exception: allow if price is still above EMA21 (just a dip, not a reversal)
-    if (ind.ema_21 !== null && snap.price < ind.ema_21) return false;
+
+  // Check 1: 5m bar structure
+  // Longs: require higher lows (recent 3 bars' min low > prior 3 bars' min low)
+  // Shorts: require lower highs (recent 3 bars' max high < prior 3 bars' max high)
+  if (bars5m.length >= 6) {
+    const recent3 = bars5m.slice(-3);
+    const prior3 = bars5m.slice(-6, -3);
+    if (isLong) {
+      const recentMinLow = Math.min(...recent3.map(b => b.low));
+      const priorMinLow = Math.min(...prior3.map(b => b.low));
+      if (recentMinLow <= priorMinLow) {
+        return { fresh: false, reason: 'stale_uptrend:lower_lows_on_5m' };
+      }
+    } else {
+      const recentMaxHigh = Math.max(...recent3.map(b => b.high));
+      const priorMaxHigh = Math.max(...prior3.map(b => b.high));
+      if (recentMaxHigh >= priorMaxHigh) {
+        return { fresh: false, reason: 'stale_downtrend:higher_highs_on_5m' };
+      }
+    }
   }
 
-  // Check 3: Price above VWAP (if available) — session bias confirmation
-  const vwap = ind.vwap;
-  if (vwap !== null && vwap > 0 && snap.price < vwap) return false;
+  // Check 2: 1m SuperTrend must not have flipped against the direction
+  // Exception: allow if price is still on the correct side of EMA21
+  if (isLong && ind.supertrend_direction === 'down') {
+    if (ind.ema_21 !== null && snap.price < ind.ema_21) {
+      return { fresh: false, reason: 'stale_uptrend:supertrend_down_below_ema21' };
+    }
+  }
+  if (!isLong && ind.supertrend_direction === 'up') {
+    if (ind.ema_21 !== null && snap.price > ind.ema_21) {
+      return { fresh: false, reason: 'stale_downtrend:supertrend_up_above_ema21' };
+    }
+  }
 
-  return true;
+  // Check 3: Session VWAP bias
+  // Longs: price should be above VWAP
+  // Shorts: price should be below VWAP
+  const vwap = ind.vwap;
+  if (vwap !== null && vwap > 0) {
+    if (isLong && snap.price < vwap) {
+      return { fresh: false, reason: 'stale_uptrend:price_below_vwap' };
+    }
+    if (!isLong && snap.price > vwap) {
+      return { fresh: false, reason: 'stale_downtrend:price_above_vwap' };
+    }
+  }
+
+  return { fresh: true, reason: 'trend_fresh' };
+}
+
+/**
+ * Legacy wrapper: returns boolean for backward-compatible call sites.
+ * Delegates to the unified isTrendFresh().
+ */
+function isUptrendFresh(snap: MarketSnapshot): boolean {
+  return isTrendFresh(snap, 'long').fresh;
 }
 
 /**
@@ -716,6 +773,10 @@ function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
   if (!ema9 || !ema21 || !ema50) return null;
   if (!(price < ema9 && ema9 < ema21 && ema21 < ema50)) return null;
 
+  // Symmetric freshness gate: require the downtrend to be structurally fresh
+  // (mirrors isUptrendFresh() used by genTrendPullbackLong)
+  if (!isTrendFresh(snap, 'short').fresh) return null;
+
   // Price should be bouncing into the EMA cluster (within 50 pts of ema9)
   const distToEma9 = ema9 - price;
   if (distToEma9 < 0 || distToEma9 > 80) return null;
@@ -755,7 +816,7 @@ function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
     rr_t1: rrt1,
     rr_t2: rrt2,
     confidence: 0,
-    confidence_factors: ['trend_pullback', 'ema_stack_bearish', 'supertrend_down', 'downside_room_confirmed'],
+    confidence_factors: ['trend_pullback', 'ema_stack_bearish', 'supertrend_down', 'fresh_downtrend_confirmed', 'downside_room_confirmed'],
     reason: `Trend pullback short into EMA cluster. Entry ${entryLow}–${entryHigh}, stop ${stop}`,
   };
   return { ...setup, ...validateSetupTargets(setup) };
