@@ -60,6 +60,21 @@ MICROSTRUCTURE_FEATURES: list[str] = [
     "lob_sweep_count_10s",
 ]
 
+# ─── HTF zone context ────────────────────────────────────────────────────────
+
+HTF_ZONE_FEATURES: list[str] = [
+    "htf_inside_resistance_zone",   # 1 if price inside HTF resistance
+    "htf_inside_support_zone",      # 1 if price inside HTF support
+    "htf_distance_to_res_pts",      # signed offset to nearest resistance midpoint
+    "htf_distance_to_sup_pts",      # signed offset to nearest support midpoint
+    "htf_distance_to_res_atr",      # absolute distance to nearest resistance in ATR
+    "htf_distance_to_sup_atr",      # absolute distance to nearest support in ATR
+    "htf_first_obstacle_rr",        # room to first obstacle / risk_pts
+    "htf_nearest_res_tf_ord",       # ordinal: 0=null, 1=15m, 2=1h, 3=4h
+    "htf_nearest_sup_tf_ord",       # ordinal: 0=null, 1=15m, 2=1h, 3=4h
+    "htf_breakout_accepted",        # 1 if price closed above zone top (long) / below bottom (short)
+]
+
 # ─── Session context ──────────────────────────────────────────────────────────
 
 SESSION_FEATURES: list[str] = [
@@ -80,7 +95,7 @@ ENTRY_CATEGORICAL_FEATURES: list[str] = [
 
 ENTRY_NUMERIC_FEATURES: list[str] = (
     SIGNAL_FEATURES + STRUCTURE_FEATURES +
-    MICROSTRUCTURE_FEATURES + SESSION_FEATURES
+    MICROSTRUCTURE_FEATURES + HTF_ZONE_FEATURES + SESSION_FEATURES
 )
 
 ENTRY_ALL_FEATURES: list[str] = ENTRY_NUMERIC_FEATURES + ENTRY_CATEGORICAL_FEATURES
@@ -89,7 +104,7 @@ ENTRY_CAT_FEATURE_INDICES: list[int] = [
     ENTRY_ALL_FEATURES.index(c) for c in ENTRY_CATEGORICAL_FEATURES
 ]
 
-ENTRY_FEATURE_SCHEMA_VERSION = "entry_v2_clean"
+ENTRY_FEATURE_SCHEMA_VERSION = "entry_v3_htf_zones"
 ENTRY_FEATURE_COUNT = len(ENTRY_ALL_FEATURES)
 
 # Validate at import time

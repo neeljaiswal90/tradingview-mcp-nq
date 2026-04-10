@@ -1,10 +1,22 @@
 node_modules/
+dashboard/node_modules/
 dist/
-screenshots/
+dashboard/dist/
+node_modules/.vite/
 *.tsbuildinfo
+dashboard/tsconfig.tsbuildinfo
+artifacts/
+
 .env
-logs/
+.mcp.json
+
 .claude/
+.cursor/
+
+logs/
+screenshots/
+tmp/
+debug-*.log
 
 # Python
 __pycache__/
@@ -19,11 +31,32 @@ catboost_info/
 
 # Bookmap addon build
 bookmap-addon/build/
+bookmap-addon/build-check/
 bookmap-addon/*.jar
 
-# Data artifacts (generated, not committed)
-data/*.csv
-data/*.parquet
-data/*.json
-models/xgboost/*.ubj
-models/catboost/*.cbm
+# Local-only ML assets
+data/*
+!data/README.md
+!data/historical/
+!data/historical/.gitkeep
+!data/processed/
+!data/processed/.gitkeep
+data/historical/*
+!data/historical/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+models/*
+!models/README.md
+!models/catboost/
+!models/catboost/.gitkeep
+!models/xgboost/
+!models/xgboost/.gitkeep
+models/catboost/*
+!models/catboost/.gitkeep
+models/xgboost/*
+!models/xgboost/.gitkeep
+
+# Generated reports
+reports/*
+!reports/README.md

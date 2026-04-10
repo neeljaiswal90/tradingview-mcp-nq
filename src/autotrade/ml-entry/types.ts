@@ -81,10 +81,27 @@ export interface EntryFeatureVector {
   is_rth: number;
   is_opening_drive_window: number;
 
+  // HTF zone context
+  htf_inside_resistance_zone: 0 | 1 | null;
+  htf_inside_support_zone: 0 | 1 | null;
+  htf_distance_to_res_pts: number | null;
+  htf_distance_to_sup_pts: number | null;
+  htf_distance_to_res_atr: number | null;
+  htf_distance_to_sup_atr: number | null;
+  htf_first_obstacle_rr: number | null;
+  /** Ordinal: 0=null, 1=15m, 2=1h, 3=4h */
+  htf_nearest_res_tf_ord: number;
+  /** Ordinal: 0=null, 1=15m, 2=1h, 3=4h */
+  htf_nearest_sup_tf_ord: number;
+  htf_breakout_accepted: 0 | 1 | null;
+
   // Categoricals
   setup_type: string;
   regime_at_signal: string;
 }
+
+/** Entry feature schema version — bump when adding/removing/renaming features. Retrain required. */
+export const ENTRY_FEATURE_SCHEMA_VERSION = 'v2_htf_zones';
 
 // ─── Service Response ────────────────────────────────────────────────────────
 

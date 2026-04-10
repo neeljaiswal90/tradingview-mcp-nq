@@ -13,8 +13,11 @@
  */
 
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
 import type { Position, MarketSnapshot, DualDirectionResult, MarketRegime, TradeRecord, PerformanceStats } from '../types.js';
 import type { ContractSpec } from '../contracts.js';
+import { getEtParts } from '../session.js';
+import type { DashboardDeltaEvent, DashboardDeltaBatch } from '../../shared/dashboard-contract.js';
 import type {
   DashboardSnapshot,
   DashboardAppMeta,
@@ -24,6 +27,9 @@ import type {
   DashboardDirectionalAssessment,
   DashboardManagement,
   DashboardRecentTrade,
+  DashboardHtfContext,
+  DashboardHtfZone,
+  DashboardHtfSetupEval,
   PnlPoint,
   FreshnessMetadata,
 } from './types.js';
@@ -65,6 +71,16 @@ export class DashboardStateManager extends EventEmitter {
   private lastSnap: MarketSnapshot | null = null;
   private lastRegime: MarketRegime = 'range_bound';
   private sessionInfo: SessionInfo | null = null;
+  /** Fresh lite indicators from context-refresh lane (preferred over stale lastSnap in buildMarketState). */
+  private liteIndicators: {
+    ema_9: number | null;
+    ema_21: number | null;
+    ema_50: number | null;
+    vwap: number | null;
+    atr_14: number | null;
+    supertrend_direction: string | null;
+    price: number;
+  } | null = null;
 
   // Position
   private position: Position | null = null;
@@ -77,6 +93,7 @@ export class DashboardStateManager extends EventEmitter {
   private perfStats: PerformanceStats | null = null;
   private recentTrades: TradeRecord[] = [];
   private pnlHistory: PnlPoint[] = [];
+  private entryCount = 0;
 
   // Risk
   private riskState: RiskStateInput | null = null;
@@ -88,6 +105,25 @@ export class DashboardStateManager extends EventEmitter {
   private mlConfig: import('../ml/types.js').MlManagementConfig | null = null;
   private mlDecisionCount = 0;
   private mlApprovedCount = 0;
+
+  // ── Sequence tracking ───────────────────────────────────────────────────
+  /** Increments on every internal state mutation. */
+  private mutationSeq = 0;
+  /** Increments only on SSE publish commit. getSnapshot() does NOT increment this. */
+  private publishSeq = 0;
+  private lastMutationIso: string | null = null;
+  /** Random UUID generated at startup — clients detect restarts via mismatch. */
+  readonly serverInstanceId = randomUUID();
+
+  /** Coalescable events — keyed by type, only latest kept. */
+  private coalescable: Map<string, DashboardDeltaEvent> = new Map();
+  /** Non-coalescable lifecycle events — all instances preserved, order maintained. */
+  private lifecycleEvents: DashboardDeltaEvent[] = [];
+
+  /** Event types that are coalesced (only latest kept per publish cycle). */
+  private static readonly COALESCABLE_TYPES = new Set([
+    'price_tick', 'management_update', 'position_updated', 'app_update',
+  ]);
 
   // Freshness tracking
   private snapshotVersion = 0;
@@ -119,6 +155,8 @@ export class DashboardStateManager extends EventEmitter {
   updateMarketSnapshot(snap: MarketSnapshot): void {
     this.lastSnap = snap;
     this.currentPrice = snap.price;
+    this.liteIndicators = null; // Full snap supersedes lite
+    this.recordMutation();
     // No emit here — the runner calls flush() at end of cycle to broadcast
     // all state changes (regime, directional, session, etc.) as one coherent snapshot.
   }
@@ -132,12 +170,44 @@ export class DashboardStateManager extends EventEmitter {
   }
 
   updatePosition(pos: Position | null): void {
+    const wasOpen = !!this.position;
+    if (pos && !this.position) {
+      this.entryCount++;
+    }
     this.position = pos;
+    this.recordMutation();
+
+    if (pos && !wasOpen) {
+      this.queueEvent({ type: 'position_opened', active_trade: this.buildActiveTrade(), kpis: this.buildKpis() });
+    } else if (!pos && wasOpen) {
+      this.queueEvent({ type: 'position_cleared', active_trade: this.buildActiveTrade(), kpis: this.buildKpis() });
+    } else if (pos) {
+      // Position update (stop/target/trail change)
+      this.queueEvent({ type: 'position_updated', active_trade: this.buildActiveTrade() });
+    }
     this.emitUpdate();
   }
 
   updateCurrentPrice(price: number): void {
     this.currentPrice = price;
+    this.recordMutation();
+    this.queueEvent({ type: 'price_tick', price });
+  }
+
+  /**
+   * Update market-state indicators from a lite 1m snapshot (in-position context-refresh).
+   * Avoids requiring a full MarketSnapshot — only updates the indicator fields
+   * that buildMarketState() actually reads.
+   */
+  updateLiteIndicators(indicators: {
+    ema_9: number | null;
+    ema_21: number | null;
+    ema_50: number | null;
+    vwap: number | null;
+    atr_14: number | null;
+    supertrend_direction: string | null;
+  }, price: number): void {
+    this.liteIndicators = { ...indicators, price };
   }
 
   updateDirectionalSignal(signal: DualDirectionResult): void {
@@ -163,6 +233,13 @@ export class DashboardStateManager extends EventEmitter {
       time_iso: trade.timestamp_exit,
       cumulative_pnl: Math.round(cumPnl * 100) / 100,
     });
+    this.recordMutation();
+    this.queueEvent({
+      type: 'recent_trade_added',
+      recent_trades: this.buildRecentTrades(),
+      pnl_history: this.pnlHistory,
+      kpis: this.buildKpis(),
+    });
     this.emitUpdate();
   }
 
@@ -176,11 +253,21 @@ export class DashboardStateManager extends EventEmitter {
     this.mlConfig = config;
     this.mlDecisionCount++;
     if (decision.approved) this.mlApprovedCount++;
+    this.recordMutation();
+    this.queueEvent({ type: 'ml_decision', ml_management: this.buildMlManagement() });
+  }
+
+  /** Seed ML config without a decision — shows "enabled / awaiting first inference" in dashboard. */
+  seedMlConfig(config: import('../ml/types.js').MlManagementConfig): void {
+    if (!this.mlConfig) {
+      this.mlConfig = config;
+    }
   }
 
   /** Clear ML management state (e.g., when position closes). */
   clearMlManagement(): void {
     this.mlDecision = null;
+    this.mlConfig = null; // Reset so next position gets fresh seed
   }
 
   incrementCycle(): void {
@@ -200,6 +287,12 @@ export class DashboardStateManager extends EventEmitter {
   /** Update in-trade management metrics (PoP + EV). Batched via flush(). */
   updateManagement(metrics: ManagementMetrics): void {
     this.managementMetrics = metrics;
+    this.recordMutation();
+    this.queueEvent({
+      type: 'management_update',
+      management: this.buildManagement(),
+      active_trade: this.buildActiveTrade(),
+    });
   }
 
   /** Clear management metrics when position closes. */
@@ -236,6 +329,14 @@ export class DashboardStateManager extends EventEmitter {
    * rather than emitting after every individual setter.
    */
   flush(): void {
+    // Queue a market/app update if we have pending mutations but no specific typed event
+    // covers them (e.g., regime change, analysis cycle completion)
+    if (this.lifecycleEvents.length === 0 && this.coalescable.size === 0 && this.mutationSeq > 0) {
+      this.queueEvent({
+        type: 'app_update',
+        app: this.buildAppMeta(),
+      });
+    }
     this.emitUpdate();
   }
 
@@ -252,6 +353,7 @@ export class DashboardStateManager extends EventEmitter {
       market_state: this.buildMarketState(),
       directional: this.buildDirectional(),
       ml_management: this.buildMlManagement(),
+      htf_context: this.buildHtfContext(),
       recent_trades: this.buildRecentTrades(),
       pnl_history: this.pnlHistory,
       freshness: this.buildFreshness(),
@@ -297,7 +399,8 @@ export class DashboardStateManager extends EventEmitter {
     }
 
     return {
-      trades_today: stats?.total_trades ?? 0,
+      closed_trades: stats?.total_trades ?? 0,
+      entries_today: this.entryCount,
       total_pnl_usd: Math.round((realizedPnl + unrealizedPnl) * 100) / 100,
       realized_pnl_usd: Math.round(realizedPnl * 100) / 100,
       unrealized_pnl_usd: Math.round(unrealizedPnl * 100) / 100,
@@ -421,14 +524,18 @@ export class DashboardStateManager extends EventEmitter {
 
   private buildMarketState(): DashboardMarketState {
     const snap = this.lastSnap;
-    const ind1m = snap?.indicators_1m;
+    // Prefer fresh lite indicators (from context-refresh lane, 5s cadence)
+    // over stale full-snap indicators (from analysis lane, frozen during managing)
+    const lite = this.liteIndicators;
+    const ind = lite ?? snap?.indicators_1m ?? null;
+    const refPrice = lite?.price ?? this.currentPrice ?? snap?.price ?? null;
 
     // Compute EMA stack description
     let emaStack: string | null = null;
-    if (ind1m?.ema_9 != null && ind1m?.ema_21 != null && ind1m?.ema_50 != null) {
-      if (ind1m.ema_9 > ind1m.ema_21 && ind1m.ema_21 > ind1m.ema_50) {
+    if (ind?.ema_9 != null && ind?.ema_21 != null && ind?.ema_50 != null) {
+      if (ind.ema_9 > ind.ema_21 && ind.ema_21 > ind.ema_50) {
         emaStack = 'bullish_ordered';
-      } else if (ind1m.ema_9 < ind1m.ema_21 && ind1m.ema_21 < ind1m.ema_50) {
+      } else if (ind.ema_9 < ind.ema_21 && ind.ema_21 < ind.ema_50) {
         emaStack = 'bearish_ordered';
       } else {
         emaStack = 'mixed';
@@ -438,8 +545,8 @@ export class DashboardStateManager extends EventEmitter {
     // VWAP relationship
     let priceVsVwap: string | null = null;
     let vwapDist: number | null = null;
-    if (snap && ind1m?.vwap != null) {
-      vwapDist = Math.round((snap.price - ind1m.vwap) * 100) / 100;
+    if (refPrice != null && ind?.vwap != null) {
+      vwapDist = Math.round((refPrice - ind.vwap) * 100) / 100;
       priceVsVwap = vwapDist > 0 ? 'above_vwap' : vwapDist < 0 ? 'below_vwap' : 'at_vwap';
     }
 
@@ -454,11 +561,11 @@ export class DashboardStateManager extends EventEmitter {
       bias_1m: bias?.['1m'] ?? null,
       alignment_score: bias?.alignment_score ?? null,
       ema_stack: emaStack,
-      supertrend_bias: ind1m?.supertrend_direction ?? null,
+      supertrend_bias: ind?.supertrend_direction ?? null,
       price_vs_vwap: priceVsVwap,
       distance_from_vwap_pts: vwapDist,
-      atr_1m: ind1m?.atr_14 != null ? Math.round(ind1m.atr_14 * 100) / 100 : null,
-      current_price: this.currentPrice ?? snap?.price ?? null,
+      atr_1m: ind?.atr_14 != null ? Math.round(ind.atr_14 * 100) / 100 : null,
+      current_price: this.currentPrice ?? refPrice,
       session: this.sessionInfo ?? null,
     };
   }
@@ -473,6 +580,8 @@ export class DashboardStateManager extends EventEmitter {
         engine_decision_reason: null,
         confidence: null,
         skip_reasons: [],
+        htf_eval_long: null,
+        htf_eval_short: null,
       };
     }
 
@@ -499,6 +608,18 @@ export class DashboardStateManager extends EventEmitter {
       };
     };
 
+    const mapHtfEval = (c: typeof sig.bestLong): DashboardHtfSetupEval | null => {
+      if (!c?.htfEval) return null;
+      return {
+        first_obstacle_rr: c.htfEval.first_obstacle_rr,
+        location_quality: c.htfEval.location_quality,
+        score_adjustment: c.htfEval.score_adjustment,
+        vetoed: c.htfEval.vetoed,
+        veto_reason: c.htfEval.veto_reason,
+        breakout_accepted: c.htfEval.breakout_accepted,
+      };
+    };
+
     return {
       best_long: mapCandidate(sig.bestLong),
       best_short: mapCandidate(sig.bestShort),
@@ -506,6 +627,38 @@ export class DashboardStateManager extends EventEmitter {
       engine_decision_reason: sig.decisionReason,
       confidence: sig.confidence ?? null,
       skip_reasons: sig.skipReasons,
+      htf_eval_long: mapHtfEval(sig.bestLong),
+      htf_eval_short: mapHtfEval(sig.bestShort),
+    };
+  }
+
+  private buildHtfContext(): DashboardHtfContext | null {
+    const htf = this.lastSnap?.htf_context;
+    if (!htf || !htf.study_present) return null;
+
+    const mapZone = (z: import('../types.js').HtfZone): DashboardHtfZone => ({
+      timeframe: z.timeframe,
+      kind: z.kind,
+      level: z.level,
+      top: z.top,
+      bottom: z.bottom,
+      distance_pts: z.distance_pts,
+      distance_atr: z.distance_atr,
+      contains_price: z.contains_price,
+    });
+
+    // Limit to top 3 nearest per kind for dashboard display
+    const resZones = htf.resistance_zones.slice(0, 3).map(mapZone);
+    const supZones = htf.support_zones.slice(0, 3).map(mapZone);
+
+    return {
+      study_present: true,
+      resistance_zones: resZones,
+      support_zones: supZones,
+      nearest_resistance: htf.nearest_resistance ? mapZone(htf.nearest_resistance) : null,
+      nearest_support: htf.nearest_support ? mapZone(htf.nearest_support) : null,
+      inside_resistance_zone: htf.inside_resistance_zone,
+      inside_support_zone: htf.inside_support_zone,
     };
   }
 
@@ -541,9 +694,9 @@ export class DashboardStateManager extends EventEmitter {
       latest_rejection_reason: d?.rejection_reason ?? null,
       prob_hold: d?.prob_hold ?? null,
       ev_hold_r: d?.ev_hold_r ?? null,
-      ev_exit_now_r: null, // Populated from features at call time
+      ev_exit_now_r: d?.ev_exit_now_r ?? null,
       inference_ms: d?.inference_ms ?? null,
-      last_evaluated_at: d ? new Date().toISOString() : null,
+      last_evaluated_at: d?.evaluated_at_iso ?? null,
       notes: d?.notes ?? [],
       decisions_this_session: this.mlDecisionCount,
       actions_approved_this_session: this.mlApprovedCount,
@@ -571,6 +724,10 @@ export class DashboardStateManager extends EventEmitter {
     return {
       snapshot_built_at: new Date().toISOString(),
       snapshot_version: this.snapshotVersion,
+      publish_seq: this.publishSeq,
+      mutation_seq: this.mutationSeq,
+      last_mutation_iso: this.lastMutationIso,
+      server_instance_id: this.serverInstanceId,
       data_gathered_at: this.dataGatheredAt,
       data_gather_duration_ms: this.dataGatherDurationMs,
       confidence_updated_at: this.confidenceUpdatedAt,
@@ -597,6 +754,51 @@ export class DashboardStateManager extends EventEmitter {
     this.emit('update');
   }
 
+  /** Record a mutation and timestamp. Called in every setter that changes state. */
+  private recordMutation(): void {
+    this.mutationSeq++;
+    this.lastMutationIso = new Date().toISOString();
+  }
+
+  /** Queue a typed delta event for the next publish cycle. */
+  queueEvent(event: DashboardDeltaEvent): void {
+    if (DashboardStateManager.COALESCABLE_TYPES.has(event.type)) {
+      // Coalescable: keep only the latest (overwrites previous of same type)
+      this.coalescable.set(event.type, event);
+    } else {
+      // Lifecycle: preserve all instances in insertion order
+      this.lifecycleEvents.push(event);
+    }
+  }
+
+  /**
+   * Atomically drain pending events into a single batch with one unique publishSeq.
+   * Returns null if nothing to publish. Node.js single-threaded —
+   * no await between snapshot-of-events and clear ensures atomicity.
+   *
+   * Ordering: lifecycle events first (in original order), then coalesced events.
+   */
+  publishEvents(): { batch: DashboardDeltaBatch; publishSeq: number } | null {
+    if (this.lifecycleEvents.length === 0 && this.coalescable.size === 0) return null;
+    this.publishSeq++;
+    const seq = this.publishSeq;
+    // Lifecycle events in original order, then coalesced (latest-only) events
+    const events: DashboardDeltaEvent[] = [
+      ...this.lifecycleEvents,
+      ...this.coalescable.values(),
+    ];
+    this.lifecycleEvents = [];
+    this.coalescable.clear();
+    return { batch: { publish_seq: seq, events }, publishSeq: seq };
+  }
+
+  /** Get current publish sequence (for snapshot responses). */
+  getPublishSeq(): number { return this.publishSeq; }
+  /** Get current mutation sequence. */
+  getMutationSeq(): number { return this.mutationSeq; }
+  /** Get server instance ID. */
+  getServerInstanceId(): string { return this.serverInstanceId; }
+
   /** Load trades from disk on startup for recent trades / pnl history. */
   loadTradesFromDisk(trades: TradeRecord[]): void {
     this.recentTrades = trades.slice(-50);
@@ -608,5 +810,13 @@ export class DashboardStateManager extends EventEmitter {
         cumulative_pnl: Math.round(cumPnl * 100) / 100,
       };
     });
+
+    // Hydrate entry count for today (ET-based trading day)
+    const todayEt = getEtParts(new Date());
+    const todayKey = `${todayEt.year}-${todayEt.month}-${todayEt.day}`;
+    this.entryCount = trades.filter(t => {
+      const entryEt = getEtParts(new Date(t.timestamp_entry));
+      return `${entryEt.year}-${entryEt.month}-${entryEt.day}` === todayKey;
+    }).length;
   }
 }

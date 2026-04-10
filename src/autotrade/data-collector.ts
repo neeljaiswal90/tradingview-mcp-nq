@@ -26,9 +26,12 @@ import type {
   KeyLevels,
   MarketSnapshot,
   DataQuality,
+  HtfZonesConfig,
 } from './types.js';
 import { classifySession, buildOpeningRange, computePriorLevels } from './session.js';
+import type { SessionContext } from './session.js';
 import { computeIndicators } from './features/indicators.js';
+import { buildHtfContext, emptyHtfContext, DEFAULT_HTF_ZONES_CONFIG } from './features/htf-zones.js';
 
 // ─── Raw type helpers ────────────────────────────────────────────────────────
 
@@ -346,6 +349,25 @@ export interface CollectionTiming {
   htf_cache_misses: string[];
 }
 
+// ─── Lite Snapshot (in-position context refresh) ────────────────────────────
+
+/**
+ * Lightweight snapshot for in-position context refresh.
+ * Only fetches 1m data (no HTF switching). ~150-200ms typical.
+ */
+export interface LiteSnapshot {
+  timestamp_unix: number;
+  timestamp_iso: string;
+  price: number;
+  bars_1m: OhlcvBar[];
+  indicators_1m: IndicatorSnapshot;
+  session: SessionContext;
+  /** Carried forward from last full collect(). */
+  key_levels: KeyLevels;
+  /** Age in ms since last full collect() populated key_levels. */
+  key_levels_age_ms: number;
+}
+
 // ─── TF Switch Sleep ────────────────────────────────────────────────────────
 
 /** Reduced from 300ms → 150ms. TradingView chart settles in ~100-150ms. */
@@ -374,6 +396,18 @@ export class DataCollector {
   /** HTF cache to avoid redundant TF switches on every cycle. */
   private htfCache = new Map<string, HtfCacheEntry>();
 
+  /**
+   * Tracked timeframe — updated after every setTimeframe() call.
+   * Used by ensureTimeframe() to skip redundant TF switches.
+   * Set to 'unknown' on switch failure to force re-switch next call.
+   */
+  private lastKnownTimeframe: string = 'unknown';
+
+  /** Last key_levels from a full collect() — carried forward to lite snapshots. */
+  private lastFullKeyLevels: KeyLevels | null = null;
+  /** Date.now() when lastFullKeyLevels was set. */
+  private lastFullKeyLevelsAt = 0;
+
   /** Last collection timing for observability. */
   private _lastTiming: CollectionTiming | null = null;
   get lastTiming(): CollectionTiming | null { return this._lastTiming; }
@@ -396,14 +430,20 @@ export class DataCollector {
     // ── Step 1: Ensure 1m (always fresh — this is the primary TF) ───────
     const t1 = Date.now();
     await chart.setTimeframe({ timeframe: '1' });
+    this.lastKnownTimeframe = '1';
     await sleep(TF_SWITCH_SLEEP_MS);
 
-    const [quote1m, raw1mBars, raw1mStudies, rawLines, rawLabels] = await Promise.all([
+    const htfConfig: HtfZonesConfig = (this as any).htfZonesConfig ?? DEFAULT_HTF_ZONES_CONFIG;
+
+    const [quote1m, raw1mBars, raw1mStudies, rawLines, rawLabels, rawHtfLabels] = await Promise.all([
       data.getQuote({}).catch(() => null),
       data.getOhlcv({ count: this.barCount1m }).catch(() => null),
       data.getStudyValues().catch(() => null),
       data.getPineLines({}).catch(() => null),
       data.getPineLabels({ study_filter: 'RIPS' }).catch(() => null),
+      htfConfig.enabled
+        ? data.getPineLabels({ study_filter: htfConfig.study_filter, max_labels: htfConfig.max_labels }).catch(() => null)
+        : Promise.resolve(null),
     ]);
 
     const bars1m = extractBars(raw1mBars as RawOhlcvResult | null);
@@ -428,6 +468,11 @@ export class DataCollector {
     if (indicators1m.smart_money_choch_buy !== null) keyLevels.choch_buy = indicators1m.smart_money_choch_buy;
     if (indicators1m.smart_money_bos_sell !== null) keyLevels.bos_sell = indicators1m.smart_money_bos_sell;
     if (indicators1m.smart_money_bos_buy !== null) keyLevels.bos_buy = indicators1m.smart_money_bos_buy;
+
+    // HTF zone context (market-neutral — no directional evaluation here)
+    const htfContext = htfConfig.enabled
+      ? buildHtfContext(rawHtfLabels as RawPineLabels | null, price, indicators1m.atr_14)
+      : emptyHtfContext();
     const phase1m = Date.now() - t1;
 
     // ── Step 2: 5m (cached) ─────────────────────────────────────────────
@@ -439,6 +484,7 @@ export class DataCollector {
       cacheHits.push('5m');
     } else {
       await chart.setTimeframe({ timeframe: '5' });
+      this.lastKnownTimeframe = '5';
       await sleep(TF_SWITCH_SLEEP_MS);
       const raw5mBars = await data.getOhlcv({ count: this.barCount5m }).catch(() => null);
       bars5m = extractBars(raw5mBars as RawOhlcvResult | null);
@@ -462,6 +508,7 @@ export class DataCollector {
       cacheHits.push('15m');
     } else {
       await chart.setTimeframe({ timeframe: '15' });
+      this.lastKnownTimeframe = '15';
       await sleep(TF_SWITCH_SLEEP_MS);
       // 15m: OHLCV only — indicators computed locally (no getStudyValues call)
       // tradingview_study fields are not needed at this timeframe
@@ -488,6 +535,7 @@ export class DataCollector {
       cacheHits.push('1h');
     } else {
       await chart.setTimeframe({ timeframe: '60' });
+      this.lastKnownTimeframe = '60';
       await sleep(TF_SWITCH_SLEEP_MS);
       // 1h: OHLCV only — indicators computed locally (no getStudyValues call)
       // tradingview_study fields are not needed at this timeframe
@@ -508,6 +556,7 @@ export class DataCollector {
     // Only restore if we actually switched away
     if (cacheMisses.length > 0) {
       await chart.setTimeframe({ timeframe: '1' });
+      this.lastKnownTimeframe = '1';
       await sleep(RESTORE_SLEEP_MS);
     }
     const phaseRestore = Date.now() - tRestore;
@@ -561,6 +610,10 @@ export class DataCollector {
     keyLevels.session_vwap = indicators1m.vwap;
     const phaseEnrich = Date.now() - tEnrich;
 
+    // ── Cache key_levels for lite snapshots ──────────────────────────────
+    this.lastFullKeyLevels = { ...keyLevels, pivot_resistance: [...keyLevels.pivot_resistance], pivot_support: [...keyLevels.pivot_support] };
+    this.lastFullKeyLevelsAt = Date.now();
+
     // ── Timing instrumentation ───────────────────────────────────────────
     this._lastTiming = {
       total_ms: Date.now() - t0,
@@ -597,6 +650,7 @@ export class DataCollector {
         minutes_since_rth_open: session.minutes_since_rth_open,
         minutes_to_rth_close: session.minutes_to_rth_close,
       },
+      htf_context: htfContext,
     };
   }
 
@@ -613,6 +667,98 @@ export class DataCollector {
   /** Force-invalidate HTF cache (e.g., after a significant event). */
   invalidateHtfCache(): void {
     this.htfCache.clear();
+  }
+
+  // ─── Timeframe Safety ───────────────────────────────────────────────────────
+
+  /**
+   * Ensure the chart is on the given timeframe. Fast no-op if already there.
+   * On failure, sets lastKnownTimeframe to 'unknown' to force re-switch next call.
+   */
+  private async ensureTimeframe(tf: string): Promise<void> {
+    if (this.lastKnownTimeframe === tf) return;
+    try {
+      await chart.setTimeframe({ timeframe: tf });
+      await sleep(TF_SWITCH_SLEEP_MS);
+      this.lastKnownTimeframe = tf;
+    } catch {
+      this.lastKnownTimeframe = 'unknown';
+      throw new Error(`ensureTimeframe('${tf}') failed`);
+    }
+  }
+
+  // ─── Lightweight In-Position Collector ──────────────────────────────────────
+
+  /**
+   * Collect a lightweight 1m-only snapshot for in-position context refresh.
+   *
+   * Does NOT switch to higher timeframes (5m/15m/1h).
+   * Carries forward key_levels from the last full collect() with a TTL.
+   * Cost: ~150-200ms typical vs 300-500ms for full collect().
+   */
+  async collectLite1m(): Promise<LiteSnapshot> {
+    const t0 = Date.now();
+
+    // Ensure we're on the 1m timeframe
+    await this.ensureTimeframe('1');
+
+    // Parallel fetch: quote + bars + TV study values (1m only)
+    const [quote1m, raw1mBars, raw1mStudies] = await Promise.all([
+      data.getQuote({}).catch(() => null),
+      data.getOhlcv({ count: this.barCount1m }).catch(() => null),
+      data.getStudyValues().catch(() => null),
+    ]);
+
+    const bars1m = extractBars(raw1mBars as RawOhlcvResult | null);
+    const price = (quote1m as Record<string, unknown> | null)?.last as number
+      ?? bars1m[bars1m.length - 1]?.close
+      ?? 0;
+
+    // Build local indicators, overlay TV-only fields
+    const localIndicators1m = buildLocalIndicatorSnapshot(bars1m);
+    const tvVals1m = extractStudyValues(raw1mStudies as RawStudyValues | null);
+    const indicators1m = overlayTvStudyFields(localIndicators1m, tvVals1m);
+
+    // Session context
+    const now = new Date();
+    const session = classifySession(now);
+
+    // Key levels: carry forward from last full collect() with age tracking
+    const keyLevels = this.lastFullKeyLevels ?? this.emptyKeyLevels();
+    const keyLevelsAgeMs = this.lastFullKeyLevelsAt > 0
+      ? Date.now() - this.lastFullKeyLevelsAt
+      : Infinity;
+
+    // Update session VWAP from fresh indicators
+    keyLevels.session_vwap = indicators1m.vwap;
+
+    return {
+      timestamp_unix: t0,
+      timestamp_iso: new Date(t0).toISOString(),
+      price,
+      bars_1m: bars1m,
+      indicators_1m: indicators1m,
+      session,
+      key_levels: keyLevels,
+      key_levels_age_ms: keyLevelsAgeMs === Infinity ? -1 : keyLevelsAgeMs,
+    };
+  }
+
+  /** Empty key levels placeholder when no full collect() has run yet. */
+  private emptyKeyLevels(): KeyLevels {
+    return {
+      session_high: null, session_low: null,
+      daily_open: null, weekly_open: null,
+      monday_high: null, monday_low: null, monday_mid: null,
+      monthly_open: null,
+      pivot_resistance: [], pivot_support: [],
+      choch_sell: null, choch_buy: null,
+      bos_sell: null, bos_buy: null,
+      overnight_high: null, overnight_low: null,
+      prior_rth_high: null, prior_rth_low: null,
+      opening_range_high: null, opening_range_low: null, opening_range_mid: null,
+      session_vwap: null,
+    };
   }
 }
 

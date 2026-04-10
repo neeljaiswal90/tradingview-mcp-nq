@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { DashboardStateManager } from '../../src/autotrade/dashboard/state-manager.js';
 import type { TradeRecord, MarketRegime, DualDirectionResult, PerformanceStats, MarketSnapshot } from '../../src/autotrade/types.js';
 import type { ContractSpec } from '../../src/autotrade/contracts.js';
-import type { DASHBOARD_VERSION } from '../../src/autotrade/dashboard/types.js';
+import type { MlDecision, MlManagementConfig } from '../../src/autotrade/ml/types.js';
+import type { DashboardSnapshot } from '../../src/shared/dashboard-contract.js';
 
 const mockContract: ContractSpec = {
   root: 'NQ',
@@ -95,9 +96,11 @@ describe('DashboardStateManager', () => {
 
   it('returns a valid snapshot with version', () => {
     const snap = manager.getSnapshot();
+    const typedSnapshot: DashboardSnapshot = snap;
     expect(snap.version).toBe('dashboard_v1.6');
     expect(snap.app.symbol).toBe('NQ');
     expect(snap.app.mode).toBe('paper');
+    expect(typedSnapshot.freshness.snapshot_version).toBeGreaterThanOrEqual(1);
   });
 
   it('returns empty active trade when no position', () => {
@@ -137,11 +140,44 @@ describe('DashboardStateManager', () => {
       trailing_active: false,
       trail_distance_ticks: 0,
       trail_anchor_price: null,
+      pre_t1_be_triggered: false,
+      pre_t1_trailing_active: false,
       target_1_direction_valid: true,
       target_2_direction_valid: true,
       target_3_direction_valid: true,
       target_ordering_valid: true,
       target_repair_applied: false,
+      pt1_done: false,
+      pt2_done: false,
+      pt1_realized_pnl: 0,
+      pt2_realized_pnl: 0,
+      pt1_qty_exited: 0,
+      pt2_qty_exited: 0,
+      exit_legs: [],
+      realized_pnl_so_far: 0,
+      realized_fees_so_far: 0,
+      atr_at_entry: 18,
+      management_params: {
+        profile_name: 'trend_scaler',
+        family: 'pullback',
+        atr_at_entry: 18,
+        pt1_offset_pts: 10,
+        pt2_offset_pts: 20,
+        pt1_exit_fraction: 0.5,
+        pt2_exit_fraction: 0.25,
+        pt1_move_to_be: true,
+        pt1_activate_trailing: true,
+        trail_ticks_post_t1: 12,
+        breakeven_trigger_r: 0.5,
+        pre_t1_trail_trigger_r: 0.8,
+        pre_t1_trail_distance_ticks: 10,
+        time_stop_minutes: 30,
+        time_stop_max_r_pre_t1: 0.6,
+        time_stop_max_r_post_t1: 1.2,
+      },
+      mfe_at_pt1_trigger: 0,
+      mae_at_pt1_trigger: 0,
+      peak_r_before_first_partial: 0,
     });
     manager.updateCurrentPrice(17010);
 
@@ -152,6 +188,12 @@ describe('DashboardStateManager', () => {
     expect(snap.active_trade.stop_loss).toBe(17000);
     expect(snap.active_trade.target_1).toBe(17020);
     expect(snap.active_trade.breakeven_armed).toBe(true);
+    expect(snap.active_trade.management_profile).toBe('trend_scaler');
+    expect(snap.active_trade.setup_family).toBe('pullback');
+    expect(snap.active_trade.atr_at_entry).toBe(18);
+    expect(snap.active_trade.pt1_resolved_pts).toBe(10);
+    expect(snap.active_trade.pt2_resolved_pts).toBe(20);
+    expect(snap.active_trade.trail_resolved_ticks).toBe(12);
   });
 
   it('correctly clears active trade on position close', () => {
@@ -238,7 +280,7 @@ describe('DashboardStateManager', () => {
     manager.updatePerformance(stats);
 
     const snap = manager.getSnapshot();
-    expect(snap.kpis.trades_today).toBe(5);
+    expect(snap.kpis.closed_trades).toBe(5);
     expect(snap.kpis.win_rate_pct).toBe(60);
     expect(snap.kpis.avg_r).toBe(0.8);
     expect(snap.kpis.realized_pnl_usd).toBe(350);
@@ -356,6 +398,90 @@ describe('DashboardStateManager', () => {
     expect(snap.recent_trades).toHaveLength(3);
     expect(snap.pnl_history).toHaveLength(3);
     expect(snap.pnl_history[2]!.cumulative_pnl).toBe(270); // 100 - 30 + 200
+  });
+
+  it('includes management metrics and preserves canonical ML timing fields', () => {
+    const metrics = {
+      pop: {
+        pop_target1_before_stop: 0.61,
+        pop_target2_before_stop: 0.34,
+        pop_runner_extension: 0.18,
+        model_name: 'rules_v1',
+        model_version: '1',
+        confidence_in_estimate: 'medium',
+      },
+      expected_value_hold_usd: 125,
+      expected_value_exit_now_usd: 86,
+      expected_value_reduce_usd: 103,
+      management_state: 'HOLD',
+      management_state_reason: 'Momentum intact',
+      decision_factors: ['above_vwap', 'time_stop_buffer'],
+      timestamp_iso: '2026-04-08T15:45:00.000Z',
+    } as const;
+
+    const mlConfig: MlManagementConfig = {
+      enabled: true,
+      service_url: 'http://127.0.0.1:5001',
+      timeout_ms: 3000,
+      model_type: 'catboost',
+      model_version: '2026.04',
+      min_confidence_exit: 0.6,
+      min_confidence_partial: 0.55,
+      min_confidence_stop_move: 0.5,
+      max_quote_age_ms: 5000,
+      action_cooldown_seconds: 0,
+      enable_partial_exit: false,
+    };
+
+    const mlDecision: MlDecision = {
+      action: 'HOLD',
+      confidence: 0.76,
+      approved: true,
+      rejection_reason: null,
+      prob_hold: 0.64,
+      ev_hold_r: 1.42,
+      ev_exit_now_r: 0.91,
+      recommended_stop_price: null,
+      recommended_size_fraction: null,
+      model_name: 'catboost',
+      model_version: '2026.04',
+      inference_ms: 42,
+      evaluated_at_iso: '2026-04-08T15:45:02.000Z',
+      gate_checks: [],
+      notes: ['flow_supportive'],
+      tier_used: null,
+      fallback_used: false,
+      fallback_reason: null,
+    };
+
+    manager.updateManagement(metrics as any);
+    manager.updateMlManagement(mlDecision, mlConfig);
+
+    const snap = manager.getSnapshot();
+    expect(snap.management.management_state).toBe('HOLD');
+    expect(snap.management.management_state_reason).toBe('Momentum intact');
+    expect(snap.management.decision_factors).toContain('above_vwap');
+    expect(snap.management.last_evaluated_at).toBe('2026-04-08T15:45:00.000Z');
+    expect(snap.ml_management.ev_exit_now_r).toBe(0.91);
+    expect(snap.ml_management.last_evaluated_at).toBe('2026-04-08T15:45:02.000Z');
+  });
+
+  it('surfaces engine phase and quote freshness in app metadata', () => {
+    const quoteTimestamp = Date.now() - 1500;
+    manager.setConnectionStatus('connected');
+    manager.updateEnginePhase({ phase: 'MANAGING', elapsed_ms: 12345, reason: 'open_position' });
+    manager.updateQuoteInfo({ source: 'live', timestamp_unix_ms: quoteTimestamp, is_stale: true, age_ms: 1500 });
+
+    const snap = manager.getSnapshot();
+    expect(snap.app.connection_status).toBe('connected');
+    expect(snap.app.engine_phase).toBe('MANAGING');
+    expect(snap.app.engine_phase_elapsed_ms).toBe(12345);
+    expect(snap.app.engine_phase_reason).toBe('open_position');
+    expect(snap.app.quote_source).toBe('live');
+    expect(snap.app.quote_is_stale).toBe(true);
+    expect(snap.app.quote_age_ms).not.toBeNull();
+    expect(snap.app.quote_age_ms!).toBeGreaterThanOrEqual(1000);
+    expect(snap.app.quote_updated_at).not.toBeNull();
   });
 
   it('caps recent trades at 50', () => {

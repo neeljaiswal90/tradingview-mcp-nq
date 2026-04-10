@@ -10,15 +10,17 @@ function timeAgo(iso: string | null): string {
 }
 
 interface Props {
-  ml: MlManagement | undefined;
+  ml: MlManagement;
 }
 
 export function MlManagementPanel({ ml }: Props) {
-  if (!ml || !ml.enabled) {
+  if (!ml.enabled) {
     return (
       <div className="panel">
-        <h3>ML Management</h3>
-        <p className="muted">Disabled</p>
+        <h3 className="panel-title">ML Management</h3>
+        <div className="empty-state">
+          <p>Disabled</p>
+        </div>
       </div>
     );
   }
@@ -34,9 +36,15 @@ export function MlManagementPanel({ ml }: Props) {
     ? 'APPROVED' : ml.latest_approved === false
     ? 'REJECTED' : '--';
 
+  const gateClass = ml.latest_approved === true
+    ? 'text-green'
+    : ml.latest_approved === false
+    ? 'text-red'
+    : 'muted';
+
   return (
     <div className="panel">
-      <h3>ML Management</h3>
+      <h3 className="panel-title">ML Management</h3>
       <div className="panel-grid">
         <div className="panel-row">
           <span className="label">Model</span>
@@ -52,7 +60,7 @@ export function MlManagementPanel({ ml }: Props) {
         </div>
         <div className="panel-row">
           <span className="label">Gate</span>
-          <span className={`value ${ml.latest_approved ? 'text-green' : 'text-red'}`}>
+          <span className={`value ${gateClass}`}>
             {approvedLabel}
           </span>
         </div>
@@ -69,6 +77,10 @@ export function MlManagementPanel({ ml }: Props) {
         <div className="panel-row">
           <span className="label">EV hold (R)</span>
           <span className="value">{ml.ev_hold_r !== null ? ml.ev_hold_r.toFixed(3) : '--'}</span>
+        </div>
+        <div className="panel-row">
+          <span className="label">EV exit now (R)</span>
+          <span className="value">{ml.ev_exit_now_r !== null ? ml.ev_exit_now_r.toFixed(3) : '--'}</span>
         </div>
         <div className="panel-row">
           <span className="label">Inference</span>

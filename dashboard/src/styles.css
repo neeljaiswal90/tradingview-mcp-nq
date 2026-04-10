@@ -78,9 +78,18 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
-.status-center { flex: 1; text-align: center; }
+.status-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
 
 .title {
   font-size: 14px;
@@ -114,9 +123,65 @@ body {
   font-size: 11px;
 }
 
+.exchange-state-badge,
+.gather-time,
+.stale-badge {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+}
+
+.exchange-state-badge {
+  background: rgba(59, 130, 246, 0.14);
+  color: var(--blue);
+}
+
+.gather-time {
+  background: var(--bg-card);
+  color: var(--text-secondary);
+}
+
+.stale-badge {
+  background: rgba(234, 179, 8, 0.14);
+  color: var(--yellow);
+}
+
 .cycle, .updated {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.phase-badge,
+.quote-badge {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.phase-badge {
+  background: var(--bg-card);
+}
+
+.phase-flat { color: var(--text-secondary); }
+.phase-managing { color: var(--green); background: rgba(34, 197, 94, 0.12); }
+.phase-transition { color: var(--blue); background: rgba(59, 130, 246, 0.12); }
+.phase-cooldown { color: var(--yellow); background: rgba(234, 179, 8, 0.12); }
+
+.phase-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.quote-fresh {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--green);
+}
+
+.quote-stale {
+  background: rgba(234, 179, 8, 0.14);
+  color: var(--yellow);
 }
 
 .conn-dot {
@@ -125,6 +190,7 @@ body {
   border-radius: 50%;
 }
 .conn-ok { background: var(--green); }
+.conn-warn { background: var(--yellow); }
 .conn-err { background: var(--red); animation: pulse 1.5s infinite; }
 
 .conn-label { font-size: 11px; color: var(--text-secondary); }
@@ -149,6 +215,10 @@ body {
   min-height: 100vh;
 }
 
+.dashboard-stale .panel {
+  border-color: var(--border-accent);
+}
+
 .grid-main {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
@@ -158,7 +228,7 @@ body {
   grid-template-areas:
     "kpis     kpis     kpis"
     "trade    market   directional"
-    "claude   claude   chart"
+    "management ml       chart"
     "trades   trades   trades";
 }
 
@@ -166,7 +236,8 @@ body {
 .grid-trade       { grid-area: trade; }
 .grid-market      { grid-area: market; }
 .grid-directional { grid-area: directional; }
-.grid-claude      { grid-area: claude; }
+.grid-management  { grid-area: management; }
+.grid-ml          { grid-area: ml; }
 .grid-chart       { grid-area: chart; }
 .grid-trades      { grid-area: trades; }
 
@@ -283,6 +354,27 @@ body {
   display: flex;
   gap: 6px;
   margin-top: 10px;
+}
+
+.trade-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.trade-section-title {
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.trade-meta-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 16px;
 }
 
 .flag {
@@ -548,123 +640,6 @@ body {
   border-radius: var(--radius-sm);
 }
 
-/* ─── Claude Panel ───────────────────────────────────────────────────────── */
-.claude-panel { position: relative; }
-
-.advisory-only {
-  font-size: 10px;
-  color: var(--text-muted);
-  font-weight: 400;
-  font-style: italic;
-}
-
-.claude-badge {
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  font-size: 10px;
-  font-weight: 700;
-  margin-left: auto;
-}
-.claude-badge.success { background: var(--green-dim); color: var(--green); }
-.claude-badge.running { background: #1a2a3a; color: var(--blue); }
-.claude-badge.error { background: var(--red-dim); color: var(--red); }
-.claude-badge.disabled { background: var(--bg-secondary); color: var(--text-muted); }
-
-.claude-summary {
-  font-size: 13px;
-  line-height: 1.6;
-  margin-bottom: 10px;
-  color: var(--text-primary);
-}
-
-.claude-metrics {
-  display: flex;
-  gap: 16px;
-  margin-bottom: 10px;
-}
-
-.claude-metric {
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.claude-reasons, .claude-checks, .claude-anomalies {
-  margin-bottom: 8px;
-}
-
-.reasons-label, .checks-label, .anomalies-label {
-  display: block;
-  font-size: 10px;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  margin-bottom: 4px;
-}
-
-.reason-item, .check-item, .anomaly-item {
-  display: inline-block;
-  font-size: 11px;
-  padding: 2px 6px;
-  margin: 2px 4px 2px 0;
-  background: var(--bg-secondary);
-  border-radius: var(--radius-sm);
-}
-
-.anomaly-item {
-  background: rgba(249, 115, 22, 0.15);
-  color: var(--orange);
-}
-
-.claude-waiting {
-  padding: 16px;
-  text-align: center;
-  color: var(--text-muted);
-  font-style: italic;
-}
-
-.claude-meta {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-  font-size: 10px;
-  color: var(--text-muted);
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-  margin-top: 10px;
-}
-
-.claude-missing {
-  font-size: 10px;
-  color: var(--yellow);
-  margin-top: 6px;
-}
-
-.expand-btn {
-  margin-top: 8px;
-  padding: 4px 10px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-}
-.expand-btn:hover { background: var(--bg-card-hover); }
-
-.claude-raw {
-  margin-top: 8px;
-  padding: 10px;
-  background: var(--bg-primary);
-  border-radius: var(--radius-sm);
-  font-size: 11px;
-  font-family: 'SF Mono', 'Consolas', monospace;
-  overflow-x: auto;
-  max-height: 300px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--text-secondary);
-}
-
 /* ─── PnL Chart ──────────────────────────────────────────────────────────── */
 .chart-container {
   height: 200px;
@@ -716,7 +691,8 @@ body {
       "kpis     kpis"
       "trade    market"
       "directional directional"
-      "claude   chart"
+      "management ml"
+      "chart    chart"
       "trades   trades";
   }
 
@@ -733,7 +709,8 @@ body {
       "trade"
       "market"
       "directional"
-      "claude"
+      "management"
+      "ml"
       "chart"
       "trades";
   }
@@ -747,4 +724,106 @@ body {
     gap: 8px;
   }
   .status-center { display: none; }
+
+  .trade-grid,
+  .trade-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .panel-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
+
+.panel-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.panel-row {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.label {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.value,
+.value-list {
+  font-family: 'SF Mono', 'Consolas', monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.value-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.action-hold,
+.state-hold {
+  color: var(--green);
+}
+
+.action-exit,
+.state-exit {
+  color: var(--red);
+}
+
+.action-move,
+.state-move {
+  color: var(--blue);
+}
+
+.action-none,
+.state-neutral {
+  color: var(--text-secondary);
+}
+
+.state-reduce {
+  color: var(--yellow);
+}
+
+.management-state-badge {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  margin-left: auto;
+  font-size: 10px;
+}
+
+.management-factor {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 768px) {
+  .panel-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
 }

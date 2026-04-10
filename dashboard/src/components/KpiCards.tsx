@@ -9,8 +9,8 @@ export function KpiCards({ kpis }: Props) {
   return (
     <div className="kpi-grid">
       <div className="kpi-card">
-        <div className="kpi-label">Trades Today</div>
-        <div className="kpi-value">{kpis.trades_today}</div>
+        <div className="kpi-label">Entries / Closed</div>
+        <div className="kpi-value">{kpis.entries_today} / {kpis.closed_trades}</div>
       </div>
 
       <div className="kpi-card">

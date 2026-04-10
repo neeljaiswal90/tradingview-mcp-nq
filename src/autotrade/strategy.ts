@@ -27,12 +27,21 @@ import type {
   DualDirectionDecision,
   DualDirectionResult,
 } from './types.js';
+import type { LobSnapshot } from './lob-client.js';
+import {
+  computeLayeredScore,
+  layeredToLegacyBreakdown,
+  DEFAULT_LAYERED_SCORING_CONFIG,
+  type LayeredScoringConfig,
+  type LayeredScoreResult,
+} from './features/layered-scoring.js';
 
-import type { IndicatorConfig } from './types.js';
+import type { IndicatorConfig, HtfSetupEvaluation, HtfZonesConfig } from './types.js';
 import type { ContractSpec } from './contracts.js';
 import { roundToTickAwayFromEntry, priceToTicks } from './contracts.js';
 import { buildDynamicRewardPlan, buildLegacyRewardPlan, DEFAULT_DYNAMIC_REWARD_CONFIG } from './features/dynamic-reward-plan.js';
 import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-reward-plan.js';
+import { evaluateHtfForSetup, DEFAULT_HTF_ZONES_CONFIG } from './features/htf-zones.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1663,6 +1672,7 @@ export function applyHardGates(
   snap: MarketSnapshot,
   config: IndicatorConfig,
   rewardPlan?: DynamicRewardPlan | null,
+  htfEval?: HtfSetupEvaluation | null,
 ): string[] {
   const failures: string[] = [];
 
@@ -1714,6 +1724,11 @@ export function applyHardGates(
   }
   if (snap.event?.no_trade_due_to_event) {
     failures.push(`event_window:${snap.event.suppression_reason}`);
+  }
+
+  // HTF zone veto (when evaluated)
+  if (htfEval?.vetoed && htfEval.veto_reason) {
+    failures.push(htfEval.veto_reason);
   }
 
   return failures;
@@ -1822,10 +1837,14 @@ function buildMlFeatures(
   bias: MultiTfBias,
   regime: MarketRegime,
   best: CandidateSetup | null,
+  chosenCandidate?: DirectionalCandidate | null,
 ): SignalContextSnapshot {
   const price = snap.price;
   const ind = snap.indicators_1m;
   const kl = snap.key_levels;
+  const htf = snap.htf_context;
+  const htfEval = chosenCandidate?.htfEval;
+
   return {
     price_vs_ema9_1m: ind.ema_9 !== null ? price - ind.ema_9 : null,
     price_vs_ema21_1m: ind.ema_21 !== null ? price - ind.ema_21 : null,
@@ -1848,6 +1867,23 @@ function buildMlFeatures(
     setup_type: best?.setup_type ?? null,
     bar_direction_5m_last: (() => { const b = last(snap.bars_5m); return b ? barDir(b) : null; })(),
     bar_direction_15m_last: (() => { const b = last(snap.bars_15m); return b ? barDir(b) : null; })(),
+    // HTF zone context (market-neutral)
+    htf_study_present: htf?.study_present ?? null,
+    htf_inside_resistance: htf?.inside_resistance_zone ?? null,
+    htf_inside_support: htf?.inside_support_zone ?? null,
+    htf_nearest_res_tf: htf?.nearest_resistance?.timeframe ?? null,
+    htf_nearest_sup_tf: htf?.nearest_support?.timeframe ?? null,
+    htf_nearest_obstacle_tf: htfEval?.nearest_obstacle?.timeframe ?? null,
+    htf_nearest_obstacle_kind: htfEval?.nearest_obstacle?.kind ?? null,
+    htf_distance_res_pts: htf?.nearest_resistance?.distance_pts ?? null,
+    htf_distance_sup_pts: htf?.nearest_support?.distance_pts ?? null,
+    htf_distance_res_atr: htf?.nearest_resistance?.distance_atr ?? null,
+    htf_distance_sup_atr: htf?.nearest_support?.distance_atr ?? null,
+    // HTF candidate-specific evaluation
+    htf_first_obstacle_rr: htfEval?.first_obstacle_rr ?? null,
+    htf_location_quality: htfEval?.location_quality ?? null,
+    htf_veto_reason: htfEval?.veto_reason ?? null,
+    htf_breakout_accepted: htfEval?.breakout_accepted ?? null,
   };
 }
 
@@ -1900,6 +1936,7 @@ export function generateSignal(
   config: IndicatorConfig,
   contract?: ContractSpec,
   dynamicRewardConfig?: DynamicRewardConfig | null,
+  lobSnapshot?: LobSnapshot | null,
 ): DualDirectionResult {
   const regime = classifyRegime(snap);
   const bias = assessMultiTfBias(snap);
@@ -1952,17 +1989,54 @@ export function generateSignal(
 
   // Track candidates alongside their pre-computed score breakdowns so we
   // never call scoreConfidenceDetailed() twice for the same candidate.
-  type ScoredCandidate = { setup: CandidateSetup; breakdown: ScoreBreakdown };
+  type ScoredCandidate = { setup: CandidateSetup; breakdown: ScoreBreakdown; layered?: LayeredScoreResult };
   const longCandidates: ScoredCandidate[] = [];
   const shortCandidates: ScoredCandidate[] = [];
+
+  // Resolve layered scoring config
+  const lsConfig: LayeredScoringConfig = config.layered_scoring
+    ? { ...DEFAULT_LAYERED_SCORING_CONFIG, ...config.layered_scoring }
+    : DEFAULT_LAYERED_SCORING_CONFIG;
+  const layeredActive = lsConfig.enabled || lsConfig.shadow_log;
 
   for (const gen of generators) {
     const s = gen(snap);
     if (s) {
       // Tick-round before scoring (rr may change after rounding)
       if (contract) tickRoundCandidate(s, contract);
+
       // Score ONCE — breakdown is stored and reused downstream
-      const breakdown = scoreConfidenceDetailed(s, snap, bias, regime, config);
+      const w = resolveScoringWeights(config);
+      let breakdown: ScoreBreakdown;
+      let layeredResult: LayeredScoreResult | undefined;
+
+      if (lsConfig.enabled) {
+        // Layered scoring is primary — compute layered, map to legacy breakdown
+        layeredResult = computeLayeredScore(s, snap, bias, regime, config, w, lobSnapshot, lsConfig);
+        breakdown = layeredToLegacyBreakdown(layeredResult, w.base);
+      } else {
+        // Old flat scoring is primary
+        breakdown = scoreConfidenceDetailed(s, snap, bias, regime, config);
+
+        // Shadow mode: also compute layered score for comparison logging
+        if (lsConfig.shadow_log && layeredActive) {
+          layeredResult = computeLayeredScore(s, snap, bias, regime, config, w, lobSnapshot, lsConfig);
+
+          console.log(
+            `[LAYERED_SHADOW] ${s.direction.toUpperCase()} ${s.setup_type} ` +
+            `old_score=${breakdown.total} new_rank=${layeredResult.final_rank} ` +
+            `structure=${layeredResult.structure_score.toFixed(1)} ` +
+            `flow=${layeredResult.flow_score.toFixed(1)}(q=${layeredResult.flow_breakdown.data_quality}) ` +
+            `lagging=${layeredResult.lagging_adjustment > 0 ? '+' : ''}${layeredResult.lagging_adjustment.toFixed(2)} ` +
+            `profile=${layeredResult.setup_family}(s=${layeredResult.profile_used.structure_weight},f=${layeredResult.flow_breakdown.effective_weight}) ` +
+            `${layeredResult.missing_flow_policy_applied ? 'MISSING_FLOW ' : ''}` +
+            `trend_cap=${layeredResult.structure_breakdown.trend_cluster_raw.toFixed(2)}->${layeredResult.structure_breakdown.trend_cluster_capped.toFixed(2)} ` +
+            `flow_features=[${layeredResult.flow_breakdown.active_flow_features.join(',')}] ` +
+            `flow_degradation=[${layeredResult.flow_breakdown.quality_degradation_reasons.join(',')}]`,
+          );
+        }
+      }
+
       s.confidence = breakdown.total;
       s.confidence_factors = breakdown.factors;
 
@@ -1971,10 +2045,11 @@ export function generateSignal(
         `score=${breakdown.total} factors=[${breakdown.factors.join(', ')}]`,
       );
 
+      const entry = { setup: s, breakdown, layered: layeredResult };
       if (s.direction === 'long') {
-        longCandidates.push({ setup: s, breakdown });
+        longCandidates.push(entry);
       } else {
-        shortCandidates.push({ setup: s, breakdown });
+        shortCandidates.push(entry);
       }
     }
   }
@@ -1985,7 +2060,7 @@ export function generateSignal(
 
   function buildDirectionalCandidate(scored: ScoredCandidate | undefined): DirectionalCandidate | null {
     if (!scored) return null;
-    const { setup, breakdown } = scored;
+    const { setup, breakdown, layered } = scored;
 
     // Build dynamic reward plan for THIS candidate (family+regime aware).
     // Extension features and microstructure score are not yet available at
@@ -2001,15 +2076,29 @@ export function generateSignal(
       );
     }
 
+    // HTF zone evaluation (candidate-specific)
+    const htfConfig = config.htf_zones ?? DEFAULT_HTF_ZONES_CONFIG;
+    const htfEval = snap.htf_context?.study_present
+      ? evaluateHtfForSetup(snap.htf_context, setup, snap, htfConfig)
+      : null;
+
+    // Apply HTF score adjustment to confidence
+    let adjustedScore = setup.confidence;
+    if (htfEval && htfEval.score_adjustment !== 0) {
+      adjustedScore = Math.max(0, Math.min(10, adjustedScore + htfEval.score_adjustment));
+    }
+
     // Reuse the pre-computed breakdown — no second scoreConfidenceDetailed() call
-    const gates = applyHardGates(setup, setup.confidence, bias, regime, snap, config, rewardPlan);
+    const gates = applyHardGates(setup, adjustedScore, bias, regime, snap, config, rewardPlan, htfEval);
     return {
       setup,
-      score: setup.confidence,
+      score: adjustedScore,
       scoreBreakdown: breakdown,
       hardGateFailures: gates,
       passedHardGates: gates.length === 0,
       rewardPlan,
+      layered,
+      htfEval,
     };
   }
 
@@ -2053,7 +2142,7 @@ export function generateSignal(
   const tradeAllowed = skipReasons.length === 0 && bestSetup !== null;
 
   // ── Step 5: ML features ──────────────────────────────────────────────────
-  const mlFeatures = buildMlFeatures(snap, bias, regime, bestSetup);
+  const mlFeatures = buildMlFeatures(snap, bias, regime, bestSetup, chosen);
 
   return {
     regime,

@@ -99,6 +99,20 @@ export interface LobSnapshot {
   signal_id: string | null;
 }
 
+/** Lightweight BBO-only response from /lob/bbo — no feature computation. */
+export interface LobBbo {
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  spread_pts: number | null;
+  bbo_age_ms: number;
+  timestamp_ms: number;
+  source_connected: boolean;
+  update_count: number;
+  is_fresh: boolean;
+  last_bbo_ts_ms: number;
+}
+
 export class LobClient {
   constructor(
     private readonly baseUrl: string,
@@ -111,6 +125,15 @@ export class LobClient {
     });
     if (!res.ok) throw new Error(`LOB health returned ${res.status}`);
     return await res.json() as LobHealthResult;
+  }
+
+  /** Lightweight BBO fetch — no full feature computation on sidecar. */
+  async getBbo(): Promise<LobBbo> {
+    const res = await fetch(`${this.baseUrl}/lob/bbo`, {
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!res.ok) throw new Error(`LOB bbo returned ${res.status}`);
+    return await res.json() as LobBbo;
   }
 
   async getSnapshot(): Promise<LobSnapshot> {

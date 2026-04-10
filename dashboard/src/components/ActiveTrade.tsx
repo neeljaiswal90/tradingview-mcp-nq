@@ -1,5 +1,5 @@
 import type { ActiveTrade as ActiveTradeType } from '../types';
-import { fmtPrice, fmtUsd, pnlClass } from '../format';
+import { fmtNum, fmtPrice, fmtUsd, pnlClass } from '../format';
 
 function formatTime(seconds: number | null | undefined): string {
   if (seconds == null) return '\u2014';
@@ -14,6 +14,11 @@ function formatTime(seconds: number | null | undefined): string {
 
 interface Props {
   trade: ActiveTradeType;
+}
+
+function formatPoints(value: number | null | undefined): string {
+  if (value == null) return '\u2014';
+  return `${fmtNum(value, 2)} pts`;
 }
 
 export function ActiveTrade({ trade }: Props) {
@@ -31,6 +36,12 @@ export function ActiveTrade({ trade }: Props) {
 
   const sideClass = trade.side === 'long' ? 'side-long' : 'side-short';
   const pnlCls = pnlClass(trade.unrealized_pnl_usd);
+  const hasManagementMeta = trade.management_profile !== null
+    || trade.setup_family !== null
+    || trade.atr_at_entry !== null
+    || trade.pt1_resolved_pts !== null
+    || trade.pt2_resolved_pts !== null
+    || trade.trail_resolved_ticks !== null;
 
   return (
     <div className={`panel trade-panel ${sideClass}-border`}>
@@ -104,6 +115,39 @@ export function ActiveTrade({ trade }: Props) {
         {trade.breakeven_armed && <span className="flag flag-be">BE Armed</span>}
         {trade.trailing_armed && <span className="flag flag-trail">Trail {trade.trailing_ticks}tk</span>}
       </div>
+      {hasManagementMeta && (
+        <div className="trade-section">
+          <div className="trade-section-title">Management</div>
+          <div className="trade-meta-grid">
+            <div className="trade-row">
+              <span className="trade-label">Profile</span>
+              <span className="trade-value">{trade.management_profile ?? '\u2014'}</span>
+            </div>
+            <div className="trade-row">
+              <span className="trade-label">Setup Family</span>
+              <span className="trade-value">{trade.setup_family ?? '\u2014'}</span>
+            </div>
+            <div className="trade-row">
+              <span className="trade-label">ATR at Entry</span>
+              <span className="trade-value">{fmtPrice(trade.atr_at_entry)}</span>
+            </div>
+            <div className="trade-row">
+              <span className="trade-label">PT1 Offset</span>
+              <span className="trade-value">{formatPoints(trade.pt1_resolved_pts)}</span>
+            </div>
+            <div className="trade-row">
+              <span className="trade-label">PT2 Offset</span>
+              <span className="trade-value">{formatPoints(trade.pt2_resolved_pts)}</span>
+            </div>
+            <div className="trade-row">
+              <span className="trade-label">Trail Distance</span>
+              <span className="trade-value">
+                {trade.trail_resolved_ticks != null ? `${trade.trail_resolved_ticks} tk` : '\u2014'}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

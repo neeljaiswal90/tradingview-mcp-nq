@@ -133,6 +133,10 @@ export interface MlServiceResponse {
   model_version: string;
   inference_ms: number;
   notes: string[];
+  /** Tier selected by the ML service for this inference (null if not tiered). */
+  tier_used?: string | null;
+  /** Reason the service fell back to a lower tier. */
+  fallback_reason?: string | null;
 }
 
 // ─── Execution Gate Result ───────────────────────────────────────────────────
@@ -159,12 +163,40 @@ export interface MlDecision {
   rejection_reason: string | null;
   prob_hold: number | null;
   ev_hold_r: number | null;
+  ev_exit_now_r: number | null;
   /** Recommended stop price for MOVE_STOP actions (from service response). */
   recommended_stop_price: number | null;
   /** Recommended exit fraction for EXIT_PARTIAL actions (from service response). */
   recommended_size_fraction: number | null;
   model_name: string;
+  /** Actual model version from service response (not config). */
+  model_version: string;
   inference_ms: number;
+  evaluated_at_iso: string;
   gate_checks: MlGateCheck[];
   notes: string[];
+  /** Tier selected by the ML service for this inference. */
+  tier_used: string | null;
+  /** Whether service fell back to a lower tier. */
+  fallback_used: boolean;
+  /** Reason for fallback (missing_required_fields | stale_bbo | etc). */
+  fallback_reason: string | null;
+}
+
+/**
+ * Result from getMlDecision — includes the decision, the exact serialized
+ * request/response bodies for logging, and the feature vector.
+ */
+export interface MlDecisionResult {
+  decision: MlDecision;
+  /** The exact JSON body sent to the ML service (for reproducible logging). */
+  serializedRequestBody: string;
+  /** The exact JSON response from the ML service. */
+  serializedResponseBody: string;
+  /** The feature vector object (for programmatic access). */
+  features: MlFeatureVector;
+  /** Unique request ID for traceability. */
+  requestId: string;
+  /** Total request latency in ms (including network). */
+  requestLatencyMs: number;
 }

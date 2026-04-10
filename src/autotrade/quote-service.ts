@@ -13,7 +13,7 @@
  */
 
 import * as tvData from '../core/tradingview/data.js';
-import { LobClient, type LobSnapshot } from './lob-client.js';
+import { LobClient } from './lob-client.js';
 
 export type QuoteSource = 'bookmap_bbo' | 'live' | 'bar_close' | 'fallback';
 
@@ -62,31 +62,32 @@ export class BookmapQuoteProvider implements QuoteProvider {
 
   async fetchQuote(): Promise<QuoteResult | null> {
     try {
-      const snap: LobSnapshot = await this.lobClient.getSnapshot();
+      // Use lightweight /lob/bbo endpoint — avoids full feature computation
+      const bbo = await this.lobClient.getBbo();
 
       // Reject if sidecar reports stale or no data
-      const isFresh = snap.bbo_age_ms < this.maxStaleMs;
-      if (!isFresh || snap.data_quality === 'unavailable') {
+      const isFresh = bbo.bbo_age_ms < this.maxStaleMs;
+      if (!isFresh) {
         return null;
       }
 
       // Need at least bid+ask for a meaningful BBO quote
-      if (snap.bid === null || snap.ask === null || snap.mid === null) {
+      if (bbo.bid === null || bbo.ask === null || bbo.mid === null) {
         return null;
       }
 
       // Use mid price as the canonical price (most accurate for NQ)
       const now = Date.now();
       return {
-        price: snap.mid,
+        price: bbo.mid,
         source: 'bookmap_bbo',
-        timestamp_unix_ms: snap.timestamp_ms || now,
-        timestamp_iso: new Date(snap.timestamp_ms || now).toISOString(),
-        age_ms: snap.bbo_age_ms,
-        is_stale: snap.bbo_age_ms > this.maxStaleMs,
-        bid: snap.bid,
-        ask: snap.ask,
-        spread_ticks: snap.spread_ticks ?? undefined,
+        timestamp_unix_ms: bbo.timestamp_ms || now,
+        timestamp_iso: new Date(bbo.timestamp_ms || now).toISOString(),
+        age_ms: bbo.bbo_age_ms,
+        is_stale: bbo.bbo_age_ms > this.maxStaleMs,
+        bid: bbo.bid,
+        ask: bbo.ask,
+        spread_ticks: bbo.spread_pts !== null ? bbo.spread_pts / 0.25 : undefined,
       };
     } catch {
       return null; // sidecar unreachable — silent fallthrough
@@ -175,12 +176,25 @@ export class QuoteService {
    * The returned QuoteResult includes `failover_reason` explaining why higher-
    * priority providers were skipped (if any).
    */
-  async fetchFresh(): Promise<QuoteResult> {
+  async fetchFresh(opts?: {
+    timeoutMs?: number;
+    perProviderTimeoutMs?: Record<string, number>;
+  }): Promise<QuoteResult> {
     const failoverReasons: string[] = [];
 
     for (const provider of this.providers) {
       try {
-        const result = await provider.fetchQuote();
+        let resultPromise = provider.fetchQuote();
+        // Per-provider timeout takes precedence, then global, then no timeout
+        const effectiveTimeout = opts?.perProviderTimeoutMs?.[provider.name]
+          ?? opts?.timeoutMs;
+        if (effectiveTimeout !== undefined) {
+          resultPromise = Promise.race([
+            resultPromise,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), effectiveTimeout)),
+          ]);
+        }
+        const result = await resultPromise;
         if (result !== null && !result.is_stale) {
           // Annotate with failover context if we skipped higher-priority providers
           if (failoverReasons.length > 0) {

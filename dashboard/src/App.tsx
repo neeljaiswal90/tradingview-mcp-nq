@@ -4,9 +4,11 @@ import { KpiCards } from './components/KpiCards';
 import { ActiveTrade } from './components/ActiveTrade';
 import { MarketStatePanel } from './components/MarketStatePanel';
 import { DirectionalPanel } from './components/DirectionalPanel';
+import { ManagementPanel } from './components/ManagementPanel';
 import { MlManagementPanel } from './components/MlManagementPanel';
 import { RecentTrades } from './components/RecentTrades';
 import { PnlChart } from './components/PnlChart';
+import { HtfZonesPanel } from './components/HtfZonesPanel';
 
 export function App() {
   const { snapshot, connected, error, isStale } = useDashboard();
@@ -44,8 +46,20 @@ export function App() {
           <MarketStatePanel state={snapshot.market_state} />
         </section>
 
+        <section className="grid-htf">
+          <HtfZonesPanel
+            htfContext={snapshot.htf_context}
+            htfEvalLong={snapshot.directional.htf_eval_long}
+            htfEvalShort={snapshot.directional.htf_eval_short}
+          />
+        </section>
+
         <section className="grid-directional">
           <DirectionalPanel assessment={snapshot.directional} />
+        </section>
+
+        <section className="grid-management">
+          <ManagementPanel management={snapshot.management} />
         </section>
 
         <section className="grid-ml">

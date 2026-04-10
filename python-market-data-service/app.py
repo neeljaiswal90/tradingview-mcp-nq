@@ -56,14 +56,85 @@ def _ensure_log_dir():
     os.makedirs(LOG_DIR, exist_ok=True)
 
 
+class AsyncJsonlWriter:
+    """Buffered JSONL writer with background flusher.
+
+    Enqueue records and they are flushed to disk every flush_interval seconds
+    or when the buffer exceeds flush_threshold lines.
+    """
+
+    def __init__(self, log_dir: str, flush_interval: float = 0.5, flush_threshold: int = 20):
+        self.log_dir = log_dir
+        self.flush_interval = flush_interval
+        self.flush_threshold = flush_threshold
+        self.buffers: dict[str, list[str]] = {}
+        self._task: Optional[asyncio.Task] = None
+
+    def enqueue(self, filename: str, record: dict) -> None:
+        """Add a record to the write buffer. Non-throwing."""
+        try:
+            line = json.dumps(record, default=str) + "\n"
+            buf = self.buffers.get(filename)
+            if buf is None:
+                buf = []
+                self.buffers[filename] = buf
+            buf.append(line)
+            if len(buf) >= self.flush_threshold:
+                self._flush_file(filename)
+        except Exception as e:
+            print(f"[LOG] Enqueue error {filename}: {e}")
+
+    def enqueue_immediate(self, filename: str, record: dict) -> None:
+        """Enqueue and immediately flush this file's buffer. For critical records."""
+        self.enqueue(filename, record)
+        self._flush_file(filename)
+
+    def _flush_file(self, filename: str) -> None:
+        buf = self.buffers.get(filename)
+        if not buf:
+            return
+        try:
+            path = os.path.join(self.log_dir, filename)
+            with open(path, "a", encoding="utf-8") as f:
+                f.writelines(buf)
+            self.buffers[filename] = []
+        except Exception as e:
+            print(f"[LOG] Flush error {filename}: {e}")
+
+    def flush_all(self) -> None:
+        for fn in list(self.buffers.keys()):
+            self._flush_file(fn)
+
+    async def run(self) -> None:
+        """Background loop: flush all buffers periodically."""
+        while True:
+            await asyncio.sleep(self.flush_interval)
+            self.flush_all()
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self.run())
+
+    def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+        self.flush_all()
+
+
+# Module-level writer instance (initialized in lifespan)
+writer: Optional[AsyncJsonlWriter] = None
+
+
 def append_jsonl(filename: str, record: dict) -> None:
-    """Append one JSON line to a log file. Non-blocking, non-throwing."""
-    try:
-        path = os.path.join(LOG_DIR, filename)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-    except Exception as e:
-        print(f"[LOG] Write error {filename}: {e}")
+    """Append one JSON line via async writer (or direct fallback if not started)."""
+    if writer is not None:
+        writer.enqueue(filename, record)
+    else:
+        try:
+            path = os.path.join(LOG_DIR, filename)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as e:
+            print(f"[LOG] Write error {filename}: {e}")
 
 
 # ─── Global State ─────────────────────────────────────────────────────────────
@@ -106,6 +177,11 @@ class SidecarState:
         # Recording cadence
         self.last_session_record_ts: float = 0.0
         self.last_trade_record_ts: float = 0.0
+
+        # Snapshot cache (300ms TTL)
+        self._snapshot_cache: Optional[dict] = None
+        self._snapshot_cache_ts: float = 0.0
+        self._prev_is_fresh: bool = False  # for freshness transition detection
 
     @property
     def mid(self) -> Optional[float]:
@@ -168,9 +244,24 @@ class SidecarState:
             current_price=self.mid,
         )
 
+    def get_cached_snapshot(self) -> dict:
+        """Return cached snapshot if < 300ms old, else recompute and cache."""
+        now = time.time()
+        if self._snapshot_cache and (now - self._snapshot_cache_ts) < SNAPSHOT_CACHE_TTL_SEC:
+            return self._snapshot_cache
+        snap = self.compute_snapshot()
+        self._snapshot_cache = snap.to_dict()
+        self._snapshot_cache_ts = now
+        return self._snapshot_cache
+
+    def invalidate_snapshot_cache(self) -> None:
+        """Force cache invalidation on state transitions."""
+        self._snapshot_cache = None
+
 
 state = SidecarState()
 START_TIME = time.time()
+SNAPSHOT_CACHE_TTL_SEC = 0.3  # 300ms
 
 # ─── Recording Policy ────────────────────────────────────────────────────────
 
@@ -203,11 +294,47 @@ def maybe_record_snapshot():
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
+async def recording_loop():
+    """Separate timed task for snapshot recording — decoupled from ingest hot loop.
+
+    This replaces the old maybe_record_snapshot() call that ran after every WebSocket event.
+    Now compute_snapshot() runs at most 2x/sec instead of on every tick (~100-200 Hz).
+    """
+    while True:
+        try:
+            await asyncio.sleep(0.5)
+            now = time.time()
+            ctx = state.recording_context
+            if ctx in ("trade", "pre_entry", "post_exit"):
+                if (now - state.last_trade_record_ts) >= TRADE_RECORD_INTERVAL_SEC:
+                    snap = state.compute_snapshot()
+                    append_jsonl("lob_snapshots.jsonl", snap.to_dict())
+                    state.last_trade_record_ts = now
+            if (now - state.last_session_record_ts) >= SESSION_RECORD_INTERVAL_SEC:
+                snap = state.compute_snapshot()
+                append_jsonl("lob_session_snapshots.jsonl", snap.to_dict())
+                state.last_session_record_ts = now
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[RECORDING] Error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global writer
     _ensure_log_dir()
+    writer = AsyncJsonlWriter(LOG_DIR)
+    writer.start()
+    recording_task = asyncio.create_task(recording_loop())
     print(f"[MKT-DATA] Sidecar starting, logs -> {LOG_DIR}")
     yield
+    recording_task.cancel()
+    try:
+        await recording_task
+    except asyncio.CancelledError:
+        pass
+    writer.stop()
     print("[MKT-DATA] Shutting down")
 
 
@@ -234,7 +361,94 @@ app.add_middleware(
 async def bookmap_ingest(ws: WebSocket):
     await ws.accept()
     state.connected = True
+    state.invalidate_snapshot_cache()
     print("[MKT-DATA] Bookmap addon connected")
+
+    def _process_event(msg: dict) -> None:
+        """Process a single event dict — called for individual and batch messages."""
+        msg_type = msg.get("type")
+        ts_ms = msg.get("ts", int(time.time() * 1000))
+        ts = ts_ms / 1000.0
+
+        if msg_type == "bbo":
+            # Detect freshness transitions for cache invalidation
+            was_fresh = state._prev_is_fresh
+            state.bid = msg["bid"]
+            state.ask = msg["ask"]
+            state.bid_size = msg["bid_sz"]
+            state.ask_size = msg["ask_sz"]
+            state.last_bbo_ts = ts
+            state.update_count += 1
+            now_fresh = state.is_fresh
+            if was_fresh != now_fresh:
+                state._prev_is_fresh = now_fresh
+                state.invalidate_snapshot_cache()
+
+        elif msg_type == "trade":
+            is_buy = msg.get("aggressor", "buy") == "buy"
+            trade_price = msg["price"]
+            trade_raw_price = msg.get("raw_price")
+            trade_size = msg["size"]
+            state.trade_buf.add(ts, trade_price, trade_size, is_buy)
+            state.trade_count += 1
+            # Feed microstructure trackers
+            state.absorption.add_trade(ts, trade_price, trade_size, is_buy)
+            state.footprint.add_trade(ts, trade_price, trade_size, is_buy)
+            state.large_trades.add_trade(ts, trade_price, trade_size, is_buy)
+            state.volume_profile.add_trade(trade_price, trade_size)
+            # Log compact trade event
+            event_record = {
+                "type": "trade", "ts": ts_ms,
+                "price": trade_price, "size": trade_size,
+                "aggressor": msg.get("aggressor"),
+                "trade_id": state.active_trade_id,
+            }
+            if isinstance(trade_raw_price, (int, float)):
+                event_record["raw_price"] = trade_raw_price
+            if "price_scale_source" in msg:
+                event_record["price_scale_source"] = msg.get("price_scale_source")
+            append_jsonl("lob_events_compact.jsonl", event_record)
+
+        elif msg_type == "depth":
+            state.depth.update(msg["side"], msg["price"], msg["size"], ts)
+
+        elif msg_type == "mbo":
+            # Robust parsing: all fields optional with safe defaults.
+            # The Java addon may omit price/size on cancel events if
+            # order state was not tracked, and side may be "unknown".
+            mbo_action = msg.get("action", "unknown")
+            mbo_side = msg.get("side", "unknown")
+            mbo_price = msg.get("price", 0.0)
+            mbo_size = msg.get("size", 0)
+            mbo_order_id = msg.get("order_id", "")
+            mbo_top = msg.get("top_of_book", False)
+            mbo_levels = msg.get("levels_penetrated", 0)
+
+            # Skip events with unknown side for aggregators that
+            # need bid/ask classification, but still count them.
+            if mbo_side in ("bid", "ask"):
+                state.mbo_agg.add_event(
+                    ts=ts, action=mbo_action, side=mbo_side,
+                    price=mbo_price, size=mbo_size,
+                    order_id=mbo_order_id,
+                    is_top_of_book=mbo_top,
+                    levels_penetrated=mbo_levels,
+                )
+                state.advanced_mbo.add_event(RichMboEvent(
+                    ts=ts, action=mbo_action, side=mbo_side,
+                    price=mbo_price, size=mbo_size,
+                    order_id=mbo_order_id,
+                    is_top_of_book=mbo_top,
+                    levels_penetrated=mbo_levels,
+                ))
+
+            # Track MBO capability state regardless of side validity
+            state.mbo_ever_seen = True
+            state.mbo_total_count += 1
+            state.last_mbo_ts = ts
+
+        elif msg_type == "heartbeat":
+            state.last_heartbeat_ts = ts
 
     try:
         while True:
@@ -242,91 +456,23 @@ async def bookmap_ingest(ws: WebSocket):
             try:
                 msg = json.loads(raw)
                 msg_type = msg.get("type")
-                ts_ms = msg.get("ts", int(time.time() * 1000))
-                ts = ts_ms / 1000.0
 
-                if msg_type == "bbo":
-                    state.bid = msg["bid"]
-                    state.ask = msg["ask"]
-                    state.bid_size = msg["bid_sz"]
-                    state.ask_size = msg["ask_sz"]
-                    state.last_bbo_ts = ts
-                    state.update_count += 1
-
-                elif msg_type == "trade":
-                    is_buy = msg.get("aggressor", "buy") == "buy"
-                    trade_price = msg["price"]
-                    trade_raw_price = msg.get("raw_price")
-                    trade_size = msg["size"]
-                    state.trade_buf.add(ts, trade_price, trade_size, is_buy)
-                    state.trade_count += 1
-                    # Feed microstructure trackers
-                    state.absorption.add_trade(ts, trade_price, trade_size, is_buy)
-                    state.footprint.add_trade(ts, trade_price, trade_size, is_buy)
-                    state.large_trades.add_trade(ts, trade_price, trade_size, is_buy)
-                    state.volume_profile.add_trade(trade_price, trade_size)
-                    # Log compact trade event
-                    event_record = {
-                        "type": "trade", "ts": ts_ms,
-                        "price": trade_price, "size": trade_size,
-                        "aggressor": msg.get("aggressor"),
-                        "trade_id": state.active_trade_id,
-                    }
-                    if isinstance(trade_raw_price, (int, float)):
-                        event_record["raw_price"] = trade_raw_price
-                    if "price_scale_source" in msg:
-                        event_record["price_scale_source"] = msg.get("price_scale_source")
-                    append_jsonl("lob_events_compact.jsonl", event_record)
-
-                elif msg_type == "depth":
-                    state.depth.update(msg["side"], msg["price"], msg["size"], ts)
-
-                elif msg_type == "mbo":
-                    # Robust parsing: all fields optional with safe defaults.
-                    # The Java addon may omit price/size on cancel events if
-                    # order state was not tracked, and side may be "unknown".
-                    mbo_action = msg.get("action", "unknown")
-                    mbo_side = msg.get("side", "unknown")
-                    mbo_price = msg.get("price", 0.0)
-                    mbo_size = msg.get("size", 0)
-                    mbo_order_id = msg.get("order_id", "")
-                    mbo_top = msg.get("top_of_book", False)
-                    mbo_levels = msg.get("levels_penetrated", 0)
-
-                    # Skip events with unknown side for aggregators that
-                    # need bid/ask classification, but still count them.
-                    if mbo_side in ("bid", "ask"):
-                        state.mbo_agg.add_event(
-                            ts=ts, action=mbo_action, side=mbo_side,
-                            price=mbo_price, size=mbo_size,
-                            order_id=mbo_order_id,
-                            is_top_of_book=mbo_top,
-                            levels_penetrated=mbo_levels,
-                        )
-                        state.advanced_mbo.add_event(RichMboEvent(
-                            ts=ts, action=mbo_action, side=mbo_side,
-                            price=mbo_price, size=mbo_size,
-                            order_id=mbo_order_id,
-                            is_top_of_book=mbo_top,
-                            levels_penetrated=mbo_levels,
-                        ))
-
-                    # Track MBO capability state regardless of side validity
-                    state.mbo_ever_seen = True
-                    state.mbo_total_count += 1
-                    state.last_mbo_ts = ts
-
-                elif msg_type == "heartbeat":
-                    state.last_heartbeat_ts = ts
-
-                # Recording policy: check after every event
-                maybe_record_snapshot()
+                if msg_type == "batch":
+                    # Batch envelope from addon: {"type":"batch","events":[...]}
+                    for event in msg.get("events", []):
+                        try:
+                            _process_event(event)
+                        except (KeyError, TypeError) as e:
+                            print(f"[MKT-DATA] Batch event error: {e}")
+                else:
+                    _process_event(msg)
 
             except (KeyError, TypeError, json.JSONDecodeError) as e:
                 print(f"[MKT-DATA] Parse error: {e}")
 
     except WebSocketDisconnect:
         state.connected = False
+        state.invalidate_snapshot_cache()
         print("[MKT-DATA] Bookmap addon disconnected")
 
 
@@ -377,12 +523,45 @@ def lob_health():
     )
 
 
+# ─── REST: Lightweight BBO ───────────────────────────────────────────────────
+
+class BboResponse(BaseModel):
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    mid: Optional[float] = None
+    spread_pts: Optional[float] = None
+    bbo_age_ms: float
+    timestamp_ms: int
+    source_connected: bool
+    update_count: int
+    is_fresh: bool
+    last_bbo_ts_ms: int
+
+
+@app.get("/lob/bbo", response_model=BboResponse)
+def lob_bbo():
+    spread = None
+    if state.bid is not None and state.ask is not None:
+        spread = round(state.ask - state.bid, 2)
+    return BboResponse(
+        bid=state.bid,
+        ask=state.ask,
+        mid=state.mid,
+        spread_pts=spread,
+        bbo_age_ms=state.bbo_age_ms,
+        timestamp_ms=int(time.time() * 1000),
+        source_connected=state.connected,
+        update_count=state.update_count,
+        is_fresh=state.is_fresh,
+        last_bbo_ts_ms=int(state.last_bbo_ts * 1000) if state.last_bbo_ts > 0 else 0,
+    )
+
+
 # ─── REST: Full Feature Snapshot ──────────────────────────────────────────────
 
 @app.get("/lob/snapshot")
 def lob_snapshot():
-    snap = state.compute_snapshot()
-    return snap.to_dict()
+    return state.get_cached_snapshot()
 
 
 # ─── REST: Context Endpoints ─────────────────────────────────────────────────
@@ -401,6 +580,7 @@ class SignalContextRequest(BaseModel):
 def trade_context_start(req: TradeContextRequest):
     state.active_trade_id = req.trade_id
     state.trade_end_ts = None
+    state.invalidate_snapshot_cache()
     state.last_trade_record_ts = 0  # force immediate snapshot
     # Record the intent
     append_jsonl("execution_intents.jsonl", {
@@ -426,6 +606,7 @@ def trade_context_end(req: TradeContextRequest):
     })
     state.trade_end_ts = time.time()
     state.active_trade_id = None
+    state.invalidate_snapshot_cache()
     print(f"[CTX] Trade ended: {req.trade_id} (post-exit recording for {POST_EXIT_WINDOW_SEC}s)")
     return {"status": "ok", "trade_id": req.trade_id, "recording_context": "post_exit"}
 
@@ -433,6 +614,7 @@ def trade_context_end(req: TradeContextRequest):
 @app.post("/signal_context/start")
 def signal_context_start(req: SignalContextRequest):
     state.active_signal_id = req.signal_id
+    state.invalidate_snapshot_cache()
     state.last_trade_record_ts = 0  # force immediate snapshot
     snap = state.compute_snapshot()
     append_jsonl("lob_snapshots.jsonl", snap.to_dict())
@@ -445,6 +627,7 @@ def signal_context_end(req: SignalContextRequest):
     snap = state.compute_snapshot()
     append_jsonl("lob_snapshots.jsonl", snap.to_dict())
     state.active_signal_id = None
+    state.invalidate_snapshot_cache()
     print(f"[CTX] Signal window ended: {req.signal_id}")
     return {"status": "ok", "signal_id": req.signal_id}
 

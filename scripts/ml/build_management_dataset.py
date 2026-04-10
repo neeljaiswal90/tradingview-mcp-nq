@@ -20,7 +20,9 @@ Optional: pip install pandas pyarrow  → also writes .parquet
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
+import glob
 import json
 import os
 import sys
@@ -104,6 +106,238 @@ def safe_bool(val: Any) -> int | None:
     if isinstance(val, bool):
         return 1 if val else 0
     return 1 if val else 0
+
+
+# ─── Import canonical feature lists from the shared registry ─────────────────
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'python-market-data-service'))
+from lob_features.ml_feature_registry import (
+    LOB_NUMERIC_FEATURES,
+    ADVANCED_MBO_FEATURES,
+    LOB_SNAPSHOT_FIELD_MAP,
+    FEATURE_FAMILIES,
+    FEATURE_METADATA,
+)
+
+
+# ─── LOB snapshot loading and nearest-timestamp join ─────────────────────────
+
+def load_lob_snapshots(log_dir: str) -> dict[str, list[dict]]:
+    """
+    Load lob_snapshots.jsonl, index by trade_id, sort by timestamp_ms.
+    Only includes records with recording_context=='trade' and a valid trade_id.
+    """
+    path = os.path.join(log_dir, "lob_snapshots.jsonl")
+    records = read_jsonl(path)
+
+    by_trade: dict[str, list[dict]] = {}
+    skipped = 0
+    for rec in records:
+        tid = rec.get("trade_id")
+        if not tid or rec.get("recording_context") != "trade":
+            skipped += 1
+            continue
+        by_trade.setdefault(tid, []).append(rec)
+
+    # Sort each trade's snapshots by timestamp_ms for binary search
+    for tid in by_trade:
+        by_trade[tid].sort(key=lambda r: r.get("timestamp_ms", 0))
+
+    total = sum(len(v) for v in by_trade.values())
+    print(f"[LOB-JOIN] Loaded {total} LOB snapshots across {len(by_trade)} trades (skipped {skipped} non-trade records)")
+    return by_trade
+
+
+def load_runtime_features(
+    log_dir: str,
+) -> tuple[dict[str, dict], dict[str, dict[str, dict]]]:
+    """
+    Load ml_management_features_*.jsonl (glob across rotated files).
+
+    Returns two indices:
+      by_request_id : { _request_id -> record }        — primary exact match
+      by_trade_ts   : { trade_id -> { timestamp -> record } } — timestamp fallback
+
+    Matching priority in enrich_row_with_lob():
+      1. row._request_id present and found in by_request_id  (future dataset paths)
+      2. (trade_id, timestamp) lookup in by_trade_ts          (current trade_path.jsonl path)
+      3. timestamp join against lob_snapshots.jsonl
+      4. position_only
+    """
+    pattern = os.path.join(log_dir, "ml_management_features*.jsonl")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return {}, {}
+
+    by_request_id: dict[str, dict] = {}
+    by_trade_ts: dict[str, dict[str, dict]] = {}
+    total = 0
+    for fpath in files:
+        records = read_jsonl(fpath)
+        for rec in records:
+            rid = rec.get("_request_id")
+            if rid:
+                by_request_id[rid] = rec
+
+            tid = rec.get("_trade_id") or rec.get("trade_id")
+            ts = rec.get("_timestamp")
+            if tid and ts:
+                by_trade_ts.setdefault(tid, {})[ts] = rec
+                total += 1
+
+    print(f"[LOB-JOIN] Loaded {total} runtime feature records from {len(files)} file(s) "
+          f"({len(by_request_id)} with request_id)")
+    return by_request_id, by_trade_ts
+
+
+def find_nearest_lob(
+    tick_ts_ms: int,
+    trade_id: str,
+    lob_by_trade: dict[str, list[dict]],
+    max_delta_ms: int = 2000,
+) -> tuple[dict | None, dict]:
+    """
+    Binary search for nearest LOB snapshot within trade_id-indexed snapshots.
+
+    Returns (snapshot_or_None, join_metadata).
+
+    Quality gates before accepting a join:
+    - data_quality != "unavailable"
+    - bbo_age_ms < 5000 (matches runtime freshness check in feature-builder.ts:54)
+    - |tick_ts - snapshot_ts| <= max_delta_ms
+    """
+    empty_meta = {
+        "_lob_join_delta_ms": None,
+        "_lob_join_method": "no_match",
+        "_lob_join_success": False,
+        "_lob_data_quality": None,
+        "_lob_bbo_age_ms": None,
+        "_lob_snapshot_ts_ms": None,
+        "_lob_snapshot_source_file": None,
+    }
+
+    snaps = lob_by_trade.get(trade_id)
+    if not snaps:
+        return None, empty_meta
+
+    # Binary search for nearest timestamp
+    timestamps = [s.get("timestamp_ms", 0) for s in snaps]
+    idx = bisect.bisect_left(timestamps, tick_ts_ms)
+
+    # Check candidates: the one at idx and idx-1
+    best_snap = None
+    best_delta = max_delta_ms + 1
+    for candidate_idx in [idx - 1, idx]:
+        if 0 <= candidate_idx < len(snaps):
+            delta = abs(timestamps[candidate_idx] - tick_ts_ms)
+            if delta < best_delta:
+                best_delta = delta
+                best_snap = snaps[candidate_idx]
+
+    if best_snap is None or best_delta > max_delta_ms:
+        return None, empty_meta
+
+    # Quality gates
+    data_quality = best_snap.get("data_quality", "unavailable")
+    bbo_age = best_snap.get("bbo_age_ms", 99999)
+
+    if data_quality == "unavailable" or bbo_age >= 5000:
+        return None, {
+            "_lob_join_delta_ms": best_delta,
+            "_lob_join_method": "trade_id_nearest",
+            "_lob_join_success": False,
+            "_lob_data_quality": data_quality,
+            "_lob_bbo_age_ms": bbo_age,
+            "_lob_snapshot_ts_ms": best_snap.get("timestamp_ms"),
+            "_lob_snapshot_source_file": "lob_snapshots.jsonl",
+        }
+
+    return best_snap, {
+        "_lob_join_delta_ms": best_delta,
+        "_lob_join_method": "trade_id_nearest",
+        "_lob_join_success": True,
+        "_lob_data_quality": data_quality,
+        "_lob_bbo_age_ms": bbo_age,
+        "_lob_snapshot_ts_ms": best_snap.get("timestamp_ms"),
+        "_lob_snapshot_source_file": "lob_snapshots.jsonl",
+    }
+
+
+def enrich_row_with_lob(
+    row: dict,
+    tick_ts_ms: int,
+    trade_id: str,
+    lob_by_trade: dict[str, list[dict]],
+    runtime_by_request_id: dict[str, dict],
+    runtime_by_trade_ts: dict[str, dict[str, dict]],
+) -> None:
+    """
+    Add LOB/MBO feature columns to a dataset row.
+
+    Priority:
+    1. runtime_exact via _request_id — UUID exact match in runtime feature log
+       (used when dataset is built directly from runtime payloads)
+    2. runtime_exact via timestamp — (trade_id, timestamp) match in runtime feature log
+       (current path: rows from trade_path.jsonl matched to runtime log by timestamp)
+    3. joined_from_lob_logs — nearest-timestamp join against lob_snapshots.jsonl
+    4. position_only — no LOB data available
+
+    Modifies row in-place. Adds all LOB + advanced MBO feature columns (from registry)
+    plus provenance metadata columns.
+    """
+    # Initialize all LOB columns to None (derived from registry, not hardcoded)
+    all_lob_features = LOB_NUMERIC_FEATURES + ADVANCED_MBO_FEATURES
+    for feat in all_lob_features:
+        row[feat] = None
+
+    ts = row.get("timestamp")
+
+    # Try runtime_exact: request_id match (primary — UUID, no timestamp drift)
+    rt_rec: dict | None = None
+    request_id = row.get("_request_id")
+    if request_id and request_id in runtime_by_request_id:
+        rt_rec = runtime_by_request_id[request_id]
+
+    # Try runtime_exact: timestamp match (fallback for trade_path.jsonl rows)
+    if rt_rec is None and ts:
+        rt_rec = runtime_by_trade_ts.get(trade_id, {}).get(ts)
+
+    if rt_rec is not None:
+        for feat in all_lob_features:
+            val = rt_rec.get(feat)
+            if val is not None:
+                row[feat] = safe_float(val)
+        row["_lob_data_source"] = "runtime_exact"
+        row["_lob_join_delta_ms"] = None
+        row["_lob_join_method"] = "runtime_exact_request_id" if request_id else "runtime_exact_timestamp"
+        row["_lob_join_success"] = True
+        row["_lob_data_quality"] = None
+        row["_lob_bbo_age_ms"] = rt_rec.get("_bbo_age_ms")
+        row["_lob_snapshot_ts_ms"] = None
+        row["_lob_snapshot_source_file"] = None
+        return
+
+    # Fallback: timestamp join against lob_snapshots.jsonl
+    snap, join_meta = find_nearest_lob(tick_ts_ms, trade_id, lob_by_trade)
+
+    if snap and join_meta["_lob_join_success"]:
+        # Map snapshot field names to registry feature names
+        for snap_field, reg_field in LOB_SNAPSHOT_FIELD_MAP.items():
+            val = snap.get(snap_field)
+            if val is not None:
+                row[reg_field] = safe_float(val)
+        row["_lob_data_source"] = "joined_from_lob_logs"
+    else:
+        row["_lob_data_source"] = "position_only"
+
+    # Always set join metadata
+    row["_lob_join_delta_ms"] = join_meta["_lob_join_delta_ms"]
+    row["_lob_join_method"] = join_meta["_lob_join_method"]
+    row["_lob_join_success"] = join_meta["_lob_join_success"]
+    row["_lob_data_quality"] = join_meta["_lob_data_quality"]
+    row["_lob_bbo_age_ms"] = join_meta["_lob_bbo_age_ms"]
+    row["_lob_snapshot_ts_ms"] = join_meta["_lob_snapshot_ts_ms"]
+    row["_lob_snapshot_source_file"] = join_meta["_lob_snapshot_source_file"]
 
 
 # ─── Build a single row from a tick + trade context ──────────────────────────
@@ -261,12 +495,21 @@ def build_dataset(log_dir: str) -> list[dict]:
       2. Each management event → row_type='management_event'
       3. Every Nth tick → row_type='tick' (sampled to avoid redundancy)
       4. Last tick before exit → row_type='pre_exit'
+
+    LOB/MBO features are enriched via:
+      1. Exact runtime payloads (ml_management_features_*.jsonl) when available
+      2. Nearest-timestamp join against lob_snapshots.jsonl as fallback
+      3. Null (position_only) when no LOB data is available
     """
     trades_path = os.path.join(log_dir, "trades.jsonl")
     path_path = os.path.join(log_dir, "trade_path.jsonl")
 
     trades = read_jsonl(trades_path)
     path_records = read_jsonl(path_path)
+
+    # Load LOB data sources for enrichment
+    lob_by_trade = load_lob_snapshots(log_dir)
+    runtime_by_request_id, runtime_by_trade_ts = load_runtime_features(log_dir)
 
     # Index by trade_id
     trade_by_id: dict[str, dict] = {}
@@ -338,6 +581,10 @@ def build_dataset(log_dir: str) -> list[dict]:
                 continue  # Skip non-sampled ticks
 
             row = build_row(tick, trade, events_before, row_type, i, total_ticks)
+            # Enrich with LOB/MBO features
+            tick_ts_ms = int((parse_iso(tick.get("timestamp")) or 0) * 1000)
+            enrich_row_with_lob(row, tick_ts_ms, tid, lob_by_trade,
+                                runtime_by_request_id, runtime_by_trade_ts)
             rows.append(row)
 
         # Also add rows for management events that don't align with a tick timestamp
@@ -374,6 +621,9 @@ def build_dataset(log_dir: str) -> list[dict]:
                 f"mgmt_{event.get('event_type', 'unknown')}",
                 -1, total_ticks,
             )
+            # Enrich with LOB/MBO features
+            evt_ts_ms = int((parse_iso(evt_ts) or 0) * 1000)
+            enrich_row_with_lob(row, evt_ts_ms, tid, lob_by_trade, runtime_by_trade)
             row["management_event_type"] = event.get("event_type")
             row["trail_distance_pts_at_event"] = safe_float(event.get("trail_distance_pts"))
             row["stop_before_event"] = safe_float(event.get("stop_before"))
@@ -469,6 +719,39 @@ SCHEMA: dict[str, dict[str, str]] = {
     "quantity_after_event":         {"type": "float",   "category": "event",     "description": "Quantity after management event"},
     "pt1_trigger_pts":              {"type": "float",   "category": "event",     "description": "PT1 trigger distance in pts (from profile)"},
     "pt2_trigger_pts":              {"type": "float",   "category": "event",     "description": "PT2 trigger distance in pts (from profile)"},
+    # LOB/MBO features (from LOB join or runtime exact payloads)
+    "lob_spread_ticks":               {"type": "float",   "category": "feature",   "description": "LOB: bid-ask spread in ticks"},
+    "lob_bid_size":                   {"type": "float",   "category": "feature",   "description": "LOB: top-of-book bid size"},
+    "lob_ask_size":                   {"type": "float",   "category": "feature",   "description": "LOB: top-of-book ask size"},
+    "lob_depth_imbalance_5":          {"type": "float",   "category": "feature",   "description": "LOB: 5-level depth imbalance"},
+    "lob_depth_imbalance_10":         {"type": "float",   "category": "feature",   "description": "LOB: 10-level depth imbalance"},
+    "lob_total_bid_depth_10lvl":      {"type": "float",   "category": "feature",   "description": "LOB: total bid depth 10 levels"},
+    "lob_total_ask_depth_10lvl":      {"type": "float",   "category": "feature",   "description": "LOB: total ask depth 10 levels"},
+    "lob_cumulative_delta_10s":       {"type": "float",   "category": "feature",   "description": "LOB: cumulative delta 10s window"},
+    "lob_cumulative_delta_30s":       {"type": "float",   "category": "feature",   "description": "LOB: cumulative delta 30s window"},
+    "lob_cumulative_delta_60s":       {"type": "float",   "category": "feature",   "description": "LOB: cumulative delta 60s window"},
+    "lob_trade_flow_imbalance_10s":   {"type": "float",   "category": "feature",   "description": "LOB: trade flow imbalance 10s"},
+    "lob_trade_flow_imbalance_30s":   {"type": "float",   "category": "feature",   "description": "LOB: trade flow imbalance 30s"},
+    "lob_cancel_add_ratio_10s":       {"type": "float",   "category": "feature",   "description": "LOB: cancel/add ratio 10s"},
+    "lob_replenishment_rate_10s":     {"type": "float",   "category": "feature",   "description": "LOB: replenishment rate 10s"},
+    "lob_absorption_rate_10s":        {"type": "float",   "category": "feature",   "description": "LOB: absorption rate 10s"},
+    "lob_sweep_count_10s":            {"type": "float",   "category": "feature",   "description": "LOB: sweep count 10s"},
+    "adv_cancel_replace_ratio_10s":   {"type": "float",   "category": "feature",   "description": "ADV MBO: cancel/replace ratio 10s"},
+    "adv_modify_rate_10s":            {"type": "float",   "category": "feature",   "description": "ADV MBO: order modify rate 10s"},
+    "adv_iceberg_suspicion_30s":      {"type": "float",   "category": "feature",   "description": "ADV MBO: iceberg suspicion 30s"},
+    "adv_queue_deterioration_bid_10s": {"type": "float",  "category": "feature",   "description": "ADV MBO: bid queue deterioration 10s"},
+    "adv_queue_deterioration_ask_10s": {"type": "float",  "category": "feature",   "description": "ADV MBO: ask queue deterioration 10s"},
+    "adv_pull_cascade_count_10s":     {"type": "float",   "category": "feature",   "description": "ADV MBO: pull cascade count 10s"},
+    "adv_lifetime_p50_ms":            {"type": "float",   "category": "feature",   "description": "ADV MBO: median order lifetime ms"},
+    # LOB join provenance metadata
+    "_lob_data_source":               {"type": "string",  "category": "meta",      "description": "Data source: runtime_exact | joined_from_lob_logs | position_only"},
+    "_lob_join_delta_ms":             {"type": "int",     "category": "meta",      "description": "Timestamp delta of LOB join in ms"},
+    "_lob_join_method":               {"type": "string",  "category": "meta",      "description": "Join method: runtime_exact | trade_id_nearest | no_match"},
+    "_lob_join_success":              {"type": "bool",    "category": "meta",      "description": "Whether a usable LOB snapshot was found"},
+    "_lob_data_quality":              {"type": "string",  "category": "meta",      "description": "LOB data quality from snapshot"},
+    "_lob_bbo_age_ms":                {"type": "int",     "category": "meta",      "description": "BBO age from LOB snapshot"},
+    "_lob_snapshot_ts_ms":            {"type": "int",     "category": "meta",      "description": "Exact timestamp of matched LOB snapshot"},
+    "_lob_snapshot_source_file":      {"type": "string",  "category": "meta",      "description": "Source file of matched LOB snapshot"},
     # Labels (FUTURE — supervised learning targets)
     "label_final_r":                {"type": "float",   "category": "label",     "description": "LABEL: Final R-multiple of the trade"},
     "label_outcome":                {"type": "string",  "category": "label",     "description": "LABEL: winner | loser | scratch"},
@@ -586,14 +869,64 @@ def main():
     print(f"  Labels:       {len(LABEL_COLUMNS)}")
     print(f"  Row types:    {dict(sorted(count_values(rows, 'row_type').items()))}")
 
-    # Feature coverage report
-    print(f"\n[DATASET] Feature coverage (non-null %):")
-    for col in FEATURE_COLUMNS[:15]:  # Show first 15
+    # ── Feature coverage by family (from registry) ────────────────────────
+    print(f"\n[DATASET] Feature coverage by family:")
+    print(f"  {'Family':<20s} {'Features':>8s} {'Avg Non-Null %':>15s} {'Min Col %':>10s} {'Max Col %':>10s}")
+    print(f"  {'-'*20} {'-'*8} {'-'*15} {'-'*10} {'-'*10}")
+    for family, feat_names in FEATURE_FAMILIES.items():
+        # Only report features that are in the dataset
+        dataset_feats = [f for f in feat_names if f in SCHEMA]
+        if not dataset_feats:
+            continue
+        coverages = []
+        for col in dataset_feats:
+            non_null = sum(1 for r in rows if r.get(col) is not None)
+            coverages.append(round(non_null / len(rows) * 100, 1))
+        avg_cov = round(sum(coverages) / len(coverages), 1) if coverages else 0.0
+        min_cov = min(coverages) if coverages else 0.0
+        max_cov = max(coverages) if coverages else 0.0
+        print(f"  {family:<20s} {len(dataset_feats):>8d} {avg_cov:>14.1f}% {min_cov:>9.1f}% {max_cov:>9.1f}%")
+
+    # ── LOB provenance breakdown ──────────────────────────────────────────
+    provenance_counts: dict[str, int] = {}
+    for r in rows:
+        src = r.get("_lob_data_source", "unknown")
+        provenance_counts[src] = provenance_counts.get(src, 0) + 1
+    print(f"\n[DATASET] LOB provenance breakdown:")
+    for src in ["runtime_exact", "joined_from_lob_logs", "position_only"]:
+        count = provenance_counts.get(src, 0)
+        pct = round(count / len(rows) * 100, 1)
+        print(f"  {src:<30s} {count:>6d}  ({pct:.1f}%)")
+
+    # ── Join quality metrics ──────────────────────────────────────────────
+    join_deltas = [r.get("_lob_join_delta_ms") for r in rows if r.get("_lob_join_delta_ms") is not None]
+    if join_deltas:
+        avg_delta = round(sum(join_deltas) / len(join_deltas), 0)
+        max_delta = max(join_deltas)
+        join_successes = sum(1 for r in rows if r.get("_lob_join_success"))
+        print(f"\n[DATASET] LOB join quality:")
+        print(f"  Avg join delta: {avg_delta:.0f}ms")
+        print(f"  Max join delta: {max_delta}ms")
+        print(f"  Join success rate: {round(join_successes / len(rows) * 100, 1)}%")
+
+    # ── Per-column coverage for LOB features ──────────────────────────────
+    all_lob = LOB_NUMERIC_FEATURES + ADVANCED_MBO_FEATURES
+    print(f"\n[DATASET] LOB/MBO feature coverage (per-column):")
+    for col in all_lob:
         non_null = sum(1 for r in rows if r.get(col) is not None)
         pct = round(non_null / len(rows) * 100, 1)
-        print(f"  {col:40s} {pct:6.1f}%  ({non_null}/{len(rows)})")
-    if len(FEATURE_COLUMNS) > 15:
-        print(f"  ... and {len(FEATURE_COLUMNS) - 15} more features")
+        print(f"  {col:45s} {pct:6.1f}%  ({non_null}/{len(rows)})")
+
+    # Warn if required families have very low coverage
+    for family in ["lob_bbo", "lob_flow"]:
+        feats = FEATURE_FAMILIES.get(family, [])
+        if feats:
+            avg = sum(
+                sum(1 for r in rows if r.get(f) is not None) / len(rows) * 100
+                for f in feats
+            ) / len(feats)
+            if avg < 10.0:
+                print(f"\n  ⚠ WARNING: {family} family has only {avg:.1f}% average coverage")
 
 
 if __name__ == "__main__":

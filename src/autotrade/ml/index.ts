@@ -13,5 +13,6 @@ export type {
   MlGateResult,
   MlGateCheck,
   MlDecision,
+  MlDecisionResult,
 } from './types.js';
 export { DEFAULT_ML_CONFIG } from './types.js';

@@ -16,7 +16,12 @@
  *   npm run auto:live        # live mode (DISABLED — futures live not implemented)
  */
 
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
+
+// Feature schema version — must stay in sync with FEATURE_SCHEMA_VERSION in
+// python-market-data-service/lob_features/ml_feature_registry.py.
+// Update this constant (and bump the registry version) whenever the feature set changes.
+const ML_FEATURE_SCHEMA_VERSION = 'v3_advanced_mbo';
 import * as tvHealth from '../core/tradingview/health.js';
 import * as tvChart from '../core/tradingview/chart.js';
 import { QuoteService, BookmapQuoteProvider } from './quote-service.js';
@@ -32,7 +37,11 @@ import { getManagementProfile, resolveProfile } from './management-profiles.js';
 import { LogWriter } from './log-writer.js';
 import { IndicatorConfigManager } from './indicator-config-manager.js';
 import { PerformanceTracker } from './performance-tracker.js';
-import { Scheduler } from './scheduler.js';
+import { Scheduler, LaneScheduler } from './scheduler.js';
+import type { LaneConfig } from './scheduler.js';
+import { ExecutionLock } from './execution-lock.js';
+import { createLaneSharedState } from './lane-state.js';
+import type { LaneSharedState } from './lane-state.js';
 import { EnginePhaseManager } from './engine-phase.js';
 import { getContractSpec } from './contracts.js';
 import { EventCalendar } from './events.js';
@@ -41,7 +50,7 @@ import { DashboardStateManager, DashboardServer } from './dashboard/index.js';
 import { ManagementDecisionEngine, buildManagementFeatures } from './management/index.js';
 import type { ManagementMetrics } from './management/index.js';
 import { getMlDecision, checkMlHealth, DEFAULT_ML_CONFIG } from './ml/index.js';
-import type { MlManagementConfig, MlDecision } from './ml/index.js';
+import type { MlManagementConfig, MlDecision, MlDecisionResult, MlFeatureVector } from './ml/index.js';
 import { getEntryMlDecision, DEFAULT_ENTRY_ML_CONFIG } from './ml-entry/index.js';
 import type { EntryMlConfig, EntryMlDecision } from './ml-entry/index.js';
 import { ExecutionPolicyEngine, DEFAULT_EXECUTION_POLICY_CONFIG } from './execution-policy/index.js';
@@ -55,6 +64,10 @@ import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-
 import type { ExecutionPolicyConfig } from './execution-policy/index.js';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import { RuntimeStateManager } from './runtime-state.js';
+import { TradeJournal } from './trade-journal.js';
+import { readRecoveryArtifacts, buildRecoveryReport, isRecoveryBlocked } from './recovery.js';
+import type { RecoveryReport } from './recovery.js';
 
 import type {
   Signal,
@@ -191,7 +204,48 @@ async function main(): Promise<void> {
   );
 
   const sessionId = `SESSION_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${randomUUID().slice(0, 8)}`;
+
+  // ── Phase 0: Lock + Recovery Gate (before any other disk writes) ──────────
+  const runtimeState = new RuntimeStateManager(env.LOG_DIR, {
+    heartbeatIntervalMs: env.RUNTIME_HEARTBEAT_INTERVAL_MS,
+    heartbeatStaleMs: env.RUNTIME_HEARTBEAT_STALE_MS,
+  });
+
+  if (!runtimeState.acquireLock(sessionId)) {
+    console.error('[STARTUP] Another runner instance is active. Exiting.');
+    process.exit(1);
+  }
+  // Lock held — all early-exit paths must release it explicitly.
+
+  runtimeState.cleanupStaleTmpFiles();
+
+  const tradeJournal = new TradeJournal(env.LOG_DIR, sessionId);
+  const recoveryArtifacts = readRecoveryArtifacts(runtimeState, tradeJournal);
+  const recoveryReport = buildRecoveryReport(
+    recoveryArtifacts, tradeJournal,
+    env.RESTART_MODE, env.MODE,
+    env.RUNTIME_HEARTBEAT_STALE_MS,
+  );
+  runtimeState.writeRecoveryReport(recoveryReport);
+
+  if (isRecoveryBlocked(recoveryReport)) {
+    console.error(`[STARTUP] ${recoveryReport.operator_message}`);
+    console.error('[STARTUP] Set RESTART_MODE=dev to auto-clear paper positions, or manually reconcile trade state.');
+    runtimeState.releaseLock();
+    process.exit(2);
+  }
+
+  // Non-blocking recovery outcomes: log and proceed
+  if (recoveryReport.outcome !== 'clean_start') {
+    console.warn(`[STARTUP_RECOVERY] outcome=${recoveryReport.outcome} trade_id=${recoveryReport.open_trade_id ?? 'none'} action=${recoveryReport.action_taken}`);
+  }
+
+  // Recovery gate passed — safe to create LogWriter and proceed
   const logWriter = new LogWriter(env.LOG_DIR);
+  logWriter.startFlushTimer();
+
+  runtimeState.initialize(sessionId, env.MODE, env.RESTART_MODE);
+  runtimeState.startHeartbeat();
   const configManager = new IndicatorConfigManager('./config');
 
   // Validate and print the canonical trading config.
@@ -249,6 +303,10 @@ async function main(): Promise<void> {
   const adapter = createAdapter(env.MODE, env.LIVE_TRADING_ENABLED, contract);
   const positionManager = new PositionManager(contract, instrumentSymbol);
   positionManager.setManagementEventHandler((event) => logWriter.writeManagementEvent(event));
+  positionManager.setPositionChangeHandler((pos) => {
+    runtimeState.updatePositionKnown(pos?.trade_id ?? null);
+    runtimeState.writeOpenTradeState(pos);
+  });
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
   const events = EventCalendar.load('./config');
   console.log(`[STARTUP] Loaded event calendar: ${events.size()} events`);
@@ -273,6 +331,10 @@ async function main(): Promise<void> {
     daily_loss_pct: 0,
     daily_loss_limit_pct: effectiveConfig.max_daily_loss_pct,
     shutdown_reason: null,
+    startup_mode: recoveryReport.outcome === 'clean_start' ? 'normal'
+      : recoveryReport.outcome.includes('cleared') ? 'recovery_cleared'
+      : 'first_run',
+    recovery_action: recoveryReport.outcome,
   };
   logWriter.writeSession(session);
 
@@ -313,6 +375,7 @@ async function main(): Promise<void> {
   let lastRegime: MarketRegime = 'range_bound';
   let cycleChangeNote = '';
   let lastResetDay = new Date().getUTCDate();
+  let engineShuttingDown = false;
   let lastSnap: MarketSnapshot | null = null;
   let lastAlignmentScore: number | null = null;
   let lastConfidence: number | null = null;
@@ -393,6 +456,11 @@ async function main(): Promise<void> {
     lastConfidence = advisoryResult.confidence;
   };
 
+  // ─── Zombie-trade watchdog state ──────────────────────────────────────────────
+  const ZOMBIE_THRESHOLD_MS = 60 * 60 * 1000;  // 60 minutes
+  const ZOMBIE_LOG_INTERVAL_MS = 10 * 60 * 1000; // re-warn every 10 min
+  let lastZombieWarningAt = 0;
+
   // ─── Fast in-position monitor ───────────────────────────────────────────────
   const onMonitor = async (_cycleNumber: number): Promise<void> => {
     if (!positionManager.hasOpenPosition()) return;
@@ -420,6 +488,23 @@ async function main(): Promise<void> {
       return;
     }
     if (price === null) return;
+
+    // ── Zombie-trade watchdog ─────────────────────────────────────────────────
+    const zombiePos = positionManager.getPosition();
+    if (zombiePos) {
+      const holdMs = Date.now() - new Date(zombiePos.entry_time_iso).getTime();
+      if (holdMs > ZOMBIE_THRESHOLD_MS && Date.now() - lastZombieWarningAt > ZOMBIE_LOG_INTERVAL_MS) {
+        lastZombieWarningAt = Date.now();
+        const quoteAge = quoteResult ? quoteService.computeAge(quoteResult) : -1;
+        console.warn(
+          `[ZOMBIE-TRADE] trade_id=${zombiePos.trade_id} open for ${Math.round(holdMs / 60000)}min | ` +
+          `price=${price} stop=${zombiePos.stop_current} entry=${zombiePos.entry_price} | ` +
+          `side=${zombiePos.side} qty=${zombiePos.quantity_remaining} | ` +
+          `quote_age=${quoteAge}ms | ` +
+          `last_mgmt_state=${lastMgmtMetrics?.management_state ?? 'none'}`,
+        );
+      }
+    }
 
     // ── In-trade management metrics (PoP + EV advisory) ──────────────────────
     const openPos = positionManager.getPosition();
@@ -456,13 +541,14 @@ async function main(): Promise<void> {
           const mlQuoteAge = quoteResult ? quoteService.computeAge(quoteResult) : 9999;
           // Fetch LOB snapshot for ML features (non-blocking, null if unavailable)
           const mlLobSnap = await lobClient.getSnapshot().catch(() => null);
-          const mlDec = await getMlDecision(
+          const mlResult = await getMlDecision(
             positionManager.getPosition()!,
             price,
             mlQuoteAge,
             mlConfig,
             mlLobSnap,
           );
+          const mlDec = mlResult.decision;
           lastMlDecision = mlDec;
 
           // Log ML decision + update dashboard
@@ -474,7 +560,7 @@ async function main(): Promise<void> {
             action: mlDec.action,
             action_confidence: mlDec.confidence,
             model_name: mlDec.model_name,
-            model_version: mlConfig.model_version,
+            model_version: mlDec.model_version || mlConfig.model_version,
             prob_hold: mlDec.prob_hold,
             ev_hold_r: mlDec.ev_hold_r,
             approved: mlDec.approved,
@@ -485,7 +571,50 @@ async function main(): Promise<void> {
             setup_type: mlLogPos?.setup_type ?? null,
             quantity_remaining: mlLogPos?.quantity_remaining ?? null,
             unrealized_r: mlLogPos ? positionManager.getUnrealizedR(price) : null,
+            tier_used: mlDec.tier_used,
+            fallback_used: mlDec.fallback_used,
+            fallback_reason: mlDec.fallback_reason,
             notes: mlDec.notes,
+          });
+
+          // ── Log exact feature payload + response for training reproducibility ──
+          // _feature_schema_hash: sha256 of sorted feature names (excluding trade_id),
+          // truncated to 8 hex chars. Changes automatically when the feature set changes.
+          // Use this to detect train/serve schema drift in the audit pipeline.
+          const _featureSchemaHash = createHash('sha256')
+            .update(Object.keys(mlResult.features).filter(k => k !== 'trade_id').sort().join(','))
+            .digest('hex')
+            .slice(0, 8);
+          logWriter.writeMlManagementFeatures({
+            // Exact serialized request body (parsed back = what the service received)
+            ...JSON.parse(mlResult.serializedRequestBody),
+            // Request metadata
+            _timestamp: new Date().toISOString(),
+            _trade_id: mlLogPos?.trade_id ?? '',
+            _request_id: mlResult.requestId,
+            _service_url: mlConfig.service_url,
+            _request_latency_ms: mlResult.requestLatencyMs,
+            _feature_count: Object.keys(mlResult.features).length - 1, // minus trade_id
+            // Schema versioning — for audit/drift detection
+            _log_schema_version: ML_FEATURE_SCHEMA_VERSION,
+            _feature_schema_hash: _featureSchemaHash,
+            // Data quality assessment
+            _lob_available: mlResult.features.lob_spread_ticks !== null,
+            _adv_mbo_available: mlResult.features.adv_cancel_replace_ratio_10s !== null,
+            _data_quality_tier: computeDataQualityTier(mlResult.features),
+            _bbo_age_ms: mlLobSnap?.bbo_age_ms ?? null,
+            // Exact service response (full body for replay/debugging)
+            _serialized_response_body: mlResult.serializedResponseBody,
+            // Response summary (parsed for quick queries)
+            _response_action: mlDec.action,
+            _response_confidence: mlDec.confidence,
+            _response_approved: mlDec.approved,
+            _response_rejection_reason: mlDec.rejection_reason,
+            _response_model_name: mlDec.model_name,
+            _response_model_version: mlDec.model_version,
+            _response_tier_used: mlDec.tier_used,
+            _response_fallback_used: mlDec.fallback_used,
+            _response_fallback_reason: mlDec.fallback_reason,
           });
 
           if (mlDec.approved && mlDec.action !== 'NO_ACTION' && mlDec.action !== 'HOLD') {
@@ -530,7 +659,18 @@ async function main(): Promise<void> {
             );
 
             if (mlDec.action === 'EXIT_ALL') {
+              logWriter.writeExecutionIntent({
+                event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+                trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
+                price, quantity: mlPos.quantity_remaining,
+              });
               const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'manual');
+              logWriter.writeExecutionIntent({
+                event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
+                trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
+                price: exitResult.fill_price, quantity: exitResult.quantity,
+                slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+              });
               const tradeRecord = positionManager.closePosition(
                 exitResult, 'manual', lastRegime, sessionId, env.STRATEGY_VERSION, price,
                 {
@@ -541,7 +681,14 @@ async function main(): Promise<void> {
                   target_repair_applied: mlPos.target_repair_applied,
                 },
               );
+              logWriter.writeExecutionIntent({
+                event: 'trade_closed', timestamp: new Date().toISOString(),
+                trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
+                price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
+                r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+              });
               logWriter.writeTrade(tradeRecord);
+              tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
               riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
               perfTracker.recordTrade(tradeRecord);
               dashboardState.updatePosition(null);
@@ -603,7 +750,18 @@ async function main(): Promise<void> {
     );
     const pos = positionManager.getPosition()!;
     if (exit.isPartial) {
+      logWriter.writeExecutionIntent({
+        event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exit.exitPrice, quantity: exit.partialQuantity,
+      });
       const partialResult = await adapter.placeExit(pos.side, exit.partialQuantity, exit.exitPrice, exit.reason);
+      logWriter.writeExecutionIntent({
+        event: 'trade_exit_filled', timestamp: partialResult.fill_time_iso,
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: partialResult.fill_price, quantity: partialResult.quantity,
+        slippage_pts: partialResult.slippage_pts, fee_usd: partialResult.fee_usd, order_id: partialResult.order_id,
+      });
       const fillTimeIso = partialResult.fill_time_iso;
       const slippagePts = Math.abs(exit.exitPrice - exit.plannedExitPrice);
       if (exit.reason === 'partial_profit_1') {
@@ -617,7 +775,18 @@ async function main(): Promise<void> {
     } else if (exit.reason === 'partial_profit_1' && !exit.isPartial) {
       // Single-contract position: PT1 triggers a full exit — no prior partial leg recorded,
       // closePosition() will compute pnl from quantity_remaining (= original qty) correctly.
+      logWriter.writeExecutionIntent({
+        event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exit.exitPrice, quantity: pos.quantity_remaining,
+      });
       const exitResult = await adapter.placeExit(pos.side, pos.quantity_remaining, exit.exitPrice, exit.reason);
+      logWriter.writeExecutionIntent({
+        event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exitResult.fill_price, quantity: exitResult.quantity,
+        slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+      });
       // Mark PT1 fields on position for backward-compat consumers
       const posRef = positionManager.getPosition();
       if (posRef) {
@@ -634,7 +803,14 @@ async function main(): Promise<void> {
           target_repair_applied: pos.target_repair_applied,
         },
       );
+      logWriter.writeExecutionIntent({
+        event: 'trade_closed', timestamp: new Date().toISOString(),
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
+        r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+      });
       logWriter.writeTrade(tradeRecord);
+      tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
       riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
       perfTracker.recordTrade(tradeRecord);
       dashboardState.updatePosition(null);
@@ -654,7 +830,18 @@ async function main(): Promise<void> {
       phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
       lastCooldownActive = phaseManager.current() === 'COOLDOWN';
     } else {
+      logWriter.writeExecutionIntent({
+        event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exit.exitPrice, quantity: pos.quantity_remaining,
+      });
       const exitResult = await adapter.placeExit(pos.side, pos.quantity_remaining, exit.exitPrice, exit.reason);
+      logWriter.writeExecutionIntent({
+        event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exitResult.fill_price, quantity: exitResult.quantity,
+        slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+      });
       const tradeRecord = positionManager.closePosition(
         exitResult, exit.reason, lastRegime, sessionId, env.STRATEGY_VERSION, exit.plannedExitPrice,
         {
@@ -665,7 +852,14 @@ async function main(): Promise<void> {
           target_repair_applied: pos.target_repair_applied,
         },
       );
+      logWriter.writeExecutionIntent({
+        event: 'trade_closed', timestamp: new Date().toISOString(),
+        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
+        price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
+        r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+      });
       logWriter.writeTrade(tradeRecord);
+      tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
       riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
       perfTracker.recordTrade(tradeRecord);
       dashboardState.updatePosition(null);
@@ -676,7 +870,7 @@ async function main(): Promise<void> {
       dashboardState.updateRisk(riskManager.getState());
       dashboardState.flush();
       console.log(
-        `[RUNNER] 📋 Trade closed: ${tradeRecord.outcome_class.toUpperCase()} ` +
+        `[RUNNER] Trade closed: ${tradeRecord.outcome_class.toUpperCase()} ` +
         `| $${tradeRecord.pnl_realized.toFixed(2)} | ${tradeRecord.r_multiple}R`,
       );
       recentEventLog.push(`trade_closed:${tradeRecord.trade_id}:${tradeRecord.outcome_class}:${tradeRecord.r_multiple}R`);
@@ -689,6 +883,7 @@ async function main(): Promise<void> {
 
   // ─── Analysis cycle ─────────────────────────────────────────────────────────
   const onAnalysis = async (cycleNumber: number): Promise<void> => {
+    if (engineShuttingDown) return; // Block new analysis during shutdown
     cycleChangeNote = '';
     const analysisStartMs = Date.now();
 
@@ -770,6 +965,12 @@ async function main(): Promise<void> {
         );
         const riskPts = Math.abs(pos.entry_price - pos.stop_initial);
         logWriter.writeTradePathPoint({
+          // ── Row schema ─────────────────────────────────────────────────────
+          row_type: 'trade_path_point',
+          schema_version: 2,
+          owner: 'v1',
+          source_lane: 'monitor',
+          // ── Core fields ────────────────────────────────────────────────────
           timestamp: new Date().toISOString(),
           trade_id: pos.trade_id,
           session_id: sessionId,
@@ -803,6 +1004,17 @@ async function main(): Promise<void> {
           pre_t1_trailing_active: pos.pre_t1_trailing_active,
           trail_distance_ticks: pos.trail_distance_ticks,
           atr_at_entry: pos.atr_at_entry,
+          // ── Position progression (Phase 10) ────────────────────────────────
+          stop_initial: pos.stop_initial,
+          trail_anchor_price: pos.trail_anchor_price,
+          pt1_realized_pnl: pos.pt1_realized_pnl,
+          pt2_realized_pnl: pos.pt2_realized_pnl,
+          pt1_qty_exited: pos.pt1_qty_exited,
+          pt2_qty_exited: pos.pt2_qty_exited,
+          mfe_at_pt1_trigger: pos.mfe_at_pt1_trigger,
+          mae_at_pt1_trigger: pos.mae_at_pt1_trigger,
+          peak_r_before_first_partial: pos.peak_r_before_first_partial,
+          management_state: lastMgmtMetrics?.management_state ?? null,
           // ── ML advisory state ──────────────────────────────────────────────
           ml_action: lastMlDecision?.action ?? null,
           ml_confidence: lastMlDecision?.confidence ?? null,
@@ -828,8 +1040,15 @@ async function main(): Promise<void> {
 
     // ── FLAT phase: full analysis + entry evaluation ───────────────────────
 
+    // Pre-fetch LOB snapshot for layered scoring (shadow or enabled)
+    const lsConf = effectiveConfig.layered_scoring;
+    const layeredNeedsLob = lsConf?.enabled || lsConf?.shadow_log;
+    const preScoringLobSnap = layeredNeedsLob
+      ? await lobClient.getSnapshot().catch(() => null)
+      : null;
+
     const dualResult: DualDirectionResult =
-      generateSignal(snap, effectiveConfig, contract);
+      generateSignal(snap, effectiveConfig, contract, undefined, preScoringLobSnap);
     const { regime, bias, bestSetup, tradeAllowed: baseTradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
     // confidence is mutable — micro overlay may adjust it below
     let confidence = dualResult.confidence;
@@ -911,8 +1130,11 @@ async function main(): Promise<void> {
     let extensionVetoed = false;
     let extensionVetoReasons: string[] = [];
 
-    // Fetch LOB snapshot once at candidate time — used for MBO diagnostics, entry ML, and microstructure overlay
-    const candidateLobSnap = bestSetup ? await lobClient.getSnapshot().catch(() => null) : null;
+    // LOB snapshot: reuse pre-scoring snapshot if available (layered shadow/enabled),
+    // otherwise fetch now. This avoids comparing scores from different snapshot moments.
+    const candidateLobSnap = bestSetup
+      ? (preScoringLobSnap ?? await lobClient.getSnapshot().catch(() => null))
+      : null;
 
     // Microstructure score overlay — computed for every candidate, logged always
     const microOverlayConfig: MicrostructureOverlayConfig = {
@@ -1206,8 +1428,22 @@ async function main(): Promise<void> {
           const sizing = riskManager.calcPositionSize(bestSetup);
           riskManager.logSizingDecision(sizing, bestSetup.direction as 'long' | 'short', contract.root, contract.point_value, true);
 
+          const _entryTradeId = `TRADE_${sessionId}_${String(totalSignals).padStart(4, '0')}`;
+          logWriter.writeExecutionIntent({
+            event: 'trade_entry_submitted', timestamp: new Date().toISOString(),
+            trade_id: _entryTradeId, side: bestSetup.direction as 'long' | 'short', source: 'analysis',
+            price: snap.price, quantity: sizing.quantity,
+          });
+
           const entryResult = await adapter.placeEntry(bestSetup, sizing.quantity, snap.price);
-          const tradeId = `TRADE_${sessionId}_${String(totalSignals).padStart(4, '0')}`;
+          const tradeId = _entryTradeId;
+
+          logWriter.writeExecutionIntent({
+            event: 'trade_entry_filled', timestamp: entryResult.fill_time_iso,
+            trade_id: tradeId, side: bestSetup.direction as 'long' | 'short', source: 'analysis',
+            price: entryResult.fill_price, quantity: entryResult.quantity,
+            slippage_pts: entryResult.slippage_pts, fee_usd: entryResult.fee_usd, order_id: entryResult.order_id,
+          });
 
           // ── Resolve management profile for this setup type ─────────────
           // The profile provides trailing, BE, time-stop parameters.
@@ -1252,6 +1488,7 @@ async function main(): Promise<void> {
           );
           position.management_variant = effectiveConfig.active_management_variant ?? 'baseline_tight_exit';
           positionManager.openPosition(position);
+          tradeJournal.append('trade_opened', tradeId, 'runner', bestSetup.setup_type, position);
           riskManager.recordTradeOpen();
           phaseManager.transitionTo('MANAGING', `position_opened:${tradeId}`);
 
@@ -1301,6 +1538,10 @@ async function main(): Promise<void> {
           cycleChangeNote = `NEW TRADE: ${bestSetup.direction.toUpperCase()} ${sizing.quantity} ${contract.root} @ ${entryResult.fill_price} | Stop: ${bestSetup.stop} | T1: ${bestSetup.target_1} (${bestSetup.rr_t1}R)`;
           console.log(`[RUNNER] 🎯 Trade opened: ${tradeId}`);
           dashboardState.updatePosition(positionManager.getPosition());
+          // Seed ML config so dashboard shows "enabled / awaiting" before first inference
+          if (mlConfig?.enabled) {
+            dashboardState.seedMlConfig(mlConfig);
+          }
           recentEventLog.push(`trade_opened:${tradeId}:${bestSetup.direction}:${bestSetup.setup_type}`);
 
         } catch (entryErr) {
@@ -1416,35 +1657,906 @@ async function main(): Promise<void> {
     });
   };
 
-  await scheduler.runHybrid({
-    analysisIntervalMs: effectiveConfig.analysis_interval_seconds * 1000,
-    monitorIntervalMs: effectiveConfig.in_position_monitor_seconds * 1000,
-    isInPosition: () => positionManager.hasOpenPosition(),
-    onAnalysis,
-    onMonitor,
-    onShadowAnalysis: async (cycleNumber) => {
-      await runShadowSignal(lastSnap, cycleNumber);
-    },
+  // ─── V2 Multi-Lane Engine ─────────────────────────────────────────────────
+  if (effectiveConfig.runner_v2_enabled) {
+    const laneTiming = effectiveConfig.lane_timing ?? {};
+    const shadowOnly = effectiveConfig.runner_v2_shadow_only ?? true;
+    const executionLock = new ExecutionLock();
+    const sharedState: LaneSharedState = createLaneSharedState();
+
+    // Track last ML action execution time for cooldown gate
+    let v2LastMlActionTimestamp = 0;
+
+    // Forward ref for lane metrics (assigned before scheduler.run(), read in callbacks)
+    let laneSchedulerRef: LaneScheduler | null = null;
+
+    console.log(
+      `[RUNNER] ▶️  V2 multi-lane engine ${shadowOnly ? '(SHADOW-ONLY — observation mode)' : '(ACTIVE)'}`,
+    );
+
+    // ── Hard Risk Lane (500ms) ────────────────────────────────────────────
+    const onHardRisk = async (_cycle: number): Promise<void> => {
+      if (!positionManager.hasOpenPosition()) return;
+      const pos = positionManager.getPosition();
+      if (!pos) return;
+
+      // Fetch quote with per-provider tight timeouts (BBO 150ms, TV 300ms)
+      let quoteResult = await quoteService.fetchFresh({
+        perProviderTimeoutMs: {
+          'bookmap_bbo': laneTiming.hard_risk_quote_timeout_bbo_ms ?? 150,
+          'tradingview': laneTiming.hard_risk_quote_timeout_tv_ms ?? 300,
+        },
+      }).catch(() => null);
+
+      if (quoteResult && !quoteService.isStale(quoteResult)) {
+        sharedState.lastPrice = quoteResult.price;
+        sharedState.lastQuoteResult = {
+          price: quoteResult.price,
+          timestamp_unix_ms: quoteResult.timestamp_unix_ms,
+          source: quoteResult.source,
+          is_stale: quoteResult.is_stale,
+        };
+        sharedState.lastQuoteAt = Date.now();
+        dashboardState.updateQuoteInfo({ ...quoteResult, age_ms: quoteService.computeAge(quoteResult), is_stale: false });
+        dashboardState.updateCurrentPrice(quoteResult.price);
+
+        // Recovery from degraded state
+        if (sharedState.degradedSince !== null) {
+          const degradedDuration = Date.now() - sharedState.degradedSince;
+          console.log(`[HARD-RISK] RECOVERED: fresh quote after ${degradedDuration}ms degraded. ${quoteResult.source} ${quoteResult.price} age=${quoteService.computeAge(quoteResult)}ms`);
+          sharedState.degradedSince = null;
+        }
+      }
+
+      const price = sharedState.lastPrice;
+      if (price === null) {
+        // No quote ever received
+        if (sharedState.degradedSince === null) {
+          sharedState.degradedSince = Date.now();
+        }
+        if (_cycle % 20 === 0) {
+          console.log(`[HARD-RISK] SKIP: no quote received yet. Waiting for first successful fetch.`);
+        }
+        return;
+      }
+
+      // Determine freshness tier
+      const quoteAge = Date.now() - sharedState.lastQuoteAt;
+      const staleFull = laneTiming.hard_risk_stale_full_risk_ms ?? 1000;
+      const staleStopOnly = laneTiming.hard_risk_stale_stop_only_ms ?? 3000;
+
+      if (quoteAge > staleStopOnly) {
+        // Too stale — degraded mode, stop-hit defense only
+        if (sharedState.degradedSince === null) {
+          sharedState.degradedSince = Date.now();
+          console.log(`[HARD-RISK] DEGRADED: no fresh quote for ${quoteAge}ms. Stop-hit only mode. Last price=${price}`);
+        }
+      }
+
+      if (shadowOnly) {
+        // Shadow mode: evaluate but do NOT mutate or exit
+        const result = positionManager.evaluateRiskOnly(price);
+        if (result.shouldExit || result.hasMutations) {
+          logWriter.writeMlManagementAction({
+            _type: 'v2_shadow_hard_risk',
+            timestamp: new Date().toISOString(),
+            trade_id: pos.trade_id,
+            would_exit: result.shouldExit,
+            exit_reason: result.exitDecision?.reason ?? null,
+            would_mutate: result.hasMutations,
+            mutations: result.proposedMutations,
+            quote_age_ms: quoteAge,
+            price,
+          });
+
+          // Shadow-diff: both-sides disagreement record in trade_path.jsonl
+          const v2ProposedStop = result.proposedMutations.newStopCurrent;
+          const stopDisagrees = v2ProposedStop !== null && v2ProposedStop !== pos.stop_current;
+          const exitDisagrees = result.shouldExit;
+
+          if (stopDisagrees || exitDisagrees) {
+            logWriter.writeTradePathPoint({
+              row_type: 'v2_shadow_diff',
+              schema_version: 2,
+              owner: 'v2_shadow',
+              source_lane: 'hard_risk',
+              timestamp: new Date().toISOString(),
+              trade_id: pos.trade_id,
+              // ── v1 live state at this instant ──
+              v1_stop_current: pos.stop_current,
+              v1_stop_initial: pos.stop_initial,
+              v1_trailing_active: pos.trailing_active,
+              v1_trail_anchor: pos.trail_anchor_price,
+              v1_pre_t1_be_triggered: pos.pre_t1_be_triggered,
+              v1_pt1_done: pos.pt1_done,
+              v1_pt2_done: pos.pt2_done,
+              // ── v2 proposed state ──
+              v2_proposed_stop: v2ProposedStop,
+              v2_would_exit: result.shouldExit,
+              v2_exit_reason: result.exitDecision?.reason ?? null,
+              v2_would_move_be: result.proposedMutations.moveStopToBE,
+              v2_would_activate_trail: result.proposedMutations.activatePreT1Trail,
+              v2_proposed_trail_anchor: result.proposedMutations.newTrailAnchor,
+              // ── shared context ──
+              price,
+              quote_age_ms: quoteAge,
+              // ── divergence summary ──
+              divergence_type: exitDisagrees ? 'exit' : 'stop',
+              stop_delta: v2ProposedStop !== null ? v2ProposedStop - pos.stop_current : null,
+            });
+          }
+        }
+        return;
+      }
+
+      // ACTIVE mode: apply mutations and exit under lock
+      const result = positionManager.evaluateRiskOnly(price);
+
+      if (result.hasMutations && quoteAge <= staleFull) {
+        // Fresh enough for full risk logic (BE, trail ratchet, etc.)
+        await executionLock.runExclusive(async () => {
+          positionManager.applyRiskMutations(result.proposedMutations, price);
+        }, { skipIfExitInFlight: true });
+      }
+
+      if (result.shouldExit) {
+        if (executionLock.exitInFlight) return;
+        console.log(`[HARD-RISK] shouldExit=true trade_id=${pos.trade_id} reason=${result.exitDecision?.reason} price=${price}`);
+        await executionLock.runExclusive(async () => {
+          const exitPos = positionManager.getPosition();
+          if (!exitPos) return;
+          const exitDecision = result.exitDecision!;
+          const exitReason = exitDecision.reason ?? 'stop_loss';
+
+          // 1. Submit exit
+          logWriter.writeExecutionIntent({
+            event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+            trade_id: exitPos.trade_id, side: exitPos.side, source: 'hard_risk', reason: exitReason,
+            price: exitDecision.exitPrice, quantity: exitPos.quantity_remaining,
+          });
+          console.log(`[EXECUTOR] submitting paper exit trade_id=${exitPos.trade_id}`);
+
+          const exitResult = await adapter.placeExit(exitPos.side, exitPos.quantity_remaining, exitDecision.exitPrice, exitReason);
+
+          // 2. Exit filled
+          logWriter.writeExecutionIntent({
+            event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
+            trade_id: exitPos.trade_id, side: exitPos.side, source: 'hard_risk', reason: exitReason,
+            price: exitResult.fill_price, quantity: exitResult.quantity,
+            slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+          });
+          console.log(`[EXECUTOR] paper exit acknowledged trade_id=${exitPos.trade_id} fill=${exitResult.fill_price}`);
+
+          const tradeRecord = positionManager.closePosition(
+            exitResult, exitReason, sharedState.lastRegime as MarketRegime, sessionId, env.STRATEGY_VERSION, exitDecision.plannedExitPrice,
+            {
+              target_1_direction_valid: exitPos.target_1_direction_valid,
+              target_2_direction_valid: exitPos.target_2_direction_valid,
+              target_3_direction_valid: exitPos.target_3_direction_valid,
+              target_ordering_valid: exitPos.target_ordering_valid,
+              target_repair_applied: exitPos.target_repair_applied,
+            },
+          );
+
+          // 3. Trade closed
+          logWriter.writeExecutionIntent({
+            event: 'trade_closed', timestamp: new Date().toISOString(),
+            trade_id: exitPos.trade_id, side: exitPos.side, source: 'hard_risk', reason: exitReason,
+            price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
+            r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+          });
+          console.log(`[POSITION] closed trade_id=${exitPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
+
+          logWriter.writeTrade(tradeRecord);
+          tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
+          riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+          perfTracker.recordTrade(tradeRecord);
+          dashboardState.updatePosition(null);
+          dashboardState.clearManagement();
+          dashboardState.clearMlManagement();
+          lastMgmtMetrics = null;
+          dashboardState.recordTrade(tradeRecord);
+          dashboardState.updatePerformance(perfTracker.getStats());
+          dashboardState.updateRisk(riskManager.getState());
+          lobClient.endTradeContext(exitPos.trade_id).catch(() => {});
+          phaseManager.transitionTo('EXITING', `v2_hard_risk:${exitDecision.reason}`);
+          phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
+          sharedState.exitInFlight = false;
+          recentEventLog.push(`trade_closed:${exitPos.trade_id}:${exitReason}:${tradeRecord.outcome_class}`);
+          console.log(`[DASH] position cleared trade_id=${exitPos.trade_id}`);
+        }, { isExit: true, skipIfExitInFlight: true });
+        dashboardState.flush();
+      }
+    };
+
+    // ── Management Lane (2000ms) ──────────────────────────────────────────
+    const onManagement = async (_cycle: number): Promise<void> => {
+      if (!positionManager.hasOpenPosition()) return;
+      const pos = positionManager.getPosition();
+      if (!pos) return;
+
+      const price = sharedState.lastPrice;
+      if (price === null) return; // no quote yet
+
+      // Freshness gate for price-sensitive decisions
+      const quoteAge = Date.now() - sharedState.lastQuoteAt;
+      const staleThreshold = laneTiming.management_stale_threshold_ms ?? 3000;
+
+      // Management metrics (always compute, even with stale quotes)
+      const sessionCtx = classifySession();
+      const mgmtFeatures = buildManagementFeatures(
+        pos, price,
+        sharedState.lastLiteSnap?.indicators_1m ?? lastSnap?.indicators_1m ?? null,
+        sharedState.lastRegime as MarketRegime,
+        sessionCtx.strategy_bucket ?? null,
+      );
+      const mgmtMetrics = managementEngine.evaluate(mgmtFeatures);
+      lastMgmtMetrics = mgmtMetrics;
+      sharedState.lastMgmtMetrics = mgmtMetrics;
+      dashboardState.updateManagement(mgmtMetrics);
+
+      // ML inference (runs in BOTH shadow and active modes for observability)
+      if (mlConfig.enabled && positionManager.hasOpenPosition()) {
+        const mlInterval = laneTiming.ml_management_interval_ms ?? 8000;
+        const sinceLastMl = Date.now() - sharedState.lastMlCallAt;
+
+        // Event-driven ML override: force call on state changes
+        const mlForceEvents = [
+          pos.pt1_done && sinceLastMl > 1000,           // PT1 just triggered
+          pos.pre_t1_be_triggered && sinceLastMl > 1000, // BE triggered
+        ].some(Boolean);
+
+        if (sinceLastMl >= mlInterval || mlForceEvents) {
+          try {
+            const mlQuoteAge = quoteAge;
+            const mlLobSnap = await lobClient.getSnapshot().catch(() => null);
+            const mlResult = await getMlDecision(
+              pos, price, mlQuoteAge, mlConfig, mlLobSnap,
+              v2LastMlActionTimestamp > 0 ? v2LastMlActionTimestamp : null,
+            );
+            sharedState.lastMlCallAt = Date.now();
+            sharedState.lastMlDecision = mlResult.decision;
+            lastMlDecision = mlResult.decision;
+            dashboardState.updateMlManagement(mlResult.decision, mlConfig);
+
+            // Log ML action + features (same as v1)
+            logWriter.writeMlManagementAction({
+              timestamp: new Date().toISOString(),
+              trade_id: pos.trade_id,
+              action: mlResult.decision.action,
+              action_confidence: mlResult.decision.confidence,
+              model_name: mlResult.decision.model_name,
+              model_version: mlResult.decision.model_version || mlConfig.model_version,
+              prob_hold: mlResult.decision.prob_hold,
+              ev_hold_r: mlResult.decision.ev_hold_r,
+              approved: mlResult.decision.approved,
+              rejection_reason: mlResult.decision.rejection_reason,
+              inference_ms: mlResult.decision.inference_ms,
+              quote_age_ms: mlQuoteAge,
+              side: pos.side,
+              setup_type: pos.setup_type,
+              quantity_remaining: pos.quantity_remaining,
+              unrealized_r: positionManager.getUnrealizedR(price),
+              tier_used: mlResult.decision.tier_used,
+              fallback_used: mlResult.decision.fallback_used,
+              fallback_reason: mlResult.decision.fallback_reason,
+              notes: mlResult.decision.notes,
+            });
+
+            // Log features
+            const _featureSchemaHash = createHash('sha256')
+              .update(Object.keys(mlResult.features).filter(k => k !== 'trade_id').sort().join(','))
+              .digest('hex')
+              .slice(0, 8);
+            logWriter.writeMlManagementFeatures({
+              ...JSON.parse(mlResult.serializedRequestBody),
+              _timestamp: new Date().toISOString(),
+              _trade_id: pos.trade_id,
+              _request_id: mlResult.requestId,
+              _service_url: mlConfig.service_url,
+              _request_latency_ms: mlResult.requestLatencyMs,
+              _feature_count: Object.keys(mlResult.features).length - 1,
+              _log_schema_version: ML_FEATURE_SCHEMA_VERSION,
+              _feature_schema_hash: _featureSchemaHash,
+              _lob_available: mlResult.features.lob_spread_ticks !== null,
+              _adv_mbo_available: mlResult.features.adv_cancel_replace_ratio_10s !== null,
+              _data_quality_tier: computeDataQualityTier(mlResult.features),
+              _bbo_age_ms: mlLobSnap?.bbo_age_ms ?? null,
+              _serialized_response_body: mlResult.serializedResponseBody,
+              _response_action: mlResult.decision.action,
+              _response_confidence: mlResult.decision.confidence,
+              _response_approved: mlResult.decision.approved,
+              _response_rejection_reason: mlResult.decision.rejection_reason,
+              _response_model_name: mlResult.decision.model_name,
+              _response_model_version: mlResult.decision.model_version,
+              _response_tier_used: mlResult.decision.tier_used,
+              _response_fallback_used: mlResult.decision.fallback_used,
+              _response_fallback_reason: mlResult.decision.fallback_reason,
+            });
+
+            // Execute approved ML actions under lock (ACTIVE mode only — shadow skips execution)
+            const mlDec = mlResult.decision;
+            if (!shadowOnly && mlDec.approved && mlDec.action !== 'NO_ACTION' && mlDec.action !== 'HOLD') {
+              const mlLobSnapForPolicy = mlLobSnap;
+              const policyResult = execPolicy.evaluate(
+                mlDec.action, pos, mlLobSnapForPolicy, mlQuoteAge,
+                mlDec.recommended_size_fraction !== null
+                  ? Math.max(1, Math.floor(pos.quantity_remaining * mlDec.recommended_size_fraction))
+                  : null,
+                mlDec.recommended_stop_price,
+              );
+
+              if (policyResult.should_execute) {
+                let mlExitedAll = false;
+                await executionLock.runExclusive(async () => {
+                  const mlPos = positionManager.getPosition();
+                  if (!mlPos) return;
+
+                  if (mlDec.action === 'EXIT_ALL') {
+                    console.log(`[ML] shouldExit=true trade_id=${mlPos.trade_id} reason=ml_exit_all price=${price}`);
+                    logWriter.writeExecutionIntent({
+                      event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_exit_all', reason: 'manual',
+                      price, quantity: mlPos.quantity_remaining,
+                    });
+                    console.log(`[EXECUTOR] submitting paper exit trade_id=${mlPos.trade_id}`);
+
+                    const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'manual');
+
+                    logWriter.writeExecutionIntent({
+                      event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
+                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_exit_all', reason: 'manual',
+                      price: exitResult.fill_price, quantity: exitResult.quantity,
+                      slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+                    });
+                    console.log(`[EXECUTOR] paper exit acknowledged trade_id=${mlPos.trade_id} fill=${exitResult.fill_price}`);
+
+                    const tradeRecord = positionManager.closePosition(
+                      exitResult, 'manual', sharedState.lastRegime as MarketRegime, sessionId, env.STRATEGY_VERSION, price,
+                      {
+                        target_1_direction_valid: mlPos.target_1_direction_valid,
+                        target_2_direction_valid: mlPos.target_2_direction_valid,
+                        target_3_direction_valid: mlPos.target_3_direction_valid,
+                        target_ordering_valid: mlPos.target_ordering_valid,
+                        target_repair_applied: mlPos.target_repair_applied,
+                      },
+                    );
+
+                    logWriter.writeExecutionIntent({
+                      event: 'trade_closed', timestamp: new Date().toISOString(),
+                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_exit_all', reason: 'manual',
+                      price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
+                      r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+                    });
+                    console.log(`[POSITION] closed trade_id=${mlPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
+
+                    logWriter.writeTrade(tradeRecord);
+                    tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
+                    riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+                    perfTracker.recordTrade(tradeRecord);
+                    dashboardState.updatePosition(null);
+                    dashboardState.clearManagement();
+                    dashboardState.clearMlManagement();
+                    lastMgmtMetrics = null;
+                    dashboardState.recordTrade(tradeRecord);
+                    dashboardState.updatePerformance(perfTracker.getStats());
+                    dashboardState.updateRisk(riskManager.getState());
+                    lobClient.endTradeContext(mlPos.trade_id).catch(() => {});
+                    phaseManager.transitionTo('EXITING', `ml_exit_all:${mlPos.trade_id}`);
+                    phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
+                    recentEventLog.push(`trade_closed:${mlPos.trade_id}:ml_exit_all:${tradeRecord.outcome_class}`);
+                    console.log(`[DASH] position cleared trade_id=${mlPos.trade_id}`);
+                    mlExitedAll = true;
+                  } else if (mlDec.action === 'MOVE_TO_BREAKEVEN') {
+                    positionManager.moveStopToBreakeven();
+                  } else if (mlDec.action === 'MOVE_STOP' && mlDec.recommended_stop_price !== null) {
+                    positionManager.moveStopTo(mlDec.recommended_stop_price);
+                  } else if (mlDec.action === 'EXIT_PARTIAL' && mlConfig.enable_partial_exit) {
+                    const frac = mlDec.recommended_size_fraction;
+                    if (frac !== null && frac > 0 && frac < 1) {
+                      const qtyToExit = Math.max(1, Math.floor(mlPos.quantity_remaining * frac));
+                      if (qtyToExit > 0 && qtyToExit < mlPos.quantity_remaining) {
+                        const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'manual');
+                        positionManager.applyPartialExit(qtyToExit, partialResult.fill_price, partialResult.fill_time_iso, partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig);
+                      }
+                    }
+                  }
+
+                  // Record execution timestamp for cooldown
+                  v2LastMlActionTimestamp = Date.now();
+                  sharedState.lastMlActionTimestamp = v2LastMlActionTimestamp;
+                  execPolicy.recordExecution(mlDec.action);
+                }, { isExit: mlDec.action === 'EXIT_ALL', skipIfExitInFlight: mlDec.action === 'EXIT_ALL' });
+                if (mlExitedAll) dashboardState.flush();
+              }
+            }
+          } catch (err) {
+            if (_cycle % 30 === 0) {
+              console.warn(`[ML] Decision error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        }
+      }
+
+      // Shadow guard: v1 onMonitor() owns exit evaluation and position mutation
+      if (shadowOnly) {
+        logWriter.writeMlManagementAction({
+          _type: 'v2_shadow_management',
+          timestamp: new Date().toISOString(),
+          trade_id: pos.trade_id,
+          exit_eval_skipped: true,     // deliberately skipped — not "evaluated and no exit"
+          management_state: mgmtMetrics.management_state,
+          quote_age_ms: quoteAge,
+          price,
+        });
+        writeTradePathPoint(pos, price, 'shadow_management');
+        dashboardState.flush();
+        return;
+      }
+
+      // ACTIVE mode: full position evaluation under lock
+      if (quoteAge <= staleThreshold) {
+        const exit = await executionLock.runExclusive(async () => {
+          return positionManager.evaluate(price, effectiveConfig);
+        }, { skipIfExitInFlight: true });
+
+        if (exit && exit.shouldExit && exit.reason) {
+          await handleManagementExit(exit, pos, price);
+        }
+      }
+
+      // Trade-path point logging
+      writeTradePathPoint(pos, price);
+
+      // Heartbeat log (every ~5 ticks = ~10s)
+      if (_cycle % 5 === 0) {
+        const unrealR = positionManager.getUnrealizedR(price);
+        const trailTag = pos.trailing_active ? 'active' : 'off';
+        const mlTag = lastMlDecision ? `${lastMlDecision.action}(${lastMlDecision.confidence?.toFixed(2) ?? '?'})` : 'n/a';
+        const holdSec = Math.round((Date.now() - pos.entry_time_unix) / 1000);
+        console.log(
+          `[HB] MANAGING | ${sharedState.lastQuoteResult?.source ?? 'cached'} ${price} age=${quoteAge}ms ` +
+          `| ${unrealR >= 0 ? '+' : ''}${unrealR.toFixed(2)}R MFE=${pos.max_favorable_excursion.toFixed(2)}R ` +
+          `| stop=${pos.stop_current} trail=${trailTag} | ML=${mlTag} | ${holdSec}s`,
+        );
+      }
+
+      dashboardState.updatePosition(positionManager.getPosition());
+      dashboardState.updateRisk(riskManager.getState());
+      dashboardState.flush();
+    };
+
+    // ── Context Refresh Lane (5000ms) ─────────────────────────────────────
+    const onContextRefresh = async (_cycle: number): Promise<void> => {
+      if (!positionManager.hasOpenPosition()) return;
+
+      try {
+        // ── Key-levels recompute: run full collect() instead of lite ──
+        // Throttle: at most once per 60s to prevent repeated full-collect loops
+        const keyLevelRecomputeMinIntervalMs = 60_000;
+        if (sharedState.needsKeyLevelRecompute
+            && (Date.now() - sharedState.lastKeyLevelRecomputeAt >= keyLevelRecomputeMinIntervalMs)) {
+          sharedState.lastKeyLevelRecomputeAt = Date.now();
+          try {
+            const fullSnap = await dataCollector.collect(instrumentSymbol);
+            lastSnap = fullSnap;
+            sharedState.lastLiteSnap = {
+              timestamp_unix: fullSnap.timestamp_unix,
+              timestamp_iso: fullSnap.timestamp_iso,
+              price: fullSnap.price,
+              bars_1m: fullSnap.bars_1m,
+              indicators_1m: fullSnap.indicators_1m,
+              session: classifySession(),
+              key_levels: fullSnap.key_levels,
+              key_levels_age_ms: 0,
+            };
+            sharedState.lastLiteSnapAt = Date.now();
+            sharedState.needsKeyLevelRecompute = false;
+            sharedState.keyLevelsStaleLogged = false;
+            console.log(`[CTX-REFRESH] Key levels recomputed via full collect`);
+          } catch (err) {
+            console.warn(`[CTX-REFRESH] Full recompute failed, will retry in ${keyLevelRecomputeMinIntervalMs / 1000}s: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          return; // Full collect replaces lite for this tick
+        }
+
+        const liteSnap = await dataCollector.collectLite1m();
+        sharedState.lastLiteSnap = liteSnap;
+        sharedState.lastLiteSnapAt = Date.now();
+
+        // Sync fresh indicators to dashboard for buildMarketState()
+        dashboardState.updateLiteIndicators({
+          ema_9: liteSnap.indicators_1m.ema_9,
+          ema_21: liteSnap.indicators_1m.ema_21,
+          ema_50: liteSnap.indicators_1m.ema_50,
+          vwap: liteSnap.indicators_1m.vwap,
+          atr_14: liteSnap.indicators_1m.atr_14,
+          supertrend_direction: liteSnap.indicators_1m.supertrend_direction,
+        }, liteSnap.price);
+
+        // Recompute regime from fresh indicators
+        const indicators = liteSnap.indicators_1m;
+        if (indicators.ema_9 !== null && indicators.ema_21 !== null && indicators.ema_50 !== null) {
+          // Simple regime from EMA stack (matches strategy.ts logic)
+          if (indicators.ema_9 > indicators.ema_21 && indicators.ema_21 > indicators.ema_50) {
+            sharedState.lastRegime = 'trending_up';
+          } else if (indicators.ema_9 < indicators.ema_21 && indicators.ema_21 < indicators.ema_50) {
+            sharedState.lastRegime = 'trending_down';
+          } else {
+            sharedState.lastRegime = lastRegime; // keep last known
+          }
+        }
+
+        sharedState.lastSessionCtx = liteSnap.session;
+
+        // Sync legacy variable so v1 paths and analysis lane stay aligned
+        lastRegime = sharedState.lastRegime as MarketRegime;
+
+        // Sync regime and session to dashboard for live market-state display
+        dashboardState.updateRegime(sharedState.lastRegime as MarketRegime);
+        if (liteSnap.session) {
+          const sess = liteSnap.session;
+          dashboardState.updateSessionInfo({
+            bucket: sess.legacy_bucket,
+            exchange_state: sess.exchange_state,
+            strategy_bucket: sess.strategy_bucket,
+            market_open: sess.is_rth,
+            or_complete: liteSnap.key_levels.opening_range_high !== null,
+            or_high: liteSnap.key_levels.opening_range_high,
+            or_low: liteSnap.key_levels.opening_range_low,
+            or_mid: liteSnap.key_levels.opening_range_mid,
+            or_width: liteSnap.key_levels.opening_range_high !== null && liteSnap.key_levels.opening_range_low !== null
+              ? Math.round((liteSnap.key_levels.opening_range_high - liteSnap.key_levels.opening_range_low) * 100) / 100 : null,
+          });
+        }
+
+        // Check if key_levels need refresh — set flag once, log once
+        if (liteSnap.key_levels_age_ms > 120_000 || liteSnap.key_levels_age_ms < 0) {
+          if (!sharedState.needsKeyLevelRecompute) {
+            sharedState.needsKeyLevelRecompute = true;
+            console.log(`[CTX-REFRESH] Key levels stale (${liteSnap.key_levels_age_ms}ms) — will recompute on next tick`);
+            sharedState.keyLevelsStaleLogged = true;
+          }
+        }
+
+        // Lane metrics heartbeat: every 3rd cycle (~15s at 5s interval)
+        if (laneSchedulerRef && _cycle % 3 === 0 && _cycle > 0) {
+          logWriter.writeLaneMetrics({
+            timestamp: new Date().toISOString(),
+            session_id: sessionId,
+            metrics: laneSchedulerRef.getMetrics(),
+          });
+        }
+      } catch (err) {
+        console.warn(`[CTX-REFRESH] Error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+
+    // Helper: write trade-path point (shared by management and shadow modes)
+    const writeTradePathPoint = (
+      pos: NonNullable<ReturnType<typeof positionManager.getPosition>>,
+      price: number,
+      sourceLane: string = 'management',
+    ): void => {
+      const pnlPts = pos.side === 'short' ? pos.entry_price - price : price - pos.entry_price;
+      const pnlUsd = pnlPts * pos.quantity_remaining * contract.point_value;
+      const riskPts = Math.abs(pos.entry_price - pos.stop_initial);
+      logWriter.writeTradePathPoint({
+        // ── Row schema ─────────────────────────────────────────────────────
+        row_type: 'trade_path_point',
+        schema_version: 2,
+        owner: 'v2',
+        source_lane: sourceLane,
+        // ── Core fields ────────────────────────────────────────────────────
+        timestamp: new Date().toISOString(),
+        trade_id: pos.trade_id,
+        session_id: sessionId,
+        side: pos.side,
+        entry_price: pos.entry_price,
+        current_price: price,
+        pnl_pts: Math.round(pnlPts * 100) / 100,
+        pnl_usd: Math.round(pnlUsd * 100) / 100,
+        unrealized_r: riskPts > 0 ? Math.round((pnlPts / riskPts) * 100) / 100 : 0,
+        stop_current: pos.stop_current,
+        trailing_active: pos.trailing_active,
+        target_1: pos.target_1,
+        target_2: pos.target_2,
+        partial_exit_done: pos.partial_exit_done,
+        quantity_remaining: pos.quantity_remaining,
+        mfe_pts: Math.round(pos.max_favorable_excursion * 100) / 100,
+        mae_pts: Math.round(pos.max_adverse_excursion * 100) / 100,
+        hold_seconds: Math.round((Date.now() - pos.entry_time_unix) / 1000),
+        initial_risk_pts: riskPts,
+        setup_type: pos.setup_type,
+        regime: sharedState.lastRegime as MarketRegime,
+        pop_t1_advisory: lastMgmtMetrics?.pop.pop_target1_before_stop ?? null,
+        pop_t2_advisory: lastMgmtMetrics?.pop.pop_target2_before_stop ?? null,
+        pop_model: lastMgmtMetrics?.pop.model_name ?? null,
+        management_profile: pos.management_params?.profile_name ?? null,
+        pt1_done: pos.pt1_done,
+        pt2_done: pos.pt2_done,
+        pre_t1_be_triggered: pos.pre_t1_be_triggered,
+        pre_t1_trailing_active: pos.pre_t1_trailing_active,
+        trail_distance_ticks: pos.trail_distance_ticks,
+        atr_at_entry: pos.atr_at_entry,
+        // ── Position progression (Phase 10) ────────────────────────────────
+        stop_initial: pos.stop_initial,
+        trail_anchor_price: pos.trail_anchor_price,
+        pt1_realized_pnl: pos.pt1_realized_pnl,
+        pt2_realized_pnl: pos.pt2_realized_pnl,
+        pt1_qty_exited: pos.pt1_qty_exited,
+        pt2_qty_exited: pos.pt2_qty_exited,
+        mfe_at_pt1_trigger: pos.mfe_at_pt1_trigger,
+        mae_at_pt1_trigger: pos.mae_at_pt1_trigger,
+        peak_r_before_first_partial: pos.peak_r_before_first_partial,
+        management_state: lastMgmtMetrics?.management_state ?? null,
+        // ── ML advisory state ──────────────────────────────────────────────
+        ml_action: lastMlDecision?.action ?? null,
+        ml_confidence: lastMlDecision?.confidence ?? null,
+        ml_prob_hold: lastMlDecision?.prob_hold ?? null,
+        ml_ev_hold_r: lastMlDecision?.ev_hold_r ?? null,
+        ml_approved: lastMlDecision?.approved ?? null,
+        ml_model: lastMlDecision?.model_name ?? null,
+        ml_inference_ms: lastMlDecision?.inference_ms ?? null,
+      });
+    };
+
+    // Helper: handle management lane exit
+    const handleManagementExit = async (
+      exit: ReturnType<typeof positionManager.evaluate>,
+      pos: NonNullable<ReturnType<typeof positionManager.getPosition>>,
+      price: number,
+    ): Promise<void> => {
+      if (!exit.shouldExit || !exit.reason) return;
+      const exitReason = exit.reason; // narrow to non-null for closure safety
+
+      if (exit.isPartial) {
+        await executionLock.runExclusive(async () => {
+          const partialResult = await adapter.placeExit(pos.side, exit.partialQuantity, exit.exitPrice, exitReason);
+          const slippagePts = Math.abs(exit.exitPrice - exit.plannedExitPrice);
+          if (exitReason === 'partial_profit_1') {
+            positionManager.applyPt1Exit(exit.partialQuantity, exit.exitPrice, partialResult.fill_time_iso, partialResult.fee_usd, slippagePts, effectiveConfig);
+          } else if (exitReason === 'partial_profit_2') {
+            positionManager.applyPt2Exit(exit.partialQuantity, exit.exitPrice, partialResult.fill_time_iso, partialResult.fee_usd, slippagePts, effectiveConfig);
+          } else {
+            positionManager.applyPartialExit(exit.partialQuantity, exit.exitPrice, partialResult.fill_time_iso, partialResult.fee_usd, slippagePts, effectiveConfig);
+          }
+        }, { isPartial: true, skipIfExitInFlight: true });
+      } else {
+        console.log(`[MGMT] shouldExit=true trade_id=${pos.trade_id} reason=${exitReason} price=${price}`);
+        await executionLock.runExclusive(async () => {
+          const exitPos = positionManager.getPosition();
+          if (!exitPos) return;
+
+          logWriter.writeExecutionIntent({
+            event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
+            trade_id: exitPos.trade_id, side: exitPos.side, source: 'management', reason: exitReason,
+            price: exit.exitPrice, quantity: exitPos.quantity_remaining,
+          });
+          console.log(`[EXECUTOR] submitting paper exit trade_id=${exitPos.trade_id}`);
+
+          const exitResult = await adapter.placeExit(exitPos.side, exitPos.quantity_remaining, exit.exitPrice, exitReason);
+
+          logWriter.writeExecutionIntent({
+            event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
+            trade_id: exitPos.trade_id, side: exitPos.side, source: 'management', reason: exitReason,
+            price: exitResult.fill_price, quantity: exitResult.quantity,
+            slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+          });
+          console.log(`[EXECUTOR] paper exit acknowledged trade_id=${exitPos.trade_id} fill=${exitResult.fill_price}`);
+
+          const tradeRecord = positionManager.closePosition(
+            exitResult, exitReason, sharedState.lastRegime as MarketRegime, sessionId, env.STRATEGY_VERSION, exit.plannedExitPrice,
+            {
+              target_1_direction_valid: exitPos.target_1_direction_valid,
+              target_2_direction_valid: exitPos.target_2_direction_valid,
+              target_3_direction_valid: exitPos.target_3_direction_valid,
+              target_ordering_valid: exitPos.target_ordering_valid,
+              target_repair_applied: exitPos.target_repair_applied,
+            },
+          );
+
+          logWriter.writeExecutionIntent({
+            event: 'trade_closed', timestamp: new Date().toISOString(),
+            trade_id: exitPos.trade_id, side: exitPos.side, source: 'management', reason: exitReason,
+            price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
+            r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+          });
+          console.log(`[POSITION] closed trade_id=${exitPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
+
+          logWriter.writeTrade(tradeRecord);
+          tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
+          riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+          perfTracker.recordTrade(tradeRecord);
+          dashboardState.updatePosition(null);
+          dashboardState.clearManagement();
+          dashboardState.clearMlManagement();
+          lastMgmtMetrics = null;
+          dashboardState.recordTrade(tradeRecord);
+          dashboardState.updatePerformance(perfTracker.getStats());
+          dashboardState.updateRisk(riskManager.getState());
+          lobClient.endTradeContext(exitPos.trade_id).catch(() => {});
+          phaseManager.transitionTo('EXITING', `v2_mgmt:${exit.reason}`);
+          phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
+          recentEventLog.push(`trade_closed:${exitPos.trade_id}:${exitReason}:${tradeRecord.outcome_class}`);
+          console.log(`[DASH] position cleared trade_id=${exitPos.trade_id}`);
+        }, { isExit: true, skipIfExitInFlight: true });
+        dashboardState.flush();
+      }
+    };
+
+    // ── Phase-aware interval override ─────────────────────────────────────
+    const getPhaseInterval = (lane: string): number | null => {
+      const sess = classifySession();
+      const minsSinceOpen = sess.minutes_since_rth_open ?? -1;
+
+      if (lane === 'analysis') {
+        // Opening drive: first 15 min RTH
+        if (sess.is_rth && minsSinceOpen >= 0 && minsSinceOpen <= 15) {
+          return laneTiming.opening_drive_analysis_interval_ms ?? 3000;
+        }
+        // Midday: 11:30-13:00 ET (120-210 min since 9:30)
+        if (sess.is_rth && minsSinceOpen >= 120 && minsSinceOpen <= 210) {
+          return laneTiming.midday_analysis_interval_ms ?? 8000;
+        }
+      }
+      return null;
+    };
+
+    // ── Build lane configs ────────────────────────────────────────────────
+    const lanes: LaneConfig[] = [
+      {
+        name: 'hardRisk',
+        intervalMs: laneTiming.hard_risk_interval_ms ?? 500,
+        callback: onHardRisk,
+        activeWhen: 'in_position',
+        priority: 10,
+        independentBusy: true,
+        overrunThresholdMs: 500,
+      },
+      {
+        name: 'management',
+        intervalMs: laneTiming.management_interval_ms ?? 2000,
+        callback: onManagement,
+        activeWhen: 'in_position',
+        priority: 20,
+        independentBusy: false,
+        overrunThresholdMs: 2000,
+      },
+      {
+        name: 'contextRefresh',
+        intervalMs: laneTiming.context_refresh_interval_ms ?? 5000,
+        callback: onContextRefresh,
+        activeWhen: 'in_position',
+        priority: 30,
+        independentBusy: false,
+        overduePriorityBoostAfter: laneTiming.context_refresh_starvation_boost_after ?? 3,
+        overrunThresholdMs: 1000,
+      },
+      {
+        name: 'analysis',
+        intervalMs: effectiveConfig.analysis_interval_seconds * 1000,
+        callback: onAnalysis,
+        activeWhen: 'flat',
+        priority: 40,
+        independentBusy: false,
+        overrunThresholdMs: 10000,
+      },
+      {
+        name: 'shadow',
+        intervalMs: laneTiming.shadow_interval_ms ?? 15000,
+        callback: async (cycle) => {
+          // Shadow signal requires full MarketSnapshot (5m/15m/1h data).
+          // lastSnap is from the analysis lane and is stale when in-position,
+          // but shadow is advisory-only — tolerate up to 5min staleness.
+          const shadowStaleMs = laneTiming.shadow_snap_stale_ms ?? 300_000;
+          if (lastSnap && (Date.now() - lastSnap.timestamp_unix < shadowStaleMs)) {
+            await runShadowSignal(lastSnap, cycle);
+          }
+        },
+        activeWhen: 'in_position',
+        priority: 50,
+        independentBusy: false,
+        overrunThresholdMs: 5000,
+      },
+    ];
+
+    const laneScheduler = new LaneScheduler({
+      baseTickMs: 250,
+      isInPosition: () => positionManager.hasOpenPosition(),
+      getPhaseInterval,
+      lanes,
+    });
+    laneSchedulerRef = laneScheduler;
+
+    await laneScheduler.run();
+  } else {
+    // ─── V1 Legacy Scheduler ──────────────────────────────────────────────
+    await scheduler.runHybrid({
+      analysisIntervalMs: effectiveConfig.analysis_interval_seconds * 1000,
+      monitorIntervalMs: effectiveConfig.in_position_monitor_seconds * 1000,
+      isInPosition: () => positionManager.hasOpenPosition(),
+      onAnalysis,
+      onMonitor,
+      onShadowAnalysis: async (cycleNumber) => {
+        await runShadowSignal(lastSnap, cycleNumber);
+      },
+    });
+  }
+
+  // ── Ordered shutdown (explicit drains, not sleep-based) ─────────────────
+  const SHUTDOWN_TIMEOUT_MS = 10_000;
+  let shutdownPromise: Promise<void> | null = null;
+
+  async function gracefulShutdown(reason: string): Promise<void> {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = doShutdown(reason);
+    return shutdownPromise;
+  }
+
+  async function doShutdown(reason: string): Promise<void> {
+    const forceExit = setTimeout(() => {
+      console.error('[SHUTDOWN] Timed out after 10s, forcing exit.');
+      runtimeState.releaseLock();
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref();
+
+    try {
+      console.log('\n[RUNNER] Shutting down...');
+      engineShuttingDown = true;                                        // 1. block new entries
+      // (scheduler already stopped by its own SIGINT handler)          // 2. scheduler stopped
+      await sleep(250);                                                 // 3. cushion
+      logWriter.flushAll();                                             // 4. flush logs
+      runtimeState.writeOpenTradeState(positionManager.getPosition());  // 5. persist state
+      const finalStats = perfTracker.getStats();
+      logWriter.updateSessionEnd(sessionId, {                           // 6. session end record
+        timestamp_end: new Date().toISOString(),
+        total_signals: totalSignals,
+        total_trades: finalStats.total_trades,
+        wins: finalStats.wins,
+        losses: finalStats.losses,
+        scratches: finalStats.scratches,
+        total_pnl_usd: finalStats.total_pnl_usd,
+        daily_loss_pct: riskManager.getState().daily_loss_pct,
+        shutdown_reason: reason,
+      });
+      dashboardState.setEngineRunning(false);                           // 7. dashboard state
+      dashboardServer.stop();                                           // 8. HTTP server
+      runtimeState.markCleanShutdown(reason);                           // 9. stops heartbeat, writes state
+      perfTracker.printSelfReview();
+      logWriter.destroy();                                              // 10. final flush
+    } catch (err) {
+      console.error('[SHUTDOWN] Error during teardown:', err);
+    } finally {
+      clearTimeout(forceExit);
+      runtimeState.releaseLock();                                       // 11. ALWAYS last
+    }
+    console.log('[RUNNER] ✅ Session ended cleanly.');
+  }
+
+  // Register gracefulShutdown on fatal paths (SIGINT/SIGTERM handled by scheduler)
+  process.once('uncaughtException', (err) => {
+    console.error('[FATAL] Uncaught exception:', err);
+    gracefulShutdown('uncaught_exception').finally(() => process.exit(1));
+  });
+  process.once('unhandledRejection', (err) => {
+    console.error('[FATAL] Unhandled rejection:', err);
+    gracefulShutdown('unhandled_rejection').finally(() => process.exit(1));
   });
 
-  console.log('\n[RUNNER] Shutting down...');
-  dashboardState.setEngineRunning(false);
-  dashboardServer.stop();
-  const finalStats = perfTracker.getStats();
-  logWriter.updateSessionEnd(sessionId, {
-    timestamp_end: new Date().toISOString(),
-    total_signals: totalSignals,
-    total_trades: finalStats.total_trades,
-    wins: finalStats.wins,
-    losses: finalStats.losses,
-    scratches: finalStats.scratches,
-    total_pnl_usd: finalStats.total_pnl_usd,
-    daily_loss_pct: riskManager.getState().daily_loss_pct,
-    shutdown_reason: 'user_stopped',
-  });
+  // Normal shutdown: scheduler's SIGINT/SIGTERM handler stops the loop,
+  // then control falls through to gracefulShutdown here.
+  await gracefulShutdown('user_stopped');
+}
 
-  perfTracker.printSelfReview();
-  console.log('[RUNNER] ✅ Session ended cleanly.');
+/** Classify the data quality tier based on feature availability. */
+function computeDataQualityTier(features: MlFeatureVector): string {
+  const lobAvailable = features.lob_spread_ticks !== null;
+  const advMboAvailable = features.adv_cancel_replace_ratio_10s !== null;
+  if (lobAvailable && advMboAvailable) return 'tier3_full';
+  if (lobAvailable) return 'tier1_lob';
+  return 'tier0_position_only';
 }
 
 function sleep(ms: number): Promise<void> {

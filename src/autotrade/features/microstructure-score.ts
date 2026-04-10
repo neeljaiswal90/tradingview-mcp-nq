@@ -244,7 +244,7 @@ function dirSign(direction: 'long' | 'short'): number {
 //
 // The scoring logic varies by setup family — that's the key design decision.
 
-interface ComponentResult {
+export interface ComponentResult {
   score: number;
   hasData: boolean;
   reason: string | null;
@@ -256,7 +256,7 @@ interface ComponentResult {
 // For continuation setups: aligned delta = positive
 // For reversal setups: delta divergence from prior move = positive
 
-function scoreDirectionalFlow(
+export function scoreDirectionalFlow(
   snap: LobSnapshot,
   direction: 'long' | 'short',
   family: SetupFamily,
@@ -328,7 +328,7 @@ function scoreDirectionalFlow(
 // Uses: depth_imbalance_5, bid_size, ask_size
 // Positive imbalance in trade direction = supportive
 
-function scoreBookImbalance(
+export function scoreBookImbalance(
   snap: LobSnapshot,
   direction: 'long' | 'short',
   _family: SetupFamily,
@@ -446,7 +446,7 @@ function scoreAbsorption(
 // Queue deterioration on our side = bad (our support is thinning)
 // Queue deterioration on opposing side = good (their defense is crumbling)
 
-function scoreQueuePressure(
+export function scoreQueuePressure(
   snap: LobSnapshot,
   direction: 'long' | 'short',
   family: SetupFamily,
@@ -566,7 +566,7 @@ function scoreSweepBehavior(
 // Light context only — not a dominating factor.
 // Acceptance above value = bullish context; rejection at boundaries can confirm setups.
 
-function scoreVolumeProfile(
+export function scoreVolumeProfile(
   snap: LobSnapshot,
   direction: 'long' | 'short',
   _family: SetupFamily,
@@ -619,6 +619,46 @@ function scoreVolumeProfile(
     reason = `profile:${finalScore > 0 ? '+' : ''}${finalScore.toFixed(2)}`;
   }
   return { score: finalScore, hasData: true, reason };
+}
+
+// ── G. Microprice Edge Score ─────────────────────────────────────────────────
+//
+// Uses: bid, ask, bid_size, ask_size (stable BBO data)
+// Computes: microprice = (ask * bid_size + bid * ask_size) / (bid_size + ask_size)
+// Edge = (microprice - mid) / tick_size, direction-signed
+// For all families: microprice edge in trade direction = supportive
+
+export function scoreMicropriceEdge(
+  snap: LobSnapshot,
+  direction: 'long' | 'short',
+  cap: number = 0.5,
+): ComponentResult {
+  const bid = snap.bid;
+  const ask = snap.ask;
+  const bidSz = snap.bid_size;
+  const askSz = snap.ask_size;
+
+  if (!available(bid) || !available(ask) || !available(bidSz) || !available(askSz)
+    || bidSz! + askSz! === 0) {
+    return { score: 0, hasData: false, reason: null };
+  }
+
+  const microprice = (ask! * bidSz! + bid! * askSz!) / (bidSz! + askSz!);
+  const mid = (bid! + ask!) / 2;
+  const tickSize = 0.25; // NQ tick size
+  const edgeTicks = (microprice - mid) / tickSize;
+  const sign = direction === 'long' ? 1 : -1;
+
+  // Direction-signed edge: positive = microprice favors our direction
+  const dirEdge = edgeTicks * sign;
+  // Scale: 1 tick edge → ~0.12 score, 4+ ticks → capped
+  const score = clamp(Math.round(dirEdge * 0.12 * 100) / 100, -cap, cap);
+
+  let reason: string | null = null;
+  if (Math.abs(score) >= 0.05) {
+    reason = `microprice:${score > 0 ? '+' : ''}${score.toFixed(2)}(edge=${edgeTicks.toFixed(1)}t)`;
+  }
+  return { score, hasData: true, reason };
 }
 
 // ── Data Quality Assessment ──────────────────────────────────────────────────

@@ -66,6 +66,23 @@ const DEFAULT_CONFIG: IndicatorConfig = {
   max_quote_age_ms_for_management: 3_000,
   quote_poll_timeout_ms: 1_000,
   enable_stale_quote_fallback: false,
+  htf_zones: {
+    enabled: true,
+    study_filter: 'APP HTF Pivot Zones',
+    max_labels: 200,
+    hard_veto_enabled: false,
+    hard_veto_timeframes: ['60', '240'],
+    min_first_obstacle_rr: 0.8,
+    warn_distance_atr: 0.75,
+    hard_veto_inside_major_zone: true,
+    allow_breakout_acceptance_override: true,
+    score_penalty_15m_res: -0.4,
+    score_penalty_1h_res: -0.75,
+    score_penalty_4h_res: -1.0,
+    score_penalty_obstacle_before_t1: -1.25,
+    score_bonus_near_support: 0.25,
+    score_bonus_reclaimed_support: 0.5,
+  },
 };
 
 /**
@@ -354,8 +371,6 @@ export class IndicatorConfigManager {
     this.save();
 
     console.log(`[CONFIG] 🔄 Config updated: ${prevVersion} → ${newVersion}`);
-    console.log(`[CONFIG]   Changed: ${JSON.stringify(exactChanges)}`);
-
     return newVersion;
   }
 }

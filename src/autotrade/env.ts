@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'fs';
-import type { ExecutionMode } from './types.js';
+import type { ExecutionMode, RestartMode } from './types.js';
 import { pickDefaultSymbol } from './contracts.js';
 
 /**
@@ -53,6 +53,9 @@ export interface AutotradeEnv {
   LOG_DIR: string;
   EXECUTION_ADAPTER: string;
   STRATEGY_VERSION: string;
+  RESTART_MODE: RestartMode;
+  RUNTIME_HEARTBEAT_INTERVAL_MS: number;
+  RUNTIME_HEARTBEAT_STALE_MS: number;
 }
 
 export function loadEnv(): AutotradeEnv {
@@ -78,6 +81,11 @@ export function loadEnv(): AutotradeEnv {
   // ── Warn about deprecated env vars that have moved to indicator-config.json ──
   warnDeprecatedTradingEnvVars();
 
+  const restartMode = (process.env['RESTART_MODE'] ?? 'dev') as RestartMode;
+  if (restartMode !== 'dev' && restartMode !== 'prod') {
+    console.warn(`[ENV] Invalid RESTART_MODE="${restartMode}", falling back to "dev".`);
+  }
+
   return {
     MODE: mode,
     LIVE_TRADING_ENABLED: liveEnabled,
@@ -85,6 +93,9 @@ export function loadEnv(): AutotradeEnv {
     LOG_DIR: process.env['LOG_DIR'] ?? './logs',
     EXECUTION_ADAPTER: process.env['EXECUTION_ADAPTER'] ?? 'none',
     STRATEGY_VERSION: 'STRAT_v1.0',
+    RESTART_MODE: (restartMode === 'dev' || restartMode === 'prod') ? restartMode : 'dev',
+    RUNTIME_HEARTBEAT_INTERVAL_MS: parseInt(process.env['RUNTIME_HEARTBEAT_INTERVAL_MS'] ?? '10000', 10),
+    RUNTIME_HEARTBEAT_STALE_MS: parseInt(process.env['RUNTIME_HEARTBEAT_STALE_MS'] ?? '40000', 10),
   };
 }
 
@@ -119,18 +130,6 @@ function warnDeprecatedTradingEnvVars(): void {
   }
 }
 
-function clampFloat(raw: string | undefined, min: number, max: number, def: number): number {
-  const n = parseFloat(raw ?? '');
-  if (isNaN(n)) return def;
-  return Math.max(min, Math.min(max, n));
-}
-
-function clampInt(raw: string | undefined, min: number, max: number, def: number): number {
-  const n = parseInt(raw ?? '', 10);
-  if (isNaN(n)) return def;
-  return Math.max(min, Math.min(max, n));
-}
-
 export function printEnv(env: AutotradeEnv): void {
   console.log('┌─ Environment (operational) ──────────────────────────');
   console.log(`│  MODE:                ${env.MODE.toUpperCase()}`);
@@ -138,5 +137,8 @@ export function printEnv(env: AutotradeEnv): void {
   console.log(`│  SYMBOL:              ${env.SYMBOL}`);
   console.log(`│  LOG_DIR:             ${env.LOG_DIR}`);
   console.log(`│  EXECUTION_ADAPTER:   ${env.EXECUTION_ADAPTER}`);
+  console.log(`│  RESTART_MODE:        ${env.RESTART_MODE}`);
+  console.log(`│  HEARTBEAT_INTERVAL:  ${env.RUNTIME_HEARTBEAT_INTERVAL_MS}ms`);
+  console.log(`│  HEARTBEAT_STALE:     ${env.RUNTIME_HEARTBEAT_STALE_MS}ms`);
   console.log('└──────────────────────────────────────────────────────');
 }

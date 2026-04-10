@@ -5,9 +5,10 @@
  * Feature names must match entry_feature_registry.py exactly.
  */
 
-import type { MarketSnapshot, CandidateSetup, MultiTfBias, MarketRegime } from '../types.js';
+import type { MarketSnapshot, CandidateSetup, MultiTfBias, MarketRegime, HtfSetupEvaluation } from '../types.js';
 import type { LobSnapshot } from '../lob-client.js';
 import type { EntryFeatureVector } from './types.js';
+import { htfTimeframeOrdinal } from '../features/htf-zones.js';
 
 export function buildEntryFeatures(
   setup: CandidateSetup,
@@ -17,6 +18,7 @@ export function buildEntryFeatures(
   confidence: number,
   dualScoreMargin: number,
   lobSnapshot?: LobSnapshot | null,
+  htfEval?: HtfSetupEvaluation | null,
 ): EntryFeatureVector {
   const isShort = setup.direction === 'short';
   const ind = snap.indicators_1m;
@@ -87,6 +89,20 @@ export function buildEntryFeatures(
     lob_cancel_add_ratio_10s: lobFresh ? (lob.cancel_add_ratio_10s ?? null) : null,
     lob_absorption_rate_10s: lobFresh ? (lob.absorption_rate_10s ?? null) : null,
     lob_sweep_count_10s: lobFresh ? (lob.sweep_count_10s ?? null) : null,
+
+    // HTF zone context
+    htf_inside_resistance_zone: snap.htf_context?.inside_resistance_zone != null
+      ? (snap.htf_context.inside_resistance_zone ? 1 : 0) : null,
+    htf_inside_support_zone: snap.htf_context?.inside_support_zone != null
+      ? (snap.htf_context.inside_support_zone ? 1 : 0) : null,
+    htf_distance_to_res_pts: snap.htf_context?.nearest_resistance?.distance_pts ?? null,
+    htf_distance_to_sup_pts: snap.htf_context?.nearest_support?.distance_pts ?? null,
+    htf_distance_to_res_atr: snap.htf_context?.nearest_resistance?.distance_atr ?? null,
+    htf_distance_to_sup_atr: snap.htf_context?.nearest_support?.distance_atr ?? null,
+    htf_first_obstacle_rr: htfEval?.first_obstacle_rr ?? null,
+    htf_nearest_res_tf_ord: htfTimeframeOrdinal(snap.htf_context?.nearest_resistance?.timeframe),
+    htf_nearest_sup_tf_ord: htfTimeframeOrdinal(snap.htf_context?.nearest_support?.timeframe),
+    htf_breakout_accepted: htfEval != null ? (htfEval.breakout_accepted ? 1 : 0) : null,
 
     hour_utc: hourUtc,
     minutes_since_rth_open: minutesSinceOpen,

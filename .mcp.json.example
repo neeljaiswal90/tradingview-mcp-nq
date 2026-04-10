@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tradingview": {
+      "command": "node",
+      "args": ["C:/path/to/tradingview-mcp-nq/dist/server.js"]
+    }
+  }
+}

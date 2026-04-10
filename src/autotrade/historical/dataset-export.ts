@@ -60,6 +60,14 @@ const SIGNAL_COLUMNS = [
   'rr_t1', 'rr_t2', 'risk_pts',
   'target_1_direction_valid', 'target_2_direction_valid', 'target_ordering_valid',
   'alignment_score', 'htf_alignment',
+  // HTF zone features (from ml_features)
+  'htf_study_present', 'htf_inside_resistance', 'htf_inside_support',
+  'htf_nearest_res_tf', 'htf_nearest_sup_tf',
+  'htf_nearest_obstacle_tf', 'htf_nearest_obstacle_kind',
+  'htf_distance_res_pts', 'htf_distance_sup_pts',
+  'htf_distance_res_atr', 'htf_distance_sup_atr',
+  'htf_first_obstacle_rr', 'htf_location_quality',
+  'htf_veto_reason', 'htf_breakout_accepted',
 ];
 
 const TRADE_COLUMNS = [
@@ -87,6 +95,7 @@ export function exportSignalDataset(signalsJsonlPath: string, outCsv: string, fi
   const flat: Array<Record<string, unknown>> = rows.map(r => {
     const cs = (r['candidate_setup'] ?? {}) as Record<string, unknown>;
     const bias = (r['higher_timeframe_bias'] ?? {}) as Record<string, unknown>;
+    const mlf = (r['ml_features'] ?? {}) as Record<string, unknown>;
     return {
       ...r,
       setup_type: cs['setup_type'] ?? null,
@@ -105,6 +114,22 @@ export function exportSignalDataset(signalsJsonlPath: string, outCsv: string, fi
       target_ordering_valid: cs['target_ordering_valid'] ?? null,
       alignment_score: bias['alignment_score'] ?? null,
       htf_alignment: bias['1h'] ?? null,
+      // HTF zone features (from ml_features)
+      htf_study_present: mlf['htf_study_present'] ?? null,
+      htf_inside_resistance: mlf['htf_inside_resistance'] ?? null,
+      htf_inside_support: mlf['htf_inside_support'] ?? null,
+      htf_nearest_res_tf: mlf['htf_nearest_res_tf'] ?? null,
+      htf_nearest_sup_tf: mlf['htf_nearest_sup_tf'] ?? null,
+      htf_nearest_obstacle_tf: mlf['htf_nearest_obstacle_tf'] ?? null,
+      htf_nearest_obstacle_kind: mlf['htf_nearest_obstacle_kind'] ?? null,
+      htf_distance_res_pts: mlf['htf_distance_res_pts'] ?? null,
+      htf_distance_sup_pts: mlf['htf_distance_sup_pts'] ?? null,
+      htf_distance_res_atr: mlf['htf_distance_res_atr'] ?? null,
+      htf_distance_sup_atr: mlf['htf_distance_sup_atr'] ?? null,
+      htf_first_obstacle_rr: mlf['htf_first_obstacle_rr'] ?? null,
+      htf_location_quality: mlf['htf_location_quality'] ?? null,
+      htf_veto_reason: mlf['htf_veto_reason'] ?? null,
+      htf_breakout_accepted: mlf['htf_breakout_accepted'] ?? null,
     };
   });
   writeCsv(outCsv, flat, SIGNAL_COLUMNS);

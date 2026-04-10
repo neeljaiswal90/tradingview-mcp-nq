@@ -72,6 +72,19 @@ public class BboForwarder implements CustomModule,
     private volatile boolean running = false;
     private Thread heartbeatThread;
 
+    // ── Batch queues for depth/MBO events ────────────────────────────────
+    // BBO and trade events stay immediate (latency-sensitive).
+    // Depth and MBO events are batched every 50ms to reduce WebSocket overhead.
+    private static final long BATCH_FLUSH_MS = 50;
+    private static final int BATCH_QUEUE_CAP = 5000;
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> depthQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> mboQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.atomic.AtomicInteger depthQueueSize = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final java.util.concurrent.atomic.AtomicInteger mboQueueSize = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final java.util.concurrent.atomic.AtomicLong depthDroppedCount = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong mboDroppedCount = new java.util.concurrent.atomic.AtomicLong(0);
+    private Thread batchFlushThread;
+
     // ── MBO order state tracking ─────────────────────────────────────────
     // Tracks order_id -> {side, price, size, timestamp} so that cancel/replace
     // events (which lack side info) can be enriched.
@@ -103,6 +116,7 @@ public class BboForwarder implements CustomModule,
         System.out.println("[BBO_FWD] Initializing for " + alias + " (pips=" + pips + ")");
         connectWebSocket();
         startHeartbeat();
+        startBatchFlusher();
     }
 
     @Override
@@ -115,8 +129,11 @@ public class BboForwarder implements CustomModule,
         if (heartbeatThread != null) {
             heartbeatThread.interrupt();
         }
+        if (batchFlushThread != null) {
+            batchFlushThread.interrupt();
+        }
         orderState.clear();
-        System.out.println("[BBO_FWD] Stopped");
+        System.out.println("[BBO_FWD] Stopped (depth_dropped=" + depthDroppedCount.get() + " mbo_dropped=" + mboDroppedCount.get() + ")");
     }
 
     // ── BBO Events ───────────────────────────────────────────────────────
@@ -192,7 +209,7 @@ public class BboForwarder implements CustomModule,
             + ",\"price\":" + displayPrice
             + ",\"size\":" + size
             + ",\"alias\":\"" + alias + "\"}";
-        send(json);
+        enqueueDepth(json);
     }
 
     // ── MBO Events (MarketByOrderDepthDataListener) ─────────────────────
@@ -222,7 +239,7 @@ public class BboForwarder implements CustomModule,
                 + ",\"size\":" + size
                 + ",\"order_id\":\"" + escapeJson(orderId) + "\""
                 + ",\"alias\":\"" + alias + "\"}";
-            sendWs(json);
+            enqueueMbo(json);
         } catch (Exception e) {
             System.err.println("[BBO_FWD] MBO send error: " + e.getMessage());
         }
@@ -252,7 +269,7 @@ public class BboForwarder implements CustomModule,
                 + ",\"size\":" + size
                 + ",\"order_id\":\"" + escapeJson(orderId) + "\""
                 + ",\"alias\":\"" + alias + "\"}";
-            sendWs(json);
+            enqueueMbo(json);
         } catch (Exception e) {
             System.err.println("[BBO_FWD] MBO replace error: " + e.getMessage());
         }
@@ -276,7 +293,7 @@ public class BboForwarder implements CustomModule,
                 + sizeField
                 + ",\"order_id\":\"" + escapeJson(orderId) + "\""
                 + ",\"alias\":\"" + alias + "\"}";
-            sendWs(json);
+            enqueueMbo(json);
         } catch (Exception e) {
             System.err.println("[BBO_FWD] MBO cancel error: " + e.getMessage());
         }
@@ -297,7 +314,7 @@ public class BboForwarder implements CustomModule,
             + ",\"size\":" + size
             + ",\"order_id\":\"" + escapeJson(orderId) + "\""
             + ",\"alias\":\"" + alias + "\"}";
-        sendWs(json);
+        enqueueMbo(json);
     }
 
     // ── WebSocket Client ─────────────────────────────────────────────────
@@ -456,6 +473,85 @@ public class BboForwarder implements CustomModule,
                 // Drop on failure, don't block Bookmap
             }
         }
+    }
+
+    // ── Batch Enqueue + Flusher ────────────────────────────────────────────
+
+    private void enqueueDepth(String json) {
+        if (depthQueueSize.get() >= BATCH_QUEUE_CAP) {
+            depthDroppedCount.incrementAndGet();
+            depthQueue.poll(); // drop oldest
+            depthQueueSize.decrementAndGet();
+        }
+        depthQueue.add(json);
+        depthQueueSize.incrementAndGet();
+    }
+
+    private void enqueueMbo(String json) {
+        if (mboQueueSize.get() >= BATCH_QUEUE_CAP) {
+            // MBO queue full — drop oldest MBO to make room
+            mboQueue.poll();
+            mboQueueSize.decrementAndGet();
+            mboDroppedCount.incrementAndGet();
+            // Also shed depth if backlogged (secondary pressure relief)
+            if (depthQueueSize.get() > BATCH_QUEUE_CAP / 2) {
+                depthQueue.poll();
+                depthQueueSize.decrementAndGet();
+                depthDroppedCount.incrementAndGet();
+            }
+        }
+        mboQueue.add(json);
+        mboQueueSize.incrementAndGet();
+    }
+
+    private void startBatchFlusher() {
+        batchFlushThread = new Thread(() -> {
+            StringBuilder sb = new StringBuilder(8192);
+            while (running) {
+                try {
+                    Thread.sleep(BATCH_FLUSH_MS);
+                    long flushStart = System.currentTimeMillis();
+
+                    // Drain both queues into a single batch envelope
+                    java.util.List<String> events = new java.util.ArrayList<>();
+                    String msg;
+                    while ((msg = depthQueue.poll()) != null) {
+                        events.add(msg);
+                        depthQueueSize.decrementAndGet();
+                    }
+                    while ((msg = mboQueue.poll()) != null) {
+                        events.add(msg);
+                        mboQueueSize.decrementAndGet();
+                    }
+
+                    if (events.isEmpty()) continue;
+
+                    // Build JSON batch envelope: {"type":"batch","events":[...]}
+                    sb.setLength(0);
+                    sb.append("{\"type\":\"batch\",\"events\":[");
+                    for (int i = 0; i < events.size(); i++) {
+                        if (i > 0) sb.append(',');
+                        sb.append(events.get(i));
+                    }
+                    sb.append("]}");
+                    sendWs(sb.toString());
+
+                    long flushMs = System.currentTimeMillis() - flushStart;
+                    if (flushMs > 100) {
+                        System.err.println("[BBO_FWD] Batch flush slow: " + flushMs + "ms (" + events.size() + " events)");
+                    }
+
+                    // Backpressure warning
+                    int totalQueued = depthQueueSize.get() + mboQueueSize.get();
+                    if (totalQueued > (int)(BATCH_QUEUE_CAP * 0.8)) {
+                        System.err.println("[BBO_FWD] BACKPRESSURE: queue at " + totalQueued + "/" + BATCH_QUEUE_CAP
+                            + " depth_dropped=" + depthDroppedCount.get() + " mbo_dropped=" + mboDroppedCount.get());
+                    }
+                } catch (InterruptedException ignored) { break; }
+            }
+        }, "bbo-batch-flush");
+        batchFlushThread.setDaemon(true);
+        batchFlushThread.start();
     }
 
     // ── Heartbeat + Order State Cleanup ──────────────────────────────────

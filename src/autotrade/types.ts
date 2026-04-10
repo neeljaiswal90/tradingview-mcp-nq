@@ -2,6 +2,8 @@
 
 export type ExecutionMode = 'paper' | 'live' | 'signal_only';
 
+export type RestartMode = 'dev' | 'prod';
+
 export type EnginePhase = 'FLAT' | 'ENTERING' | 'MANAGING' | 'EXITING' | 'COOLDOWN';
 
 export type MarketRegime =
@@ -266,6 +268,84 @@ export interface EventState {
   suppression_reason: string;
 }
 
+// ─── HTF Zone Types (Higher-Timeframe Support/Resistance) ──────────────────
+
+export type HtfZoneKind = 'RES' | 'SUP';
+
+export interface HtfZone {
+  /** Collision-safe identifier: `${kind}_${timeframe}_${level}_${source_ts ?? 'na'}` */
+  id: string;
+  kind: HtfZoneKind;
+  timeframe: '15' | '60' | '240' | string;
+  /** Zone midpoint price. */
+  level: number;
+  top: number;
+  bottom: number;
+  /** ATR value from the originating timeframe (null if absent). */
+  atr: number | null;
+  /** Pivot lookback length from Pine (null if absent). */
+  pivot_len: number | null;
+  /** Source timestamp (unix ms) from the Pine study (null if absent). */
+  source_ts: number | null;
+  /** Signed offset: zone.level - price. Positive = zone above, negative = below. */
+  distance_pts: number | null;
+  /** |distance_pts| / atr14 — absolute magnitude. */
+  distance_atr: number | null;
+  /** True when price is between zone.bottom and zone.top. */
+  contains_price: boolean;
+}
+
+/**
+ * Market-neutral HTF context: describes the zone landscape around current price.
+ * No directional RR, veto, or quality — those are candidate-specific (see HtfSetupEvaluation).
+ */
+export interface HtfContext {
+  study_present: boolean;
+  study_name: string | null;
+  fetched_at_iso: string | null;
+  resistance_zones: HtfZone[];
+  support_zones: HtfZone[];
+  nearest_resistance: HtfZone | null;
+  nearest_support: HtfZone | null;
+  inside_resistance_zone: boolean;
+  inside_support_zone: boolean;
+}
+
+/**
+ * Candidate-specific HTF evaluation — computed per setup in strategy layer.
+ * Contains first obstacle RR, location quality, veto reason, breakout acceptance.
+ */
+export interface HtfSetupEvaluation {
+  /** (nearest_obstacle_edge - entry_mid) / risk_pts. null when risk_pts <= 0 or no obstacle. */
+  first_obstacle_rr: number | null;
+  location_quality: 'good' | 'warning' | 'poor' | null;
+  score_adjustment: number;
+  score_factors: string[];
+  vetoed: boolean;
+  veto_reason: string | null;
+  breakout_accepted: boolean;
+  nearest_obstacle: HtfZone | null;
+  nearest_support_zone: HtfZone | null;
+}
+
+export interface HtfZonesConfig {
+  enabled: boolean;
+  study_filter: string;
+  max_labels: number;
+  hard_veto_enabled: boolean;
+  hard_veto_timeframes: string[];
+  min_first_obstacle_rr: number;
+  warn_distance_atr: number;
+  hard_veto_inside_major_zone: boolean;
+  allow_breakout_acceptance_override: boolean;
+  score_penalty_15m_res: number;
+  score_penalty_1h_res: number;
+  score_penalty_4h_res: number;
+  score_penalty_obstacle_before_t1: number;
+  score_bonus_near_support: number;
+  score_bonus_reclaimed_support: number;
+}
+
 export interface MarketSnapshot {
   timestamp_unix: number;
   timestamp_iso: string;
@@ -284,6 +364,8 @@ export interface MarketSnapshot {
   session?: SessionState;
   /** Macro-event state for NQ no-trade windows. */
   event?: EventState;
+  /** Higher-timeframe support/resistance zone context (market-neutral). */
+  htf_context?: HtfContext;
 }
 
 export interface DataQuality {
@@ -587,6 +669,10 @@ export interface DirectionalCandidate {
   passedHardGates: boolean;
   /** Dynamic reward plan built at candidate evaluation time (null when disabled). */
   rewardPlan: import('./features/dynamic-reward-plan.js').DynamicRewardPlan | null;
+  /** Layered score result (populated when layered_scoring shadow_log or enabled is true). */
+  layered?: import('./features/layered-scoring.js').LayeredScoreResult;
+  /** HTF zone evaluation for this candidate (null when study absent or HTF disabled). */
+  htfEval?: HtfSetupEvaluation | null;
 }
 
 /**
@@ -700,6 +786,22 @@ export interface SignalContextSnapshot {
   setup_type: SetupType | null;
   bar_direction_5m_last: 'up' | 'down' | 'doji' | null;
   bar_direction_15m_last: 'up' | 'down' | 'doji' | null;
+  // HTF zone context
+  htf_study_present: boolean | null;
+  htf_inside_resistance: boolean | null;
+  htf_inside_support: boolean | null;
+  htf_nearest_res_tf: string | null;
+  htf_nearest_sup_tf: string | null;
+  htf_nearest_obstacle_tf: string | null;
+  htf_nearest_obstacle_kind: string | null;
+  htf_distance_res_pts: number | null;
+  htf_distance_sup_pts: number | null;
+  htf_distance_res_atr: number | null;
+  htf_distance_sup_atr: number | null;
+  htf_first_obstacle_rr: number | null;
+  htf_location_quality: string | null;
+  htf_veto_reason: string | null;
+  htf_breakout_accepted: boolean | null;
 }
 
 // ─── Position & Trade ────────────────────────────────────────────────────────
@@ -737,7 +839,7 @@ export type ManagementEventType =
   | 'final_runner_exit';
 
 export interface ManagementEvent {
-  _record_type: 'management_event';
+  row_type: 'management_event';
   timestamp: string;
   trade_id: string;
   event_type: ManagementEventType;
@@ -994,6 +1096,9 @@ export interface SessionRecord {
   daily_loss_pct: number;
   daily_loss_limit_pct: number;
   shutdown_reason: string | null;
+  // ── Recovery annotations (populated at startup) ───────────────────────────
+  startup_mode?: 'normal' | 'recovery_cleared' | 'first_run';
+  recovery_action?: string | null;
 }
 
 // ─── Indicator Config ────────────────────────────────────────────────────────
@@ -1157,6 +1262,33 @@ export interface IndicatorConfig {
   dynamic_reward_planning?: import('./features/dynamic-reward-plan.js').DynamicRewardConfig;
   /** Spatial normalization policy: controls scale families for VWAP/room/micro metrics. */
   normalization?: import('./features/normalization.js').NormalizationConfig;
+  /** Layered scoring architecture: separates structure, flow, and lagging into distinct layers. */
+  layered_scoring?: import('./features/layered-scoring.js').LayeredScoringConfig;
+  /** HTF zone awareness: higher-timeframe support/resistance scoring and veto. */
+  htf_zones?: HtfZonesConfig;
+  // ── V2 Multi-Lane Engine ─────────────────────────────────────────────────
+  /** Enable the v2 multi-lane scheduler (default: false — uses legacy hybrid scheduler). */
+  runner_v2_enabled?: boolean;
+  /** When true with runner_v2_enabled, new lanes run observationally without owning exits. */
+  runner_v2_shadow_only?: boolean;
+  /** Per-lane timing overrides for the v2 scheduler. */
+  lane_timing?: {
+    hard_risk_interval_ms?: number;
+    hard_risk_quote_timeout_bbo_ms?: number;
+    hard_risk_quote_timeout_tv_ms?: number;
+    hard_risk_stale_full_risk_ms?: number;
+    hard_risk_stale_stop_only_ms?: number;
+    management_interval_ms?: number;
+    management_stale_threshold_ms?: number;
+    context_refresh_interval_ms?: number;
+    context_refresh_starvation_boost_after?: number;
+    shadow_interval_ms?: number;
+    ml_management_interval_ms?: number;
+    opening_drive_analysis_interval_ms?: number;
+    midday_analysis_interval_ms?: number;
+    /** Max staleness (ms) of full snapshot before shadow signal skips. Default 300000 (5min). */
+    shadow_snap_stale_ms?: number;
+  };
 }
 
 export interface IndicatorChangeRecord {

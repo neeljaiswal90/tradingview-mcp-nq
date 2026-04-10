@@ -19,6 +19,36 @@ import type { OrderResult } from './execution.js';
 import type { ContractSpec } from './contracts.js';
 import { roundToTick, ticksToPrice } from './contracts.js';
 
+// ── Risk-only evaluation types (Phase 1: pure evaluation for hard-risk lane) ──
+
+/** Proposed position mutations from risk-only evaluation (applied under ExecutionLock). */
+export interface RiskMutations {
+  /** Move stop to breakeven (entry price). */
+  moveStopToBE: boolean;
+  /** Activate pre-T1 trailing stop. */
+  activatePreT1Trail: boolean;
+  /** Updated trail anchor price (null if no change). */
+  newTrailAnchor: number | null;
+  /** Tightened stop price from trail ratchet (null if no change). */
+  newStopCurrent: number | null;
+  /** Whether to emit a trail_ratchet management event. */
+  emitTrailRatchetEvent: boolean;
+  /** Previous stop price (for event emission). */
+  previousStopForEvent: number;
+}
+
+/** Result of pure risk-only evaluation — no position mutations applied. */
+export interface RiskEvalResult {
+  /** True if stop was hit (hard stop after any proposed mutations). */
+  shouldExit: boolean;
+  /** Exit decision details (non-null only when shouldExit is true). */
+  exitDecision: ExitDecision | null;
+  /** Proposed mutations for the caller to apply under ExecutionLock. */
+  proposedMutations: RiskMutations;
+  /** Whether any mutation was actually proposed. */
+  hasMutations: boolean;
+}
+
 export interface ExitDecision {
   shouldExit: boolean;
   reason: ExitReason | null;
@@ -90,6 +120,7 @@ export class PositionManager {
   private readonly instrumentSymbol: string;
   private readonly venue: string;
   private onManagementEvent?: (event: ManagementEvent) => void;
+  private onPositionChange?: (position: Position | null) => void;
 
   constructor(contract: ContractSpec, instrumentSymbol: string) {
     this.contract = contract;
@@ -100,6 +131,18 @@ export class PositionManager {
   /** Register a handler for structured management events (PT1, trail ratchets, etc.). */
   setManagementEventHandler(handler: (event: ManagementEvent) => void): void {
     this.onManagementEvent = handler;
+  }
+
+  /** Register a handler for position state changes (for crash recovery persistence). */
+  setPositionChangeHandler(handler: (position: Position | null) => void): void {
+    this.onPositionChange = handler;
+  }
+
+  /** Emit position change if handler is registered (never throws). */
+  private emitPositionChange(): void {
+    try {
+      this.onPositionChange?.(this.position);
+    } catch { /* persistence must never break trading */ }
   }
 
   /** Build a ManagementEvent from current Position state. */
@@ -119,7 +162,7 @@ export class PositionManager {
     const trailDistPts = pos.trailing_active && pos.trail_distance_ticks > 0
       ? ticksToPrice(pos.trail_distance_ticks, this.contract) : null;
     return {
-      _record_type: 'management_event',
+      row_type: 'management_event',
       timestamp: new Date().toISOString(),
       trade_id: pos.trade_id,
       event_type: eventType,
@@ -164,6 +207,7 @@ export class PositionManager {
       throw new Error('PositionManager: a position is already open');
     }
     this.position = pos;
+    this.emitPositionChange();
   }
 
   /**
@@ -493,6 +537,7 @@ export class PositionManager {
       `Remaining: ${pos.quantity_remaining} ct. ` +
       `Trail=${pos.trailing_active ? trailTicks + 'tk' : 'off'}.`,
     );
+    this.emitPositionChange();
   }
 
   /**
@@ -550,6 +595,7 @@ export class PositionManager {
       `Trail=${pos.trailing_active ? pos.trail_distance_ticks + 'tk' : 'off'}. ` +
       `Profile=${mgmt.profile_name}.`,
     );
+    this.emitPositionChange();
   }
 
   /**
@@ -573,6 +619,7 @@ export class PositionManager {
       `Profile=${pos.management_params.profile_name}.`,
     );
     this.emitMgmtEvent(this.buildMgmtEvent(pos, 'pt2_trigger', fillPrice, pos.stop_current, pos.stop_current, qtyBefore, pos.quantity_remaining));
+    this.emitPositionChange();
   }
 
   /**
@@ -753,6 +800,7 @@ export class PositionManager {
     this.emitMgmtEvent(this.buildMgmtEvent(pos, 'final_runner_exit', exitPrice, pos.stop_current, pos.stop_current, pos.quantity_remaining, 0));
 
     this.position = null;
+    this.emitPositionChange();
     return record;
   }
 
@@ -772,6 +820,7 @@ export class PositionManager {
       `[POS] Stop moved (ML): ${prev.toFixed(this.contract.price_decimals)} → ` +
       `${pos.stop_current.toFixed(this.contract.price_decimals)} (${isShort ? 'short' : 'long'})`,
     );
+    this.emitPositionChange();
     return true;
   }
 
@@ -793,6 +842,7 @@ export class PositionManager {
       `[POS] Stop → BE (ML): ${prev.toFixed(this.contract.price_decimals)} → ` +
       `${beStop.toFixed(this.contract.price_decimals)}`,
     );
+    this.emitPositionChange();
     return true;
   }
 
@@ -918,5 +968,214 @@ export class PositionManager {
       mae_at_pt1_trigger: 0,
       peak_r_before_first_partial: 0,
     };
+  }
+
+  // ── Pure risk-only evaluation (hard-risk lane) ────────────────────────────
+  //
+  // evaluateRiskOnly() returns proposed mutations WITHOUT modifying position.
+  // The hard-risk lane applies these under ExecutionLock via applyRiskMutations().
+  // This separation ensures evaluation is lock-free and fast, while all position
+  // mutations are serialized to prevent races between lanes.
+
+  /**
+   * Pure risk-only evaluation for the hard-risk lane.
+   *
+   * Evaluates breakeven trigger, pre-T1 trailing activation, trail ratchet,
+   * and hard stop — but does NOT mutate position state.
+   * Returns proposed mutations and an exit decision.
+   *
+   * Does NOT evaluate: PT1/PT2/T1 targets, time stop, MFE/MAE updates.
+   * Those remain in the full evaluate() method, called by the management lane.
+   */
+  evaluateRiskOnly(currentPrice: number): RiskEvalResult {
+    const noMutations: RiskMutations = {
+      moveStopToBE: false,
+      activatePreT1Trail: false,
+      newTrailAnchor: null,
+      newStopCurrent: null,
+      emitTrailRatchetEvent: false,
+      previousStopForEvent: 0,
+    };
+    const noExit: RiskEvalResult = {
+      shouldExit: false,
+      exitDecision: null,
+      proposedMutations: noMutations,
+      hasMutations: false,
+    };
+
+    const pos = this.position;
+    if (!pos) return noExit;
+
+    const isShort = pos.side === 'short';
+    const mgmt = pos.management_params;
+    const favorableMove = isShort
+      ? pos.entry_price - currentPrice
+      : currentPrice - pos.entry_price;
+
+    const mutations: RiskMutations = { ...noMutations, previousStopForEvent: pos.stop_current };
+    // Effective stop starts at current; mutations may tighten it
+    let effectiveStop = pos.stop_current;
+
+    // ── 1. Breakeven trigger ────────────────────────────────────────────
+    if (!pos.partial_exit_done && !pos.pre_t1_be_triggered && mgmt.breakeven_trigger_r > 0) {
+      const initialRiskPts = Math.abs(pos.entry_price - pos.stop_initial);
+      const currentR = initialRiskPts > 0 ? favorableMove / initialRiskPts : 0;
+      if (currentR >= mgmt.breakeven_trigger_r) {
+        const beStop = roundToTick(pos.entry_price, this.contract);
+        const tightens = isShort ? beStop < effectiveStop : beStop > effectiveStop;
+        if (tightens) {
+          mutations.moveStopToBE = true;
+          effectiveStop = beStop;
+        }
+      }
+    }
+
+    // ── 2. Pre-T1 trailing activation ───────────────────────────────────
+    if (!pos.partial_exit_done && !pos.pre_t1_trailing_active && mgmt.pre_t1_trail_trigger_r > 0) {
+      const initialRiskPts = Math.abs(pos.entry_price - pos.stop_initial);
+      const currentR = initialRiskPts > 0 ? favorableMove / initialRiskPts : 0;
+      if (currentR >= mgmt.pre_t1_trail_trigger_r) {
+        mutations.activatePreT1Trail = true;
+      }
+    }
+
+    // ── 3. Trail ratchet ────────────────────────────────────────────────
+    // Check against actual position state (trailing may already be active) or
+    // the proposed activation above. If pre-T1 trail was JUST proposed, we use
+    // currentPrice as the initial anchor.
+    const trailingWillBeActive = pos.trailing_active || mutations.activatePreT1Trail;
+    const trailTicks = mutations.activatePreT1Trail
+      ? Math.max(0, Math.floor(mgmt.pre_t1_trail_distance_ticks))
+      : pos.trail_distance_ticks;
+
+    if (trailingWillBeActive && trailTicks > 0) {
+      const trailDistPts = ticksToPrice(trailTicks, this.contract);
+
+      // Compute effective anchor: existing or initial from activation
+      let anchor = pos.trail_anchor_price ?? currentPrice;
+      if (mutations.activatePreT1Trail) {
+        anchor = currentPrice; // fresh activation — anchor is current price
+      }
+
+      // Anchor moves in favor only
+      const improved = isShort ? currentPrice < anchor : currentPrice > anchor;
+      if (improved) {
+        mutations.newTrailAnchor = currentPrice;
+        anchor = currentPrice;
+      } else if (mutations.activatePreT1Trail) {
+        mutations.newTrailAnchor = currentPrice; // set initial anchor
+      }
+
+      const rawTrail = isShort ? anchor + trailDistPts : anchor - trailDistPts;
+      const trailStop = roundToTick(rawTrail, this.contract);
+      const tighten = isShort ? trailStop < effectiveStop : trailStop > effectiveStop;
+      if (tighten) {
+        mutations.newStopCurrent = trailStop;
+        mutations.emitTrailRatchetEvent = true;
+        mutations.previousStopForEvent = effectiveStop;
+        effectiveStop = trailStop;
+      }
+    }
+
+    // ── 4. Hard stop check (against effective stop including proposals) ──
+    const stopHit = isShort
+      ? currentPrice >= effectiveStop
+      : currentPrice <= effectiveStop;
+
+    const hasMutations = mutations.moveStopToBE
+      || mutations.activatePreT1Trail
+      || mutations.newTrailAnchor !== null
+      || mutations.newStopCurrent !== null;
+
+    if (stopHit) {
+      return {
+        shouldExit: true,
+        exitDecision: {
+          shouldExit: true,
+          reason: 'stop_loss',
+          exitPrice: currentPrice,
+          plannedExitPrice: effectiveStop,
+          isPartial: false,
+          partialQuantity: 0,
+        },
+        proposedMutations: mutations,
+        hasMutations,
+      };
+    }
+
+    return {
+      shouldExit: false,
+      exitDecision: null,
+      proposedMutations: mutations,
+      hasMutations,
+    };
+  }
+
+  /**
+   * Apply risk mutations proposed by evaluateRiskOnly().
+   * MUST be called under ExecutionLock.
+   *
+   * Applies: breakeven move, pre-T1 trail activation, trail ratchet stop tightening.
+   * Emits management events for observability.
+   */
+  applyRiskMutations(mutations: RiskMutations, currentPrice: number): void {
+    const pos = this.position;
+    if (!pos) return;
+
+    const isShort = pos.side === 'short';
+    const mgmt = pos.management_params;
+
+    // ── Breakeven trigger ──
+    if (mutations.moveStopToBE) {
+      const beStop = roundToTick(pos.entry_price, this.contract);
+      const prev = pos.stop_current;
+      pos.stop_current = beStop;
+      pos.pre_t1_be_triggered = true;
+      pos.stop_moved_to_be = true;
+      console.log(
+        `[PRE-T1 BE] ${pos.side.toUpperCase()} stop ${prev.toFixed(this.contract.price_decimals)} → ` +
+        `BE ${beStop.toFixed(this.contract.price_decimals)} (profile=${mgmt.profile_name})`,
+      );
+      this.emitMgmtEvent(this.buildMgmtEvent(pos, 'pre_t1_be_move', currentPrice, prev, beStop, pos.quantity_remaining, pos.quantity_remaining));
+    }
+
+    // ── Pre-T1 trailing activation ──
+    if (mutations.activatePreT1Trail) {
+      pos.pre_t1_trailing_active = true;
+      pos.trailing_active = true;
+      pos.trail_distance_ticks = Math.max(0, Math.floor(mgmt.pre_t1_trail_distance_ticks));
+      pos.trail_anchor_price = mutations.newTrailAnchor ?? currentPrice;
+      console.log(
+        `[PRE-T1 TRAIL] ${pos.side.toUpperCase()} trailing armed ` +
+        `(trail=${pos.trail_distance_ticks}tk, anchor=${pos.trail_anchor_price.toFixed(this.contract.price_decimals)}, profile=${mgmt.profile_name})`,
+      );
+      this.emitMgmtEvent(this.buildMgmtEvent(pos, 'pre_t1_trail_activation', currentPrice, pos.stop_current, pos.stop_current, pos.quantity_remaining, pos.quantity_remaining));
+    }
+
+    // ── Trail anchor update (without stop change) ──
+    if (!mutations.activatePreT1Trail && mutations.newTrailAnchor !== null) {
+      pos.trail_anchor_price = mutations.newTrailAnchor;
+    }
+
+    // ── Trail ratchet stop tightening ──
+    if (mutations.newStopCurrent !== null) {
+      const prev = pos.stop_current;
+      pos.stop_current = mutations.newStopCurrent;
+      console.log(
+        `[TRAIL] ${pos.side.toUpperCase()} stop ${prev.toFixed(this.contract.price_decimals)} → ` +
+        `${mutations.newStopCurrent.toFixed(this.contract.price_decimals)} (anchor=${pos.trail_anchor_price?.toFixed(this.contract.price_decimals) ?? '?'}, ` +
+        `trail=${pos.trail_distance_ticks}tk)`,
+      );
+      if (mutations.emitTrailRatchetEvent) {
+        this.emitMgmtEvent(this.buildMgmtEvent(pos, 'trail_ratchet', currentPrice, mutations.previousStopForEvent, mutations.newStopCurrent, pos.quantity_remaining, pos.quantity_remaining));
+      }
+    }
+
+    // Emit position change if any mutation was applied
+    const hasMutations = mutations.moveStopToBE || mutations.activatePreT1Trail
+      || mutations.newTrailAnchor !== null || mutations.newStopCurrent !== null;
+    if (hasMutations) {
+      this.emitPositionChange();
+    }
   }
 }

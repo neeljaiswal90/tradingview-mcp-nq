@@ -41,6 +41,8 @@ export class DashboardServer {
   private server: ReturnType<typeof createServer> | null = null;
   private throttleTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingUpdate = false;
+  /** Timer for periodic full-snapshot reconciliation (15s). */
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
@@ -105,12 +107,17 @@ export class DashboardServer {
 
       this.server!.listen(port, '0.0.0.0', () => {
         console.log(`[DASHBOARD] 🖥️  Dashboard server running at http://localhost:${port}`);
+        this.startReconcileTimer();
         resolve();
       });
     });
   }
 
   stop(): void {
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
+    }
     for (const client of this.sseClients) {
       client.end();
     }
@@ -128,9 +135,11 @@ export class DashboardServer {
       'X-Accel-Buffering': 'no',
     });
 
-    // Send initial snapshot
+    // Transport contract: ALWAYS send full snapshot immediately on new SSE connection.
+    // This is the reconnect/bootstrap protocol — no Last-Event-ID replay.
     const snap = this.options.stateManager.getSnapshot();
-    res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
+    const seq = this.options.stateManager.getPublishSeq();
+    res.write(`id: ${seq}\nevent: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
 
     this.sseClients.add(res);
     console.log(`[DASHBOARD] SSE client connected (total: ${this.sseClients.size})`);
@@ -147,8 +156,10 @@ export class DashboardServer {
     });
   }
 
-  private broadcastEvent(event: string, data: string): void {
-    const message = `event: ${event}\ndata: ${data}\n\n`;
+  private broadcastEvent(event: string, data: string, id?: number): void {
+    let message = '';
+    if (id !== undefined) message += `id: ${id}\n`;
+    message += `event: ${event}\ndata: ${data}\n\n`;
     for (const client of this.sseClients) {
       client.write(message);
     }
@@ -176,16 +187,34 @@ export class DashboardServer {
 
   private doBroadcast(): void {
     if (this.sseClients.size === 0) return;
-    const snap = this.options.stateManager.getSnapshot();
     this.broadcastCount++;
-    this.broadcastEvent('snapshot', JSON.stringify(snap));
-    // Log every 10th broadcast to avoid spam
-    if (this.broadcastCount % 10 === 1) {
+
+    // Drain typed delta events from state manager into a single batch message
+    const published = this.options.stateManager.publishEvents();
+    if (published) {
+      const { batch, publishSeq } = published;
+      // One SSE message per publish cycle — one unique id
+      this.broadcastEvent('delta', JSON.stringify(batch), publishSeq);
+    }
+
+    // Log every 30th broadcast to avoid spam
+    if (this.broadcastCount % 30 === 1) {
+      const seq = this.options.stateManager.getPublishSeq();
       console.log(
         `[DASHBOARD] SSE broadcast #${this.broadcastCount} → ${this.sseClients.size} client(s)` +
-        ` | cycle=${snap.app.cycle_count} | conf=${snap.directional.confidence ?? 'n/a'}`,
+        ` | publish_seq=${seq}`,
       );
     }
+  }
+
+  /** Start periodic full-snapshot reconciliation (time-based, not broadcast-count). */
+  private startReconcileTimer(): void {
+    this.reconcileTimer = setInterval(() => {
+      if (this.sseClients.size === 0) return;
+      const snap = this.options.stateManager.getSnapshot();
+      const seq = this.options.stateManager.getPublishSeq();
+      this.broadcastEvent('snapshot', JSON.stringify(snap), seq);
+    }, 15_000);
   }
 
   // ─── JSON response ───────────────────────────────────────────────────────

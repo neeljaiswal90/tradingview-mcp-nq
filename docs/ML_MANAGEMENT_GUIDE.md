@@ -28,6 +28,12 @@
 
 **Priority chain:** Hard stops > Rules engine > ML advisory. ML can never override hard stops or widen risk.
 
+Directory roles:
+
+- `python-ml-service/` is service source code.
+- `data/` and `models/` are local-only working assets.
+- `reports/` is generated output and should not be treated as durable source.
+
 ---
 
 ## Quick Start

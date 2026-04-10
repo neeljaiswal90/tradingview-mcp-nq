@@ -1,93 +1,85 @@
-# TradingView MCP Server
+# TradingView MCP + NQ Trading Stack
 
-AI-assisted TradingView chart analysis and Pine Script development via Chrome DevTools Protocol.
+This repository combines three things in one workspace:
 
-> **Disclaimer:** Unofficial tool. Not affiliated with TradingView Inc. or Anthropic, PBC. Ensure your usage complies with TradingView's [Terms of Use](https://www.tradingview.com/policies/).
-
-## Features
-
-- **78 MCP tools** for reading and controlling a live TradingView Desktop chart
-- **Full CLI** with 30 commands and 66 subcommands
-- **Pine Script development**: read/write source, compile, analyze, error checking
-- **Chart control**: symbol, timeframe, chart type, indicators, drawings
-- **Data access**: OHLCV bars, quotes, indicator values, strategy results
-- **Pine graphics**: read line.new, label.new, table.new, box.new outputs
-- **Replay mode**: start, step, autoplay, paper trading
-- **UI automation**: click, hover, scroll, keyboard, panel management
-- **Multi-chart**: pane layouts, tab management, batch operations
-- **Screenshots**: full page, chart region, strategy tester
-- **Streaming**: real-time JSONL output for quotes, bars, indicators
+- a TradingView MCP server and CLI
+- an autonomous NQ/MNQ trading engine with an operator dashboard
+- local Python sidecars for market data and ML-assisted management
 
 ## Quick Start
 
-```bash
-# 1. Launch TradingView Desktop with CDP
-#    Windows: scripts\launch_tv_debug.bat
-#    macOS:   bash scripts/launch_tv_debug_mac.sh
-#    Linux:   bash scripts/launch_tv_debug_linux.sh
-
-# 2. Build
-npm install
+```powershell
+npm run bootstrap
 npm run build
+npm run dashboard:build
+npm run start:full
+```
 
-# 3. Use as MCP server (add to your client config)
+Use `npm run stop:full` to stop the local stack. If TradingView is not already running with CDP enabled on port `9222`, use the optional helper launchers below first.
+
+The canonical launch scripts are:
+
+- `scripts/launch-app.ps1`
+- `scripts/start-full-stack.ps1`
+- `scripts/stop-full-stack.ps1`
+
+`npm run start:full` is the default, single obvious way to run the app. Use `scripts/launch-app.ps1` only when you explicitly want the lightweight engine-plus-dashboard flow without auto-starting the Python sidecars.
+
+## Optional Utilities
+
+TradingView helpers:
+
+- Windows desktop install: `scripts\launch_tv_debug.bat`
+- Windows Store / MSIX install: `powershell -ExecutionPolicy Bypass -File scripts\launch_tv_store.ps1 -Port 9222`
+- macOS: `bash scripts/launch_tv_debug_mac.sh`
+- Linux: `bash scripts/launch_tv_debug_linux.sh`
+
+Other utilities:
+
+- Lightweight app launch: `powershell -NoLogo -ExecutionPolicy Bypass -File scripts\launch-app.ps1`
+- Recreate desktop shortcuts: `npm run shortcuts`
+- Create a clean shareable ZIP: `npm run zip:shareable`
+
+The shareable ZIP excludes `.env`, `.mcp.json`, `node_modules/`, `dashboard/node_modules/`, local `data/`, local `models/`, runtime/build clutter, generated `reports/`, and `.git` by default.
+
+## MCP and CLI
+
+Build the TypeScript server first:
+
+```powershell
+npm run build
 node dist/server.js
+```
 
-# 4. Or use the CLI
+CLI examples:
+
+```powershell
 npx tv status
 npx tv symbol AAPL
 npx tv pine get
 ```
 
-See [SETUP_GUIDE.md](SETUP_GUIDE.md) for detailed instructions.
+Start from `.mcp.json.example` when wiring the MCP server into Claude Desktop, Cursor, or another MCP client.
 
-## Architecture
+## Repo Guides
 
-```
-src/
-├── config.ts                  # Environment-based configuration
-├── logger.ts                  # Stderr structured logger
-├── result.ts                  # Result<T> discriminated union
-├── server.ts                  # MCP server entry point
-├── core/
-│   ├── cdp/
-│   │   ├── connection.ts      # CDP connect with retry
-│   │   ├── evaluate.ts        # evaluate(), safeString(), requireFinite()
-│   │   └── targets.ts         # Target discovery via /json/list
-│   ├── session/
-│   │   └── manager.ts         # Singleton session with liveness probe
-│   └── tradingview/
-│       ├── index.ts           # Barrel export
-│       ├── known-paths.ts     # TradingView internal API paths
-│       ├── wait.ts            # Chart ready detection
-│       ├── health.ts          # Health check, discovery, launch
-│       ├── chart.ts           # Symbol, timeframe, indicators, ranges
-│       ├── data.ts            # OHLCV, quotes, study values, Pine graphics
-│       ├── pine.ts            # Pine Script editor and compilation
-│       ├── capture.ts         # Screenshots
-│       ├── drawing.ts         # Shape drawing
-│       ├── alerts.ts          # Alert management
-│       ├── replay.ts          # Bar replay mode
-│       ├── indicators.ts      # Indicator settings
-│       ├── watchlist.ts       # Watchlist management
-│       ├── pane.ts            # Multi-chart pane layouts
-│       ├── tab.ts             # Tab management
-│       ├── ui.ts              # UI automation + layout management
-│       ├── batch.ts           # Batch operations
-│       └── stream.ts          # Real-time streaming
-├── tools/                     # MCP tool registrations (14 modules)
-└── cli/                       # CLI with router + 15 command modules
+- `docs/SETUP_GUIDE.md` - setup, launch, MCP configuration, and verification
+- `docs/PROJECT_STRUCTURE.md` - canonical folder layout and commit rules
+- `docs/ML_MANAGEMENT_GUIDE.md` - ML sidecar and dataset/model workflow
+- `docs/audits/` - archived audits, implementation reviews, and cleanup reports
+
+## Cleanup and Maintenance
+
+```powershell
+npm run clean:runtime
+npm run clean:deep
+npm run shortcuts
+npm run zip:shareable
 ```
 
-## Testing
+- `clean:runtime` removes generated runtime clutter such as logs, screenshots, caches, report artifacts, and build output
+- `clean:deep` also removes `node_modules` and `dashboard/node_modules`
+- `shortcuts` recreates desktop shortcuts for the canonical PowerShell launchers
+- `zip:shareable` creates a clean ZIP snapshot without secrets, dependency folders, or generated clutter
 
-```bash
-npm test                  # All tests
-npm run test:unit         # Unit tests only
-npm run test:smoke        # Smoke tests only
-npm run test:integration  # Integration tests (requires TradingView)
-```
-
-## License
-
-See the reference project for license terms.
+Runtime output belongs in `logs/` and generated analysis output belongs in `reports/`. Neither should be treated as source.
