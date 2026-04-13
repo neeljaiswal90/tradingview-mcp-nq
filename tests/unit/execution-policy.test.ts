@@ -69,11 +69,13 @@ function makeLob(overrides: Partial<LobSnapshot> = {}): LobSnapshot {
 }
 
 describe('ExecutionPolicyEngine', () => {
-  it('passes through when policy is disabled', () => {
+  it('passes through when policy is disabled with not_enforced verdict', () => {
     const engine = new ExecutionPolicyEngine({ ...ENABLED, enabled: false });
     const result = engine.evaluate('EXIT_ALL', makePos(), makeLob(), 100);
     expect(result.should_execute).toBe(true);
-    expect(result.checks[0]?.name).toBe('policy_disabled');
+    expect(result.checks[0]?.name).toBe('policy_not_enforced');
+    expect(result.policy_verdict).toBe('not_enforced');
+    expect(result.intent.reasons).toContain('policy_not_enforced');
   });
 
   it('blocks passive actions (HOLD, NO_ACTION)', () => {
@@ -199,5 +201,37 @@ describe('ExecutionPolicyEngine', () => {
     const result = engine.evaluate('EXIT_ALL', makePos(), makeLob(), 100);
     expect(result.intent.microstructure.spread_ticks).toBe(1);
     expect(result.intent.microstructure.quote_age_ms).toBe(100);
+  });
+
+  // ── policy_verdict semantic tests (P2 regression) ──────────────────────
+
+  it('approved ML EXIT_ALL has policy_verdict=approved', () => {
+    const engine = new ExecutionPolicyEngine(ENABLED);
+    const result = engine.evaluate('EXIT_ALL', makePos(), makeLob(), 100);
+    expect(result.should_execute).toBe(true);
+    expect(result.policy_verdict).toBe('approved');
+  });
+
+  it('rejected action has policy_verdict=rejected', () => {
+    const engine = new ExecutionPolicyEngine({ ...ENABLED, action_cooldown_sec: 30 });
+    engine.recordExecution('MOVE_STOP');
+    const result = engine.evaluate('MOVE_TO_BREAKEVEN', makePos(), makeLob(), 100);
+    expect(result.should_execute).toBe(false);
+    expect(result.policy_verdict).toBe('rejected');
+  });
+
+  it('disabled policy never has policy_verdict=approved or rejected', () => {
+    const engine = new ExecutionPolicyEngine({ ...ENABLED, enabled: false });
+    const result = engine.evaluate('EXIT_ALL', makePos(), makeLob(), 100);
+    expect(result.policy_verdict).toBe('not_enforced');
+    expect(result.policy_verdict).not.toBe('approved');
+    expect(result.policy_verdict).not.toBe('rejected');
+  });
+
+  it('passive actions have policy_verdict=rejected when policy enabled', () => {
+    const engine = new ExecutionPolicyEngine(ENABLED);
+    const result = engine.evaluate('HOLD', makePos(), makeLob(), 100);
+    expect(result.should_execute).toBe(false);
+    expect(result.policy_verdict).toBe('rejected');
   });
 });

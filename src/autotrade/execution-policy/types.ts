@@ -88,6 +88,9 @@ export interface PolicyCheck {
   reason: string;
 }
 
+/** Semantic verdict distinguishing disabled policy from active approval/rejection. */
+export type PolicyVerdict = 'not_enforced' | 'approved' | 'rejected';
+
 export interface ExecutionPolicyResult {
   /** The final execution intent. */
   intent: ExecutionIntent;
@@ -97,4 +100,6 @@ export interface ExecutionPolicyResult {
   should_execute: boolean;
   /** If blocked, why. */
   block_reason: string | null;
+  /** Semantic verdict: was the policy active and what was the outcome? */
+  policy_verdict: PolicyVerdict;
 }

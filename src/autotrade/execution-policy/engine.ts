@@ -68,6 +68,7 @@ export class ExecutionPolicyEngine {
         checks: [{ name: 'passive', passed: false, reason: `${action} is passive` }],
         should_execute: false,
         block_reason: `${action} is passive`,
+        policy_verdict: 'rejected',
       };
     }
 
@@ -203,6 +204,7 @@ export class ExecutionPolicyEngine {
       checks,
       should_execute: allPassed && timing === 'now',
       block_reason: allPassed ? null : (firstFailure?.reason ?? 'unknown'),
+      policy_verdict: allPassed ? 'approved' : 'rejected',
     };
   }
 
@@ -310,10 +312,11 @@ export class ExecutionPolicyEngine {
   ): ExecutionPolicyResult {
     const isPassive = (PASSIVE_ACTIONS as readonly string[]).includes(action);
     return {
-      intent: this.buildIntent(action, action, 'normal', isPassive ? 'cancel' : 'now', qty ?? null, stop ?? null, ['policy_disabled'], lob, quoteAgeMs),
-      checks: [{ name: 'policy_disabled', passed: true, reason: 'execution policy disabled — pass-through' }],
+      intent: this.buildIntent(action, action, 'normal', isPassive ? 'cancel' : 'now', qty ?? null, stop ?? null, ['policy_not_enforced'], lob, quoteAgeMs),
+      checks: [{ name: 'policy_not_enforced', passed: true, reason: 'execution policy not enabled — no checks applied' }],
       should_execute: !isPassive,
       block_reason: null,
+      policy_verdict: 'not_enforced',
     };
   }
 }

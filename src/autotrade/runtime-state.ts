@@ -27,7 +27,7 @@ import type { RestartMode } from './types.js';
 
 // ── Schema versions (bump when file shape changes) ─────────────────────────
 
-const RUNTIME_STATE_SCHEMA_VERSION = 1;
+const RUNTIME_STATE_SCHEMA_VERSION = 2;
 const OPEN_TRADE_STATE_SCHEMA_VERSION = 1;
 const LOCK_SCHEMA_VERSION = 1;
 
@@ -46,6 +46,31 @@ export interface RuntimeState {
   open_trade_id: string | null;
   mode: ExecutionMode;
   restart_mode: RestartMode;
+  // ── Cycle activity fields (v2) ──────────────────────────────────────────
+  last_cycle_started_at: string | null;
+  last_cycle_completed_at: string | null;
+  /** Market snapshot timestamp — NOT wall clock. Answers "when was the latest market data produced." */
+  last_snapshot_ts: string | null;
+  last_signal_decision_at: string | null;
+  /** One-way latch: transitions false → true when data quality meets readiness threshold. */
+  warmup_complete: boolean;
+}
+
+/**
+ * Canonical warmup readiness predicate. A runner is considered warmed up when
+ * it has enough bars for the slowest indicator (EMA-200) and critical indicators
+ * are available. This is a one-way latch — once true, it never reverts.
+ */
+export interface DataQualityForWarmup {
+  bars_1m_count: number;
+  atr_available: boolean;
+  vwap_available: boolean;
+}
+
+export function isWarmupComplete(quality: DataQualityForWarmup): boolean {
+  return quality.bars_1m_count >= 200  // enough for EMA-200
+    && quality.atr_available
+    && quality.vwap_available;
 }
 
 export interface OpenTradeStateFile {
@@ -274,7 +299,31 @@ export class RuntimeStateManager {
   // ── Runtime state ────────────────────────────────────────────────────
 
   readPrevious(): RuntimeState | null {
-    return safeReadJson<RuntimeState>(this.runtimeStatePath, RUNTIME_STATE_SCHEMA_VERSION);
+    // Accept both v1 (pre-cycle-activity) and v2 (current) schema versions.
+    // v1 files are missing cycle activity fields — backfill with defaults.
+    if (!existsSync(this.runtimeStatePath)) return null;
+    try {
+      const raw = readFileSync(this.runtimeStatePath, 'utf8').trim();
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      const sv = parsed.schema_version;
+      if (sv !== 1 && sv !== RUNTIME_STATE_SCHEMA_VERSION) {
+        console.warn(`[RUNTIME-STATE] Schema mismatch in runtime_state.json: expected v1 or v${RUNTIME_STATE_SCHEMA_VERSION}, got v${sv}. Treating as unreadable.`);
+        return null;
+      }
+      // Backfill v2 fields if reading a v1 file
+      if (sv === 1) {
+        parsed.last_cycle_started_at = parsed.last_cycle_started_at ?? null;
+        parsed.last_cycle_completed_at = parsed.last_cycle_completed_at ?? null;
+        parsed.last_snapshot_ts = parsed.last_snapshot_ts ?? null;
+        parsed.last_signal_decision_at = parsed.last_signal_decision_at ?? null;
+        parsed.warmup_complete = parsed.warmup_complete ?? false;
+      }
+      return parsed as RuntimeState;
+    } catch (err) {
+      console.warn(`[RUNTIME-STATE] Failed to read runtime_state.json: ${err instanceof Error ? err.message : err}. Treating as unreadable.`);
+      return null;
+    }
   }
 
   initialize(sessionId: string, mode: ExecutionMode, restartMode: RestartMode): void {
@@ -292,6 +341,11 @@ export class RuntimeStateManager {
       open_trade_id: null,
       mode,
       restart_mode: restartMode,
+      last_cycle_started_at: null,
+      last_cycle_completed_at: null,
+      last_snapshot_ts: null,
+      last_signal_decision_at: null,
+      warmup_complete: false,
     };
     atomicWriteJson(this.runtimeStatePath, this.state);
   }
@@ -353,6 +407,41 @@ export class RuntimeStateManager {
 
   readOpenTradeState(): OpenTradeStateFile | null {
     return safeReadJson<OpenTradeStateFile>(this.openTradeStatePath, OPEN_TRADE_STATE_SCHEMA_VERSION);
+  }
+
+  // ── Cycle activity tracking ─────────────────────────────────────────
+  // These methods only mutate the in-memory state object. The existing 10s
+  // heartbeat timer writes the full state to disk — no extra disk I/O needed.
+
+  updateCycleStart(): void {
+    if (!this.state) return;
+    this.state.last_cycle_started_at = new Date().toISOString();
+  }
+
+  updateCycleComplete(): void {
+    if (!this.state) return;
+    this.state.last_cycle_completed_at = new Date().toISOString();
+  }
+
+  /** Set to the market snapshot timestamp (snap.timestamp_iso), NOT wall clock. */
+  updateSnapshotTs(ts: string): void {
+    if (!this.state) return;
+    this.state.last_snapshot_ts = ts;
+  }
+
+  updateSignalDecision(): void {
+    if (!this.state) return;
+    this.state.last_signal_decision_at = new Date().toISOString();
+  }
+
+  /** One-way latch: once warmup is complete, it never reverts. */
+  markWarmupComplete(): void {
+    if (!this.state) return;
+    this.state.warmup_complete = true;
+  }
+
+  isWarmupComplete(): boolean {
+    return this.state?.warmup_complete ?? false;
   }
 
   // ── Clean shutdown ──────────────────────────────────────────────────

@@ -27,6 +27,11 @@ export class PerformanceTracker {
     const saved = logWriter.readPerformance();
     this.stats = this.normalizeStats(saved);
 
+    // Stamp the current session id immediately — do not carry over the
+    // previous run's session_id, which would make performance.json stale
+    // until the first trade.
+    this.stats.session_id = sessionId;
+
     // If we backfilled missing fields from an existing file, persist the fix
     // so the warning does not recur on next startup.
     if (saved && this.statsWereNormalized) {
@@ -59,6 +64,10 @@ export class PerformanceTracker {
       );
       this.stats.total_pnl_usd = runningPnl;
     }
+
+    // Always write performance.json at startup so the file immediately
+    // reflects the current session_id and hydrated cumulative stats.
+    logWriter.writePerformance(this.stats);
   }
 
   recordTrade(trade: TradeRecord): void {
@@ -145,6 +154,22 @@ export class PerformanceTracker {
 
   getStats(): Readonly<PerformanceStats> {
     return { ...this.stats };
+  }
+
+  /**
+   * Periodic live session checkpoint — writes current session totals to
+   * sessions.jsonl and performance.json so live monitoring can see progress
+   * before shutdown. Note: updateSessionEnd() is reused here as a live
+   * checkpoint writer, not only a shutdown/finalization writer.
+   */
+  checkpointSession(): void {
+    this.logWriter.updateSessionEnd(this.sessionId, {
+      signal_count: this.stats.total_signals,
+      trade_count: this.stats.total_trades,
+      pnl_realized: this.stats.total_pnl_usd,
+      updated_at: new Date().toISOString(),
+    } as any);
+    this.logWriter.writePerformance(this.stats);
   }
 
   printSelfReview(): void {

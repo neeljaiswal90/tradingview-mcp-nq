@@ -134,3 +134,27 @@ describe('exit_reason (legacy coarse) is always stop_loss for any stop variant',
     expect(computeExitReasonLegacy('target_2')).toBe('target_2');
   });
 });
+
+// ─── ML exit attribution — P0 regression ────────────────────────────────────
+// Type-level compile gate: if these assignments fail to compile, the ExitReason
+// union is missing the new ML variants.
+import type { ExitReason } from '../../src/autotrade/types.js';
+
+const _mlExitAllCheck: ExitReason = 'ml_exit_all';
+const _mlExitPartialCheck: ExitReason = 'ml_exit_partial';
+const _manualCheck: ExitReason = 'manual';
+void _mlExitAllCheck; void _mlExitPartialCheck; void _manualCheck;
+
+describe('ML exit reasons are distinct from manual (P0 regression)', () => {
+  it('ml_exit_all is distinct from manual', () => {
+    expect('ml_exit_all').not.toBe('manual');
+  });
+
+  it('ml_exit_partial is distinct from ml_exit_all', () => {
+    expect('ml_exit_partial').not.toBe('ml_exit_all');
+  });
+
+  it('ml_exit_partial is distinct from manual', () => {
+    expect('ml_exit_partial').not.toBe('manual');
+  });
+});

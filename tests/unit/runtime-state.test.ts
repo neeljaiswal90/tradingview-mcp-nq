@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { RuntimeStateManager } from '../../src/autotrade/runtime-state.js';
+import { RuntimeStateManager, isWarmupComplete } from '../../src/autotrade/runtime-state.js';
 
 const TEST_DIR = join(process.cwd(), 'tests', '_tmp_runtime_state');
 
@@ -100,7 +100,13 @@ describe('RuntimeStateManager', () => {
       expect(state!.shutdown_clean).toBe(false);
       expect(state!.mode).toBe('paper');
       expect(state!.restart_mode).toBe('dev');
-      expect(state!.schema_version).toBe(1);
+      expect(state!.schema_version).toBe(2);
+      // v2 cycle activity fields initialize to null/false
+      expect(state!.last_cycle_started_at).toBeNull();
+      expect(state!.last_cycle_completed_at).toBeNull();
+      expect(state!.last_snapshot_ts).toBeNull();
+      expect(state!.last_signal_decision_at).toBeNull();
+      expect(state!.warmup_complete).toBe(false);
     });
 
     it('markCleanShutdown sets shutdown_clean=true', () => {
@@ -126,6 +132,114 @@ describe('RuntimeStateManager', () => {
       const state = mgr.readPrevious();
       expect(state!.open_position_known).toBe(false);
       expect(state!.open_trade_id).toBeNull();
+    });
+  });
+
+  // ── Cycle activity tracking (v2) ────────────────────────────────────
+
+  describe('cycle activity tracking', () => {
+    it('updateCycleStart sets last_cycle_started_at', async () => {
+      mgr.initialize('session_1', 'paper', 'dev');
+      mgr.updateCycleStart();
+      // Wait for heartbeat to flush in-memory state to disk (100ms interval in tests)
+      mgr.startHeartbeat();
+      await new Promise(r => setTimeout(r, 200));
+      mgr.stopHeartbeat();
+      const state = mgr.readPrevious();
+      expect(state!.last_cycle_started_at).not.toBeNull();
+      expect(new Date(state!.last_cycle_started_at!).getTime()).toBeGreaterThan(0);
+    });
+
+    it('updateCycleComplete sets last_cycle_completed_at', async () => {
+      mgr.initialize('session_1', 'paper', 'dev');
+      mgr.updateCycleComplete();
+      mgr.startHeartbeat();
+      await new Promise(r => setTimeout(r, 200));
+      mgr.stopHeartbeat();
+      const state = mgr.readPrevious();
+      expect(state!.last_cycle_completed_at).not.toBeNull();
+    });
+
+    it('updateSnapshotTs sets market snapshot timestamp', async () => {
+      mgr.initialize('session_1', 'paper', 'dev');
+      const marketTime = '2026-04-12T15:30:00.000Z';
+      mgr.updateSnapshotTs(marketTime);
+      mgr.startHeartbeat();
+      await new Promise(r => setTimeout(r, 200));
+      mgr.stopHeartbeat();
+      const state = mgr.readPrevious();
+      expect(state!.last_snapshot_ts).toBe(marketTime);
+    });
+
+    it('updateSignalDecision sets last_signal_decision_at', async () => {
+      mgr.initialize('session_1', 'paper', 'dev');
+      mgr.updateSignalDecision();
+      mgr.startHeartbeat();
+      await new Promise(r => setTimeout(r, 200));
+      mgr.stopHeartbeat();
+      const state = mgr.readPrevious();
+      expect(state!.last_signal_decision_at).not.toBeNull();
+    });
+
+    it('markWarmupComplete is a one-way latch', () => {
+      mgr.initialize('session_1', 'paper', 'dev');
+      expect(mgr.isWarmupComplete()).toBe(false);
+      mgr.markWarmupComplete();
+      expect(mgr.isWarmupComplete()).toBe(true);
+      // Calling again is idempotent
+      mgr.markWarmupComplete();
+      expect(mgr.isWarmupComplete()).toBe(true);
+    });
+
+    it('readPrevious backfills v1 files with v2 defaults', () => {
+      // Write a v1 schema file (no cycle activity fields)
+      writeFileSync(join(TEST_DIR, 'runtime_state.json'), JSON.stringify({
+        schema_version: 1,
+        app_version: 'test',
+        written_at: new Date().toISOString(),
+        session_id: 'old_session',
+        started_at: new Date().toISOString(),
+        last_heartbeat_at: new Date().toISOString(),
+        shutdown_clean: true,
+        shutdown_reason: 'test',
+        open_position_known: false,
+        open_trade_id: null,
+        mode: 'paper',
+        restart_mode: 'dev',
+      }));
+      const state = mgr.readPrevious();
+      expect(state).not.toBeNull();
+      expect(state!.session_id).toBe('old_session');
+      // v2 fields backfilled with defaults
+      expect(state!.last_cycle_started_at).toBeNull();
+      expect(state!.last_cycle_completed_at).toBeNull();
+      expect(state!.last_snapshot_ts).toBeNull();
+      expect(state!.last_signal_decision_at).toBeNull();
+      expect(state!.warmup_complete).toBe(false);
+    });
+  });
+
+  // ── Warmup predicate ──────────────────────────────────────────────
+
+  describe('isWarmupComplete predicate', () => {
+    it('returns false when bars < 200', () => {
+      expect(isWarmupComplete({ bars_1m_count: 199, atr_available: true, vwap_available: true })).toBe(false);
+    });
+
+    it('returns false when ATR unavailable', () => {
+      expect(isWarmupComplete({ bars_1m_count: 200, atr_available: false, vwap_available: true })).toBe(false);
+    });
+
+    it('returns false when VWAP unavailable', () => {
+      expect(isWarmupComplete({ bars_1m_count: 200, atr_available: true, vwap_available: false })).toBe(false);
+    });
+
+    it('returns true when all conditions met', () => {
+      expect(isWarmupComplete({ bars_1m_count: 200, atr_available: true, vwap_available: true })).toBe(true);
+    });
+
+    it('returns true when bars exceed threshold', () => {
+      expect(isWarmupComplete({ bars_1m_count: 480, atr_available: true, vwap_available: true })).toBe(true);
     });
   });
 

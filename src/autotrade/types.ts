@@ -120,6 +120,10 @@ export type ExitReason =
   | 'final_runner_exit'
   | 'time_stop'
   | 'invalidation'
+  /** ML management decided EXIT_ALL — full position closed by ML advisory. */
+  | 'ml_exit_all'
+  /** ML management decided EXIT_PARTIAL — partial reduction by ML advisory. */
+  | 'ml_exit_partial'
   | 'manual'
   | 'daily_loss_limit'
   | 'session_end';

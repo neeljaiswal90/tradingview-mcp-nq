@@ -341,14 +341,14 @@ describe('PerformanceTracker — normalization of partial performance.json', () 
     const lw = mockLogWriter(partial);
     new PerformanceTracker('TEST', lw, 25000);
 
-    // writePerformance should have been called during construction to persist the fix
-    expect(lw.writePerformance).toHaveBeenCalledTimes(1);
+    // writePerformance called twice: once for normalization fix, once for startup stamp
+    expect(lw.writePerformance).toHaveBeenCalledTimes(2);
     const written = lw.writePerformance.mock.calls[0][0];
     expect(written.by_management_profile).toEqual({});
     expect(written.total_trades).toBe(5); // headline preserved
   });
 
-  it('does NOT re-write performance.json on startup when all fields are present', () => {
+  it('writes performance.json once on startup to stamp session_id when all fields present', () => {
     const complete: PerformanceStats = {
       session_id: 'FULL',
       total_trades: 10,
@@ -374,16 +374,48 @@ describe('PerformanceTracker — normalization of partial performance.json', () 
     const lw = mockLogWriter(complete);
     new PerformanceTracker('TEST', lw, 25000);
 
-    // writePerformance should NOT have been called during construction
-    expect(lw.writePerformance).not.toHaveBeenCalled();
+    // writePerformance is called once at startup to stamp the current session_id
+    // (no normalization needed since all fields present)
+    expect(lw.writePerformance).toHaveBeenCalledTimes(1);
   });
 
-  it('does NOT re-write when saved is null (fresh start, no file on disk)', () => {
+  it('writes performance.json on fresh start (no file on disk)', () => {
     const lw = mockLogWriter(null);
     new PerformanceTracker('TEST', lw, 25000);
 
-    // No file existed → nothing to persist-fix
-    expect(lw.writePerformance).not.toHaveBeenCalled();
+    // Always writes at startup to stamp session_id
+    expect(lw.writePerformance).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Session identity freshness (P3 regression) ──────────────────────
+
+  it('stamps current session_id over stale saved session_id', () => {
+    const staleFile = {
+      session_id: 'OLD_SESSION_2024',
+      total_trades: 5,
+      wins: 3,
+      losses: 2,
+      scratches: 0,
+      win_rate: 60,
+      total_pnl_usd: 100,
+      max_drawdown_pct: 1.5,
+      by_setup: {},
+      by_regime: {},
+      by_hour: {},
+      by_config_version: {},
+      by_management_profile: {},
+      last_updated: '2024-01-01T00:00:00Z',
+    } as unknown as PerformanceStats;
+
+    const lw = mockLogWriter(staleFile);
+    const pt = new PerformanceTracker('NEW_SESSION_2026', lw, 25000);
+    const stats = pt.getStats();
+
+    // Current session_id must overwrite the stale one
+    expect(stats.session_id).toBe('NEW_SESSION_2026');
+    // Cumulative metrics must be preserved
+    expect(stats.total_trades).toBe(5);
+    expect(stats.total_pnl_usd).toBe(100);
   });
 
   // ── Reset script schema parity ────────────────────────────────────────

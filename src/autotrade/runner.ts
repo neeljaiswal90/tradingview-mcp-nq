@@ -64,7 +64,7 @@ import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-
 import type { ExecutionPolicyConfig } from './execution-policy/index.js';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { RuntimeStateManager } from './runtime-state.js';
+import { RuntimeStateManager, isWarmupComplete } from './runtime-state.js';
 import { TradeJournal } from './trade-journal.js';
 import { readRecoveryArtifacts, buildRecoveryReport, isRecoveryBlocked } from './recovery.js';
 import type { RecoveryReport } from './recovery.js';
@@ -246,6 +246,9 @@ async function main(): Promise<void> {
 
   runtimeState.initialize(sessionId, env.MODE, env.RESTART_MODE);
   runtimeState.startHeartbeat();
+  // 60s periodic session checkpoint — writes live session totals to sessions.jsonl
+  // and performance.json so operators can monitor without waiting for shutdown.
+  let perfCheckpointTimer: ReturnType<typeof setInterval> | null = null;
   const configManager = new IndicatorConfigManager('./config');
 
   // Validate and print the canonical trading config.
@@ -308,6 +311,8 @@ async function main(): Promise<void> {
     runtimeState.writeOpenTradeState(pos);
   });
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
+  perfCheckpointTimer = setInterval(() => perfTracker.checkpointSession(), 60_000);
+  perfCheckpointTimer.unref(); // Don't keep process alive for checkpoint
   const events = EventCalendar.load('./config');
   console.log(`[STARTUP] Loaded event calendar: ${events.size()} events`);
 
@@ -643,6 +648,7 @@ async function main(): Promise<void> {
               spread_ticks: policyResult.intent.microstructure.spread_ticks,
               quote_age_ms: policyResult.intent.microstructure.quote_age_ms,
               reasons: policyResult.intent.reasons,
+              policy_verdict: policyResult.policy_verdict,
             });
 
             if (!policyResult.should_execute) {
@@ -664,7 +670,7 @@ async function main(): Promise<void> {
                 trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
                 price, quantity: mlPos.quantity_remaining,
               });
-              const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'manual');
+              const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'ml_exit_all');
               logWriter.writeExecutionIntent({
                 event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
                 trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
@@ -672,7 +678,7 @@ async function main(): Promise<void> {
                 slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
               });
               const tradeRecord = positionManager.closePosition(
-                exitResult, 'manual', lastRegime, sessionId, env.STRATEGY_VERSION, price,
+                exitResult, 'ml_exit_all', lastRegime, sessionId, env.STRATEGY_VERSION, price,
                 {
                   target_1_direction_valid: mlPos.target_1_direction_valid,
                   target_2_direction_valid: mlPos.target_2_direction_valid,
@@ -688,7 +694,7 @@ async function main(): Promise<void> {
                 r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
               });
               logWriter.writeTrade(tradeRecord);
-              tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
+              tradeJournal.append('final_close', tradeRecord.trade_id, 'ml_management', tradeRecord.exit_reason, null);
               riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
               perfTracker.recordTrade(tradeRecord);
               dashboardState.updatePosition(null);
@@ -712,7 +718,7 @@ async function main(): Promise<void> {
                 const qtyToExit = Math.max(1, Math.floor(mlPos.quantity_remaining * frac));
                 if (qtyToExit > 0 && qtyToExit < mlPos.quantity_remaining) {
                   console.log(`[ML] Executing EXIT_PARTIAL (${qtyToExit} of ${mlPos.quantity_remaining})`);
-                  const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'manual');
+                  const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'ml_exit_partial');
                   positionManager.applyPartialExit(
                     qtyToExit, partialResult.fill_price, partialResult.fill_time_iso,
                     partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig,
@@ -884,6 +890,8 @@ async function main(): Promise<void> {
   // ─── Analysis cycle ─────────────────────────────────────────────────────────
   const onAnalysis = async (cycleNumber: number): Promise<void> => {
     if (engineShuttingDown) return; // Block new analysis during shutdown
+    runtimeState.updateCycleStart();
+    try {
     cycleChangeNote = '';
     const analysisStartMs = Date.now();
 
@@ -916,6 +924,13 @@ async function main(): Promise<void> {
     // attach event state
     snap.event = events.evaluate(new Date());
     lastSnap = snap;
+    // Track market snapshot timestamp (market time, not wall clock)
+    runtimeState.updateSnapshotTs(snap.timestamp_iso);
+    // One-way warmup latch: transition to ready when data quality meets threshold
+    if (!runtimeState.isWarmupComplete() && isWarmupComplete(snap.data_quality)) {
+      runtimeState.markWarmupComplete();
+      console.log('[RUNNER] Warmup complete — sufficient bars and indicators available');
+    }
     dashboardState.updateMarketSnapshot(snap);
     dashboardState.incrementCycle();
     // Track collection timing for freshness metadata + observability
@@ -1049,6 +1064,7 @@ async function main(): Promise<void> {
 
     const dualResult: DualDirectionResult =
       generateSignal(snap, effectiveConfig, contract, undefined, preScoringLobSnap);
+    runtimeState.updateSignalDecision();
     const { regime, bias, bestSetup, tradeAllowed: baseTradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
     // confidence is mutable — micro overlay may adjust it below
     let confidence = dualResult.confidence;
@@ -1655,6 +1671,9 @@ async function main(): Promise<void> {
       configVersion: effectiveConfig.version,
       changeNote: cycleChangeNote,
     });
+    } finally {
+      runtimeState.updateCycleComplete();
+    }
   };
 
   // ─── V2 Multi-Lane Engine ─────────────────────────────────────────────────
@@ -1986,6 +2005,23 @@ async function main(): Promise<void> {
                 mlDec.recommended_stop_price,
               );
 
+              // Log execution policy intent for V2 audit trail parity with V1
+              logWriter.writeMlManagementAction({
+                _type: 'execution_intent',
+                timestamp: new Date().toISOString(),
+                trade_id: pos.trade_id,
+                source_action: policyResult.intent.source_action,
+                execution_action: policyResult.intent.execution_action,
+                urgency: policyResult.intent.urgency,
+                timing: policyResult.intent.timing,
+                should_execute: policyResult.should_execute,
+                block_reason: policyResult.block_reason,
+                spread_ticks: policyResult.intent.microstructure.spread_ticks,
+                quote_age_ms: policyResult.intent.microstructure.quote_age_ms,
+                reasons: policyResult.intent.reasons,
+                policy_verdict: policyResult.policy_verdict,
+              });
+
               if (policyResult.should_execute) {
                 let mlExitedAll = false;
                 await executionLock.runExclusive(async () => {
@@ -1996,23 +2032,23 @@ async function main(): Promise<void> {
                     console.log(`[ML] shouldExit=true trade_id=${mlPos.trade_id} reason=ml_exit_all price=${price}`);
                     logWriter.writeExecutionIntent({
                       event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
-                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_exit_all', reason: 'manual',
+                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management', reason: 'ml_exit_all',
                       price, quantity: mlPos.quantity_remaining,
                     });
                     console.log(`[EXECUTOR] submitting paper exit trade_id=${mlPos.trade_id}`);
 
-                    const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'manual');
+                    const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'ml_exit_all');
 
                     logWriter.writeExecutionIntent({
                       event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
-                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_exit_all', reason: 'manual',
+                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management', reason: 'ml_exit_all',
                       price: exitResult.fill_price, quantity: exitResult.quantity,
                       slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
                     });
                     console.log(`[EXECUTOR] paper exit acknowledged trade_id=${mlPos.trade_id} fill=${exitResult.fill_price}`);
 
                     const tradeRecord = positionManager.closePosition(
-                      exitResult, 'manual', sharedState.lastRegime as MarketRegime, sessionId, env.STRATEGY_VERSION, price,
+                      exitResult, 'ml_exit_all', sharedState.lastRegime as MarketRegime, sessionId, env.STRATEGY_VERSION, price,
                       {
                         target_1_direction_valid: mlPos.target_1_direction_valid,
                         target_2_direction_valid: mlPos.target_2_direction_valid,
@@ -2024,14 +2060,14 @@ async function main(): Promise<void> {
 
                     logWriter.writeExecutionIntent({
                       event: 'trade_closed', timestamp: new Date().toISOString(),
-                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_exit_all', reason: 'manual',
+                      trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management', reason: 'ml_exit_all',
                       price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
                       r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
                     });
                     console.log(`[POSITION] closed trade_id=${mlPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
 
                     logWriter.writeTrade(tradeRecord);
-                    tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
+                    tradeJournal.append('final_close', tradeRecord.trade_id, 'ml_management', tradeRecord.exit_reason, null);
                     riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
                     perfTracker.recordTrade(tradeRecord);
                     dashboardState.updatePosition(null);
@@ -2056,7 +2092,7 @@ async function main(): Promise<void> {
                     if (frac !== null && frac > 0 && frac < 1) {
                       const qtyToExit = Math.max(1, Math.floor(mlPos.quantity_remaining * frac));
                       if (qtyToExit > 0 && qtyToExit < mlPos.quantity_remaining) {
-                        const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'manual');
+                        const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'ml_exit_partial');
                         positionManager.applyPartialExit(qtyToExit, partialResult.fill_price, partialResult.fill_time_iso, partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig);
                       }
                     }
@@ -2505,6 +2541,7 @@ async function main(): Promise<void> {
     try {
       console.log('\n[RUNNER] Shutting down...');
       engineShuttingDown = true;                                        // 1. block new entries
+      if (perfCheckpointTimer) { clearInterval(perfCheckpointTimer); perfCheckpointTimer = null; } // 1b. stop checkpoint
       // (scheduler already stopped by its own SIGINT handler)          // 2. scheduler stopped
       await sleep(250);                                                 // 3. cushion
       logWriter.flushAll();                                             // 4. flush logs
