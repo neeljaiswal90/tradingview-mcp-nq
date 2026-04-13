@@ -13,7 +13,6 @@
   "min_rr": 2,
   "max_risk_per_trade_pct": 1.5,
   "max_daily_loss_pct": 8,
-  "max_consecutive_losses": 5,
   "account_equity": 25000,
   "time_stop_minutes": 30,
   "time_stop_max_r_pre_t1": 0.25,
@@ -36,9 +35,42 @@
   "enable_failed_or_break": true,
   "cooldown_bars": 1,
   "no_same_bar_reversal": true,
+  "startup_backfill_minutes": 60,
+  "enable_cycle_watchdog": true,
+  "cycle_stall_threshold_ms": 15000,
+  "cycle_cusum_k": 0.5,
+  "cycle_cusum_h": 5.0,
+  "cycle_cusum_baseline_samples": 60,
+  "enable_post_flip_first_pullback_short": true,
+  "post_flip_first_pullback_short_max_retest_atr": 0.20,
   "dual_min_score": 7.5,
   "dual_score_margin": 1,
   "dual_choppy_extra_margin": 0.5,
+  "directional_freshness": {
+    "enabled": true,
+    "long_vwap_mode": "hard",
+    "short_vwap_mode": "soft",
+    "short_above_vwap_allowance_session_atr": 0.35,
+    "short_above_vwap_penalty": 0.4,
+    "require_5m_structure": true,
+    "require_supertrend_or_ema21_exception": true,
+    "short_above_vwap_penalty_midpoint_atr": 0.20,
+    "short_above_vwap_penalty_slope_atr": 0.08
+  },
+  "session_score_overrides": {},
+  "session_selection_floor_overrides": {
+    "ETH": {
+      "short": {
+        "trend_pullback_short": 7.3,
+        "post_flip_first_pullback_short": 7.4
+      }
+    }
+  },
+  "replay_validation": {
+    "mae_tolerance_r": 1.0,
+    "candidate_progress_threshold": 0.50,
+    "enable_platt_calibration": true
+  },
   "scoring_weights": {
     "adx_strong_trend": 0.4,
     "adx_weak_trend": -0.3,
@@ -46,7 +78,12 @@
     "ttm_squeeze_penalty": -0.3,
     "ttm_squeeze_release": 0.3,
     "cvd_divergence": -0.4,
-    "cvd_aligned": 0.25
+    "cvd_aligned": 0.25,
+    "htf_conflict_transition_relief": 0.35,
+    "reversal_transition_bonus": 0.2,
+    "contextual_positive_cap": 0.5,
+    "reversal_bonus_peak_bars_since_flip": 7,
+    "reversal_bonus_sigma_bars": 3
   },
   "management_profiles": {
     "trend_pullback": {
@@ -185,20 +222,64 @@
     "min_downside_room_atr": 1.0,
     "require_reset_after_extension": true,
     "max_consecutive_push_bars": 6,
-    "max_last_3_bar_return_atr": 1.5
+    "max_last_3_bar_return_atr": 1.5,
+    "hard_extreme_max_current_impulse_atr": 4.5,
+    "overrides": {
+      "ETH": {
+        "short": {
+          "trend_pullback_short": {
+            "max_current_impulse_atr": 2.8,
+            "max_consecutive_push_bars": 7,
+            "max_last_3_bar_return_atr": 1.7
+          },
+          "post_flip_first_pullback_short": {
+            "max_current_impulse_atr": 2.8,
+            "max_consecutive_push_bars": 7,
+            "max_last_3_bar_return_atr": 1.7
+          }
+        }
+      }
+    }
   },
   "ml_management": {
     "enabled": true,
     "service_url": "http://127.0.0.1:5001",
     "timeout_ms": 3000,
     "model_type": "catboost",
-    "model_version": "20260407_171140",
+    "model_version": "20260410_031213",
     "min_confidence_exit": 0.6,
     "min_confidence_partial": 0.55,
     "min_confidence_stop_move": 0.5,
     "max_quote_age_ms": 5000,
-    "action_cooldown_seconds": 10,
-    "enable_partial_exit": false
+    "action_cooldown_seconds": 20,
+    "enable_partial_exit": false,
+    "min_hold_seconds_before_ml_exit": 15,
+    "min_hold_seconds_before_ml_reduce": 10,
+    "use_probability_calibration": true,
+    "early_phase_end_seconds": 30,
+    "runner_phase_min_seconds": 60,
+    "runner_trigger_r": 0.75,
+    "exit_threshold_early": 0.06,
+    "exit_threshold_active": 0.18,
+    "exit_threshold_runner": 0.10,
+    "min_confidence_to_exit_early": 0.85,
+    "min_confidence_to_exit_active": 0.75,
+    "min_confidence_to_exit_runner": 0.85,
+    "early_green_trade_exit_block_r": 0.10,
+    "runner_drawdown_from_peak_r": 0.25,
+    "train_min_development_seconds": 15,
+    "hold_label_margin_r": 0.05,
+    "counterfactual_max_horizon_seconds": 120,
+    "exclude_rows_after_any_ml_action": true,
+    "exclude_rows_with_future_ml_exit": false,
+    "decision_stride_seconds": 2
+  },
+  "entry_ml": {
+    "mode": "off",
+    "service_url": "http://127.0.0.1:5001",
+    "timeout_ms": 2000,
+    "min_confirmation_confidence": 0.58,
+    "min_expected_r": 0.1
   },
   "active_management_variant": "wider_trail_v1",
   "management_profile_variants": {
@@ -231,6 +312,30 @@
       "failed_or_break": {
         "pre_t1_trail_atr": 0.45,
         "trail_atr_post_t1": 0.6
+      }
+    },
+    "dead_trade_guard_v1": {
+      "_note": "Strict superset of wider_trail_v1 for trend_pullback. Only delta is the pre-PT1 failure-to-launch overlay (Dead-Trade Guard). Ships in shadow_mode=true. Other families intentionally omitted so they continue to be served by active_management_variant=wider_trail_v1 when this variant is selected. All times in minutes; all rates in R/min.",
+      "trend_pullback": {
+        "pre_t1_trail_atr": 0.55,
+        "trail_atr_post_t1": 0.65,
+        "pre_t1_failure_exit_enabled": true,
+        "pre_t1_failure_shadow_mode": true,
+        "pre_t1_failure_curves_key": "trend_pullback",
+        "pre_t1_failure_min_n_per_bucket": 20,
+        "pre_t1_failure_decay_min_gap_minutes": 0.5,
+        "pre_t1_failure_lambda_net": 1.0,
+        "pre_t1_failure_soft_min_minutes": 4,
+        "pre_t1_failure_soft_progress_rate_max": 0.05,
+        "pre_t1_failure_soft_failure_ratio_min": 2.0,
+        "pre_t1_failure_hard_min_minutes": 5,
+        "pre_t1_failure_hard_current_r_alpha": 0.4,
+        "pre_t1_failure_emergency_min_minutes": 3,
+        "pre_t1_failure_emergency_mae_r_floor": 0.20,
+        "pre_t1_failure_emergency_failure_ratio_min": 4.0,
+        "pre_t1_failure_emergency_peak_r_max": 0.10,
+        "pre_t1_failure_emergency_decay_rate_min": 0,
+        "pre_t1_failure_cost_r": 0.05
       }
     }
   },
@@ -278,6 +383,40 @@
     "score_penalty_obstacle_before_t1": -1.25,
     "score_bonus_near_support": 0.25,
     "score_bonus_reclaimed_support": 0.5
+  },
+  "quant_entry": {
+    "enabled": true,
+    "long_enabled": true,
+    "short_enabled": true,
+    "hybrid_gate": false,
+    "quant_primary_mode": false,
+    "expectancy": {
+      "min_bucket_samples": 30,
+      "min_expected_r_primary": 0.0,
+      "side_prior_min_expected_r": 0.2,
+      "bucket_table_path": "data/expectancy_bucket_table.json"
+    },
+    "lob_degradation": {
+      "stale_threshold_ms": 750,
+      "min_total_depth_10lvl": 20,
+      "min_side_depth_10lvl": 5
+    },
+    "orderflow": {
+      "ofi_short_window_ms": 10000,
+      "ofi_long_window_ms": 30000,
+      "z_warmup_samples": 30
+    },
+    "trend_pullback": {
+      "z_ema9_band_min": 0.15,
+      "z_ema9_band_max": 1.25,
+      "pullback_ratio_band_min": 0.25,
+      "pullback_ratio_band_max": 0.62,
+      "flow_confirmation_min": 0.20,
+      "k_sl": 1.05,
+      "entry_half_band_sigma": 0.1,
+      "cold_start_tp1_k": 0.7,
+      "cold_start_tp2_k": 1.4
+    }
   },
   "runner_v2_enabled": false,
   "runner_v2_shadow_only": true,

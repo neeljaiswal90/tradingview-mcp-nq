@@ -29,7 +29,11 @@ import { LobClient } from './lob-client.js';
 
 import { loadEnv, printEnv } from './env.js';
 import { DataCollector } from './data-collector.js';
-import { generateSignal } from './strategy.js';
+import { generateSignal, getStrategyDefinition, getStrategyEffectiveStatus, STRATEGY_REGISTRY } from './strategy.js';
+import { buildRegistrySnapshot } from './strategy-registry.js';
+import { APP_VERSION, APP_BUILD_SHA, computeConfigHash } from '../shared/app-version.js';
+import { computeScoreV2 } from './scoring/score-v2.js';
+import { DEFAULT_SCORING_WEIGHTS } from './strategy.js';
 import { RiskManager } from './risk.js';
 import { createAdapter } from './execution.js';
 import { PositionManager } from './position-manager.js';
@@ -49,12 +53,20 @@ import { classifySession } from './session.js';
 import { DashboardStateManager, DashboardServer } from './dashboard/index.js';
 import { ManagementDecisionEngine, buildManagementFeatures } from './management/index.js';
 import type { ManagementMetrics } from './management/index.js';
-import { getMlDecision, checkMlHealth, DEFAULT_ML_CONFIG } from './ml/index.js';
+import { getMlDecision, checkMlHealth, DEFAULT_ML_CONFIG, decideAction } from './ml/index.js';
 import type { MlManagementConfig, MlDecision, MlDecisionResult, MlFeatureVector } from './ml/index.js';
-import { getEntryMlDecision, DEFAULT_ENTRY_ML_CONFIG } from './ml-entry/index.js';
+import { getEntryMlDecision, DEFAULT_ENTRY_ML_CONFIG, ENTRY_FEATURE_SCHEMA_VERSION } from './ml-entry/index.js';
 import type { EntryMlConfig, EntryMlDecision } from './ml-entry/index.js';
+import { resolveQuantEntryConfig } from './features/quant-entry-config.js';
+import {
+  buildQuantShadowDecision,
+  type EntryMlVerdictSource,
+  type ExpectancyNoDataContext,
+} from './features/quant-shadow-decision.js';
+import { loadExpectancyBucketTable } from './features/expectancy-table-loader.js';
+import type { ExpectancyBucketTable } from './features/expectancy-engine.js';
 import { ExecutionPolicyEngine, DEFAULT_EXECUTION_POLICY_CONFIG } from './execution-policy/index.js';
-import { computeExtensionFeatures, evaluateExtensionVeto, DEFAULT_EXTENSION_FILTER_CONFIG } from './features/extension.js';
+import { computeExtensionFeatures, evaluateExtensionVeto, resolveExtensionConfig, DEFAULT_EXTENSION_FILTER_CONFIG } from './features/extension.js';
 import type { ExtensionFeatures, EntryExtensionFilterConfig } from './features/extension.js';
 import { extractMboDiagnostics, buildMboTradeContext, buildMboHealthSummary, formatMboStatusLine } from './mbo-diagnostics.js';
 import { computeMicrostructureScore, computeMicroAdjustment, DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG } from './features/microstructure-score.js';
@@ -64,7 +76,15 @@ import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-
 import type { ExecutionPolicyConfig } from './execution-policy/index.js';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { RuntimeStateManager, isWarmupComplete } from './runtime-state.js';
+import { RuntimeStateManager, isWarmupComplete, getOrderflowBuffer, persistOrderflowBuffersToDisk, loadAndRestoreOrderflowBuffers } from './runtime-state.js';
+import {
+  ORDERFLOW_Z_WARMUP_SAMPLES,
+  deriveOrderflowSessionId,
+  restoreOrderflowBuffer,
+  readLobSnapshotsForRestore,
+} from './features/orderflow-state.js';
+import { CycleCusumTracker } from './cycle-cusum.js';
+import type { CycleCusumConfig } from './cycle-cusum.js';
 import { TradeJournal } from './trade-journal.js';
 import { readRecoveryArtifacts, buildRecoveryReport, isRecoveryBlocked } from './recovery.js';
 import type { RecoveryReport } from './recovery.js';
@@ -209,6 +229,7 @@ async function main(): Promise<void> {
   const runtimeState = new RuntimeStateManager(env.LOG_DIR, {
     heartbeatIntervalMs: env.RUNTIME_HEARTBEAT_INTERVAL_MS,
     heartbeatStaleMs: env.RUNTIME_HEARTBEAT_STALE_MS,
+    hardeningEnabled: env.AUTOTRADE_RUNTIME_STATE_HARDENING,
   });
 
   if (!runtimeState.acquireLock(sessionId)) {
@@ -244,6 +265,34 @@ async function main(): Promise<void> {
   const logWriter = new LogWriter(env.LOG_DIR);
   logWriter.startFlushTimer();
 
+  // Write the canonical release stamp so every artifact from this session
+  // can be correlated to one shipped build. See src/shared/app-version.ts.
+  try {
+    const { getReleaseStamp, writeCurrentReleaseReport } = await import('../shared/app-version.js');
+    const stamp = getReleaseStamp();
+    let management_model: unknown = null;
+    let entry_model: unknown = null;
+    try {
+      const { readFileSync: rfs, existsSync: exs } = await import('fs');
+      const mgmtPromoted = './models/management_catboost/promoted.json';
+      if (exs(mgmtPromoted)) management_model = JSON.parse(rfs(mgmtPromoted, 'utf8'));
+      const entryPromoted = './models/entry_catboost/promoted.json';
+      if (exs(entryPromoted)) entry_model = JSON.parse(rfs(entryPromoted, 'utf8'));
+    } catch { /* optional */ }
+    const releasePath = writeCurrentReleaseReport({
+      management_model,
+      entry_model,
+      feature_schema: null, // sidecar owns FEATURE_SCHEMA_VERSION; captured in sidecar logs
+    });
+    console.log(
+      `[RELEASE] app=${stamp.app_version} sha=${stamp.build_sha} build=${stamp.build_date} ` +
+      `start=${stamp.start_time} config=${stamp.config_hash_short}`,
+    );
+    if (releasePath) console.log(`[RELEASE] wrote ${releasePath}`);
+  } catch (err) {
+    console.warn('[RELEASE] Failed to write release stamp:', err);
+  }
+
   runtimeState.initialize(sessionId, env.MODE, env.RESTART_MODE);
   runtimeState.startHeartbeat();
   // 60s periodic session checkpoint — writes live session totals to sessions.jsonl
@@ -263,6 +312,41 @@ async function main(): Promise<void> {
   configManager.printEffectiveConfig();
 
   const effectiveConfig = configManager.getConfig();
+
+  // Short config hash used by every candidate_scores_v2 row so results
+  // can be bound to a specific config revision without requiring the
+  // full release stamp on every line.
+  const CONFIG_HASH_SHORT = computeConfigHash().short;
+
+  // Write strategy registry snapshot so reports can correlate decisions to
+  // which strategies were live at startup. See strategy-registry.ts.
+  try {
+    const { writeFileSync: wfs, mkdirSync: mks, existsSync: exs } = await import('fs');
+    const { join: jn } = await import('path');
+    const snapshot = buildRegistrySnapshot(STRATEGY_REGISTRY, effectiveConfig);
+    const outDir = './reports/strategies';
+    if (!exs(outDir)) mks(outDir, { recursive: true });
+    wfs(jn(outDir, 'strategy_registry_latest.json'), JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
+    const lines: string[] = [
+      '# Strategy registry (latest)',
+      '',
+      `Written: ${snapshot.written_at}`,
+      `Total: ${snapshot.total} (active=${snapshot.active} shadow=${snapshot.shadow} disabled=${snapshot.disabled} deprecated=${snapshot.deprecated})`,
+      '',
+      '| strategy_id | family | direction | status | effective | score_profile | notes |',
+      '|---|---|---|---|---|---|---|',
+    ];
+    for (const r of snapshot.strategies) {
+      lines.push(`| ${r.strategy_id} | ${r.family} | ${r.direction} | ${r.status} | ${r.effective_status} | ${r.score_profile} | ${r.notes ?? ''} |`);
+    }
+    wfs(jn(outDir, 'strategy_inventory_latest.md'), lines.join('\n') + '\n', 'utf8');
+    console.log(
+      `[REGISTRY] ${snapshot.total} strategies: ` +
+      `active=${snapshot.active} shadow=${snapshot.shadow} disabled=${snapshot.disabled}`,
+    );
+  } catch (err) {
+    console.warn('[REGISTRY] Failed to write strategy registry snapshot:', err);
+  }
 
   const quoteService = new QuoteService(
     effectiveConfig.max_quote_age_ms_for_management ?? 3_000,
@@ -293,11 +377,94 @@ async function main(): Promise<void> {
   // Persists the latest management metrics across the onMonitor → writeTradePathPoint boundary
   let lastMgmtMetrics: ManagementMetrics | null = null;
   let lastMlDecision: MlDecision | null = null;
+  let lastMlActionTimestampV1 = 0;
   const mlConfig: MlManagementConfig = effectiveConfig.ml_management ?? DEFAULT_ML_CONFIG;
   const entryMlConfig: EntryMlConfig = effectiveConfig.entry_ml ?? DEFAULT_ENTRY_ML_CONFIG;
+
+  // ── Phase 8 Stage A: load expectancy bucket table once at startup ───
+  //
+  // The loader validates provenance (schema_version, bin edges,
+  // backoff_order, horizon) against the engine's canonical constants.
+  // Any mismatch is LOUD — the runner logs the rejection reason and
+  // continues with `null` table. Downstream (`lookupExpectancy`)
+  // returns null-null estimates, which `deriveExpectancyVerdict`
+  // converts to `no_data`, which Stage B treats as neutral
+  // (plan: "no helpful fallback that silently turns missing bucket
+  // tables into live gate behavior").
+  //
+  // The table is loaded ONCE at runner startup, not per-cycle. A
+  // bucket-table refresh requires a runner restart — which is the
+  // correct operational boundary for a calibration change.
+  let expectancyTable: ExpectancyBucketTable | null = null;
+  {
+    const quantCfgStartup = resolveQuantEntryConfig(effectiveConfig.quant_entry);
+    if (quantCfgStartup.enabled) {
+      const loadResult = loadExpectancyBucketTable(quantCfgStartup.expectancy.bucket_table_path);
+      if (loadResult.status === 'loaded') {
+        expectancyTable = loadResult.table;
+        console.log(`[QUANT-ENGINE] ${loadResult.detail}`);
+        console.log(
+          `[QUANT-ENGINE] provenance: generated_at=${loadResult.provenance.generated_at ?? 'unknown'} ` +
+          `schema=${loadResult.provenance.schema_version_on_disk ?? 'unknown'} ` +
+          `path=${loadResult.path}`
+        );
+      } else {
+        console.warn(
+          `[QUANT-ENGINE] Bucket table NOT loaded (status=${loadResult.status}). ` +
+          `Expectancy will be no_data for every candidate, which the ` +
+          `Phase 7 Stage B gate treats as neutral — NOT as a rejection. ` +
+          `Detail: ${loadResult.detail}`
+        );
+      }
+    } else {
+      console.log('[QUANT-ENGINE] quant_entry.enabled=false — expectancy engine dormant (Phase 7 scaffold only)');
+    }
+  }
+  // ── Pre-seed orderflow buffer ────────────────────────────────────────
+  //
+  // Strategy 1: Restore from persisted buffer state (shutdown → startup).
+  // Strategy 2: Replay historical LOB snapshots from disk.
+  // The persisted state is preferred because it retains the exact rolling
+  // mean/std state, not just the raw contributions. If the persisted state
+  // is too old (>1h) or missing, fall back to LOB replay.
+  {
+    const persistRestored = loadAndRestoreOrderflowBuffers(env.LOG_DIR);
+    if (persistRestored > 0) {
+      console.log(`[ORDERFLOW] Restored ${persistRestored} buffer(s) from persisted shutdown state`);
+    }
+
+    const lobLogPath = join(env.LOG_DIR, 'lob_session_snapshots.jsonl');
+    const lobSnaps = readLobSnapshotsForRestore(lobLogPath);
+    if (lobSnaps.length > 0) {
+      const now = new Date();
+      const sessionId = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`;
+      const result = restoreOrderflowBuffer(instrumentSymbol, sessionId, lobSnaps);
+      console.log(
+        `[ORDERFLOW] LOB replay: ${result.snapshots_replayed} snapshots replayed, ` +
+        `buffer_sample_count=${result.buffer_sample_count}, ` +
+        `ready=${result.buffer_ready}, source=${result.restored_from}`
+      );
+    } else if (persistRestored === 0) {
+      console.log('[ORDERFLOW] No persisted state or LOB snapshots — z_ofi_blend will warm up from live data');
+    }
+  }
+
   const execPolicyConfig: ExecutionPolicyConfig = effectiveConfig.execution_policy ?? DEFAULT_EXECUTION_POLICY_CONFIG;
   const extensionConfig: EntryExtensionFilterConfig = effectiveConfig.entry_extension_filters ?? DEFAULT_EXTENSION_FILTER_CONFIG;
   const execPolicy = new ExecutionPolicyEngine(execPolicyConfig);
+
+  // ─── Delta 6: CUSUM cycle watchdog ───────────────────────────────────────
+  // Layered on top of the existing `cycle_stall_threshold_ms` hard threshold.
+  // Detects small persistent drifts in cycle duration that would otherwise
+  // accumulate below the hard threshold. Baseline is built from the first N
+  // healthy cycles; evaluation starts only after the baseline is ready.
+  const cusumConfig: CycleCusumConfig = {
+    cycle_cusum_k: effectiveConfig.cycle_cusum_k ?? 0.5,
+    cycle_cusum_h: effectiveConfig.cycle_cusum_h ?? 5.0,
+    cycle_cusum_baseline_samples: effectiveConfig.cycle_cusum_baseline_samples ?? 60,
+  };
+  const cycleCusum = new CycleCusumTracker(cusumConfig);
+  let previousCycleStartMs: number | null = null;
 
   // 480 × 1m bars = 8 hours — enough to span overnight into prior RTH
   // for prior_rth_high/low computation; also supports opening range caching.
@@ -310,6 +477,22 @@ async function main(): Promise<void> {
     runtimeState.updatePositionKnown(pos?.trade_id ?? null);
     runtimeState.writeOpenTradeState(pos);
   });
+  // Load empirical winner-distribution curves for the Dead-Trade Guard Lane B.
+  // Missing file or empty map makes Lane B a no-op; Lanes A and C still work.
+  // File path is fixed (matches scripts/ml/build_failure_exit_curves.mjs output).
+  try {
+    const { loadCurves } = await import('./failure-exit/index.js');
+    const curves = loadCurves('./config/failure_exit_curves.json');
+    positionManager.setFailureCurves(curves);
+    if (curves.size > 0) {
+      const keys = Array.from(curves.keys()).join(', ');
+      console.log(`[STARTUP] Loaded failure-exit curves for families: ${keys}`);
+    } else {
+      console.log('[STARTUP] No failure-exit curves loaded (Lane B will be no-op)');
+    }
+  } catch (err) {
+    console.warn(`[STARTUP] Failed to load failure-exit curves: ${(err as Error).message}`);
+  }
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
   perfCheckpointTimer = setInterval(() => perfTracker.checkpointSession(), 60_000);
   perfCheckpointTimer.unref(); // Don't keep process alive for checkpoint
@@ -412,7 +595,9 @@ async function main(): Promise<void> {
   // ─── Shadow / advisory signal (runs in MANAGING for analytics only) ─────────
   const runShadowSignal = async (snap: MarketSnapshot | null, cycleNumber: number): Promise<void> => {
     if (!snap) return;
-    const advisoryResult: DualDirectionResult = generateSignal(snap, effectiveConfig, contract);
+    const advisoryResult: DualDirectionResult = generateSignal(
+      snap, effectiveConfig, contract, undefined, undefined, expectancyTable,
+    );
 
     console.log(
       `[SHADOW] Cycle #${cycleNumber} advisory: ${advisoryResult.decision} ` +
@@ -552,6 +737,7 @@ async function main(): Promise<void> {
             mlQuoteAge,
             mlConfig,
             mlLobSnap,
+            lastMlActionTimestampV1 > 0 ? lastMlActionTimestampV1 : null,
           );
           const mlDec = mlResult.decision;
           lastMlDecision = mlDec;
@@ -704,14 +890,20 @@ async function main(): Promise<void> {
               lobClient.endTradeContext(mlPos.trade_id).catch(() => {});
               phaseManager.transitionTo('EXITING', `ml_exit_all:${mlPos.trade_id}`);
               phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
+              lastMlActionTimestampV1 = Date.now();
               console.log(`[ML] Trade closed: ${tradeRecord.outcome_class} $${tradeRecord.pnl_realized.toFixed(2)}`);
             } else if (mlDec.action === 'MOVE_TO_BREAKEVEN') {
               const moved = positionManager.moveStopToBreakeven();
-              if (moved) console.log('[ML] Stop moved to breakeven');
+              if (moved) {
+                lastMlActionTimestampV1 = Date.now();
+                console.log('[ML] Stop moved to breakeven');
+              }
             } else if (mlDec.action === 'MOVE_STOP' && mlDec.recommended_stop_price !== null && mlDec.recommended_stop_price > 0) {
-              // Gate already verified tightening-only and valid price; safe to apply
               const moved = positionManager.moveStopTo(mlDec.recommended_stop_price);
-              if (moved) console.log(`[ML] Stop moved to ${mlDec.recommended_stop_price}`);
+              if (moved) {
+                lastMlActionTimestampV1 = Date.now();
+                console.log(`[ML] Stop moved to ${mlDec.recommended_stop_price}`);
+              }
             } else if (mlDec.action === 'EXIT_PARTIAL' && mlConfig.enable_partial_exit) {
               const frac = mlDec.recommended_size_fraction;
               if (frac !== null && frac > 0 && frac < 1) {
@@ -723,6 +915,7 @@ async function main(): Promise<void> {
                     qtyToExit, partialResult.fill_price, partialResult.fill_time_iso,
                     partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig,
                   );
+                  lastMlActionTimestampV1 = Date.now();
                 }
               }
             }
@@ -1063,12 +1256,34 @@ async function main(): Promise<void> {
       : null;
 
     const dualResult: DualDirectionResult =
-      generateSignal(snap, effectiveConfig, contract, undefined, preScoringLobSnap);
+      generateSignal(snap, effectiveConfig, contract, undefined, preScoringLobSnap, expectancyTable);
     runtimeState.updateSignalDecision();
     const { regime, bias, bestSetup, tradeAllowed: baseTradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
     // confidence is mutable — micro overlay may adjust it below
     let confidence = dualResult.confidence;
     let tradeAllowed = baseTradeAllowed;
+
+    // Phase 2 — registry status gate (final execution eligibility).
+    // compareSides() picked a winner on score alone; shadow strategies can
+    // win but must never execute. Resolve the effective registry status
+    // here so it can be threaded into the primary candidate log (so
+    // execution_allowed_final is truthful from the first row) AND used to
+    // skip execution at the risk-check point below. This is the single
+    // place where registry status affects the execution path.
+    const _shadowEffStatus = bestSetup
+      ? getStrategyEffectiveStatus(bestSetup.setup_type, effectiveConfig)
+      : 'active';
+    const _shadowBlocked = bestSetup != null && _shadowEffStatus !== 'active';
+    const _shadowReason = _shadowBlocked ? `registry_status_${_shadowEffStatus}` : null;
+    if (_shadowBlocked && tradeAllowed) {
+      // Winner exists on score but registry status blocks execution.
+      tradeAllowed = false;
+      if (!skipReasons.includes(_shadowReason!)) skipReasons.push(_shadowReason!);
+      console.log(
+        `[SHADOW] winner ${bestSetup!.direction} ${bestSetup!.setup_type} ` +
+        `(status=${_shadowEffStatus}) — telemetry only, no execution`,
+      );
+    }
     lastRegime = regime;
     lastAlignmentScore = bias.alignment_score;
     lastConfidence = confidence;
@@ -1173,7 +1388,18 @@ async function main(): Promise<void> {
     if (bestSetup) {
       const entryMid = (bestSetup.entry_low + bestSetup.entry_high) / 2;
       extensionFeatures = computeExtensionFeatures(snap, entryMid, bestSetup.direction as 'long' | 'short');
-      const vetoResult = evaluateExtensionVeto(extensionFeatures, bestSetup.direction as 'long' | 'short', extensionConfig, bestSetup.setup_type);
+      const sessionLabel: 'ETH' | 'RTH' | null = snap.session?.is_eth
+        ? 'ETH'
+        : snap.session?.is_rth
+          ? 'RTH'
+          : null;
+      const effectiveExtensionConfig = resolveExtensionConfig(
+        extensionConfig,
+        sessionLabel,
+        bestSetup.direction as 'long' | 'short',
+        bestSetup.setup_type,
+      );
+      const vetoResult = evaluateExtensionVeto(extensionFeatures, bestSetup.direction as 'long' | 'short', effectiveExtensionConfig, bestSetup.setup_type);
       extensionVetoed = vetoResult.vetoed;
       extensionVetoReasons = vetoResult.reasons;
       const extensionSoftReasons = vetoResult.soft_reasons;
@@ -1287,6 +1513,16 @@ async function main(): Promise<void> {
         extension_veto_reasons: extensionVetoReasons,
         extension_soft_reasons: extensionSoftReasons,
         actually_executed: false, // updated below if executed
+        // Delta 3: selection vs execution floor split
+        selection_only: dualResult.selection_only === true,
+        // execution_allowed_final reflects registry status — if the winner
+        // is a shadow/disabled strategy, it is ALWAYS false regardless of
+        // what the strategy layer decided.
+        execution_allowed_final: dualResult.execution_allowed_final === true && !_shadowBlocked,
+        selected_for_execution: bestSetup != null,
+        shadow_reason: _shadowReason,
+        registry_effective_status: _shadowEffStatus,
+        decision_reason_primary: dualResult.decision_reason_primary ?? null,
         // Extension features
         ...extensionFeatures,
         // Market context
@@ -1331,6 +1567,106 @@ async function main(): Promise<void> {
         dynamic_rr_stage: (extensionFeatures || microScore) ? 'runner_refined' : 'strategy_base',
       });
 
+      // ── Phase 3: candidate_scores_v2.jsonl (one row per evaluation) ─────
+      // See src/shared/app-version.ts and the plan file for field semantics.
+      // This is the ONLY writeCandidateScoreV2() call — shadow-blocked
+      // winners, extension-vetoed candidates, and executed trades all share
+      // this single v2 row, distinguished only by the selected_for_execution
+      // and execution_allowed_final booleans.
+      {
+        const chosenDir = bestSetup.direction;
+        const chosenCand = chosenDir === 'long' ? bestLong : bestShort;
+        const barMs = Date.parse(snap.timestamp_iso);
+        const replayKey = `${Number.isFinite(barMs) ? barMs : 0}:${bestSetup.setup_type}:${chosenDir}:0`;
+        const veto_flags: string[] = [];
+        if (extensionVetoed) veto_flags.push(...extensionVetoReasons.map((r) => `extension:${r}`));
+        if (chosenCand && !chosenCand.passedHardGates) {
+          veto_flags.push(...chosenCand.hardGateFailures.map((f) => `hard_gate:${f}`));
+        }
+        if (_shadowBlocked) veto_flags.push(`registry:${_shadowEffStatus}`);
+        const reason_codes: string[] = [];
+        if (dualResult.decision_reason_primary) reason_codes.push(dualResult.decision_reason_primary);
+        if (chosenCand?.rejection_reason_primary) reason_codes.push(chosenCand.rejection_reason_primary);
+        const layered = chosenCand?.layered;
+        const breakdown = chosenCand?.scoreBreakdown;
+        const final_live_score = confidence;
+        // Phase 4: structure/timing/payoff are sourced from score-v2 — a
+        // dedicated Structure/Timing/Payoff decomposition. Field names
+        // match Phase 3 exactly; only the upstream source changed. SHADOW
+        // ONLY — this never touches the live execution path.
+        const scoreV2Result = computeScoreV2({
+          setup: bestSetup,
+          snap,
+          bias,
+          regime,
+          scoringWeights: DEFAULT_SCORING_WEIGHTS,
+          indicatorConfig: effectiveConfig,
+          extension: extensionFeatures,
+          microstructure: microScore,
+          lob: candidateLobSnap,
+          rewardPlan: rewardPlan ?? null,
+        });
+        const structure_score = scoreV2Result.structure;
+        const timing_score = scoreV2Result.timing;
+        const payoff_score = scoreV2Result.payoff;
+        // Phase 4: final_rank_100 is re-sourced from score-v2.composite.
+        const final_rank_100 = scoreV2Result.rank_100;
+        logWriter.writeCandidateScoreV2({
+          candidate_scores_schema_version: 'v2',
+          // identity
+          candidate_id: signalId,
+          candidate_replay_key: replayKey,
+          app_version: APP_VERSION,
+          build_sha: APP_BUILD_SHA,
+          config_hash: CONFIG_HASH_SHORT,
+          session_id: sessionId,
+          strategy_id: bestSetup.setup_type,
+          direction: chosenDir,
+          regime,
+          timestamp: snap.timestamp_iso,
+          symbol: instrumentSymbol,
+          // live decision
+          selected_for_execution: true, // bestSetup is the winner by definition
+          execution_allowed_final: (dualResult.execution_allowed_final === true) && !_shadowBlocked,
+          shadow_reason: _shadowReason,
+          registry_effective_status: _shadowEffStatus,
+          hard_gate_pass: chosenCand?.passedHardGates ?? false,
+          veto_flags,
+          reason_codes,
+          // legacy scoring (unchanged, what lives today)
+          raw_flat_score: breakdown?.total ?? final_live_score,
+          flat_score_components: breakdown ?? null,
+          final_live_score,
+          // shadow decomposition (Phase 3 placeholders, Phase 4 replaces them)
+          structure_score,
+          timing_score,
+          payoff_score,
+          layered_shadow_score: layered?.final_rank ?? null,
+          // Phase 4 provenance: flags that structure/timing/payoff were
+          // sourced from score-v2 rather than the Phase 3 placeholders.
+          score_v2_source: 'score_v2',
+          score_v2_composite: scoreV2Result.composite,
+          score_v2_components: scoreV2Result.components,
+          microstructure_overlay: microScore
+            ? {
+                total: microScore.total,
+                directional: microScore.directional,
+                imbalance: microScore.imbalance,
+                absorption: microScore.absorption,
+                queue: microScore.queue,
+                sweep: microScore.sweep,
+                profile: microScore.profile,
+              }
+            : null,
+          // dynamic RR
+          dynamic_rr_value: rewardPlan?.dynamic_min_rr ?? null,
+          dynamic_rr_gate_pass: rewardPlan?.rr_gate_pass ?? null,
+          dynamic_rr_components: rewardPlan?.rr_components ?? null,
+          // display rank (reporting only)
+          final_rank_100,
+        });
+      }
+
       if (extensionVetoed) {
         signal.reason_for_skip = (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '')
           + `extension_veto:${extensionVetoReasons[0]}`;
@@ -1357,16 +1693,39 @@ async function main(): Promise<void> {
     if (tradeAllowed && !cooldownBlock && !extensionVetoed && !positionManager.hasOpenPosition() && bestSetup) {
       // ── ML entry confirmation gate (before risk check) ──────────────────
       let entryMlDecision: EntryMlDecision | null = null;
-      if (entryMlConfig.mode !== 'off') {
-        try {
+      try {
+        if (entryMlConfig.mode !== 'off') {
           // Notify sidecar of signal window
           lobClient.startSignalContext(signalId, bestSetup.direction).catch(() => {});
           // Reuse the LOB snapshot already fetched at candidate time
           entryMlDecision = await getEntryMlDecision(
-            bestSetup, snap, bias, regime, confidence,
-            dualMargin, entryMlConfig, candidateLobSnap,
+            bestSetup,
+            snap,
+            bias,
+            regime,
+            confidence,
+            dualMargin,
+            entryMlConfig,
+            candidateLobSnap,
+            bestSetup.htfEval ?? null,
           );
           lobClient.endSignalContext(signalId).catch(() => {});
+
+          if (entryMlDecision.request_payload) {
+            logWriter.writeEntryMlFeatures({
+              _type: 'entry_ml_features',
+              timestamp: new Date().toISOString(),
+              signal_id: signalId,
+              candidate_id: signalId,
+              direction: bestSetup.direction,
+              setup_type: bestSetup.setup_type,
+              mode: entryMlConfig.mode,
+              bypass_code: entryMlDecision.bypass_code,
+              feature_schema_version: ENTRY_FEATURE_SCHEMA_VERSION,
+              request: entryMlDecision.request_payload,
+              response: entryMlDecision.response,
+            });
+          }
 
           // Log the decision (with MBO context for diagnostics)
           logWriter.writeMlManagementAction({
@@ -1376,6 +1735,7 @@ async function main(): Promise<void> {
             setup_type: bestSetup.setup_type,
             direction: bestSetup.direction,
             confirmed: entryMlDecision.confirmed,
+            bypass_code: entryMlDecision.bypass_code,
             reason: entryMlDecision.reason,
             confidence: entryMlDecision.response?.confidence ?? null,
             expected_r: entryMlDecision.response?.expected_r ?? null,
@@ -1386,37 +1746,193 @@ async function main(): Promise<void> {
           });
 
           if (!entryMlDecision.confirmed && entryMlConfig.mode === 'confirm_only') {
-            signal.reason_for_skip = (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') + `entry_ml:${entryMlDecision.reason}`;
+            signal.reason_for_skip =
+              (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') +
+              `entry_ml:${entryMlDecision.bypass_code}:${entryMlDecision.reason}`;
             signal.no_trade = true;
-            console.log(`[ENTRY-ML] Rejected: ${bestSetup.direction} ${bestSetup.setup_type} — ${entryMlDecision.reason}`);
+            console.log(
+              `[ENTRY-ML] Rejected (${entryMlDecision.bypass_code}): ` +
+              `${bestSetup.direction} ${bestSetup.setup_type} — ${entryMlDecision.reason}`,
+            );
             logWriter.writeCandidateSignal({
               _event: 'ml_rejected',
               candidate_id: signalId,
               timestamp: new Date().toISOString(),
               direction: bestSetup.direction,
               setup_type: bestSetup.setup_type,
+              bypass_code: entryMlDecision.bypass_code,
               reason: entryMlDecision.reason,
               confidence: entryMlDecision.response?.confidence ?? null,
               expected_r: entryMlDecision.response?.expected_r ?? null,
               actually_executed: false,
             });
-          } else if (entryMlDecision.confirmed) {
+          } else if (entryMlDecision.response && entryMlDecision.bypass_code === 'rank_only_advisory') {
+            console.log(
+              `[ENTRY-ML] Advisory (${entryMlDecision.bypass_code}): ${bestSetup.direction} ${bestSetup.setup_type} ` +
+              `conf=${entryMlDecision.response.confidence?.toFixed(2) ?? 'n/a'} ` +
+              `r=${entryMlDecision.response.expected_r?.toFixed(2) ?? 'n/a'} ` +
+              `(${entryMlDecision.inference_ms}ms)`,
+            );
+          } else if (entryMlDecision.confirmed && entryMlDecision.response) {
             console.log(
               `[ENTRY-ML] Confirmed: ${bestSetup.direction} ${bestSetup.setup_type} ` +
               `conf=${entryMlDecision.response?.confidence?.toFixed(2) ?? 'n/a'} ` +
               `r=${entryMlDecision.response?.expected_r?.toFixed(2) ?? 'n/a'} ` +
               `(${entryMlDecision.inference_ms}ms)`,
             );
+          } else if (entryMlDecision.confirmed) {
+            console.log(
+              `[ENTRY-ML] Bypass (${entryMlDecision.bypass_code}): ` +
+              `${bestSetup.direction} ${bestSetup.setup_type} — ${entryMlDecision.reason}`,
+            );
           }
-        } catch (err) {
-          // ML entry failure is non-fatal: log and continue to rules-based entry
-          console.warn(`[ENTRY-ML] Error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        } else {
+          entryMlDecision = await getEntryMlDecision(
+            bestSetup,
+            snap,
+            bias,
+            regime,
+            confidence,
+            dualMargin,
+            entryMlConfig,
+            candidateLobSnap,
+            bestSetup.htfEval ?? null,
+          );
+
+          if (entryMlDecision.request_payload) {
+            logWriter.writeEntryMlFeatures({
+              _type: 'entry_ml_features',
+              timestamp: new Date().toISOString(),
+              signal_id: signalId,
+              candidate_id: signalId,
+              direction: bestSetup.direction,
+              setup_type: bestSetup.setup_type,
+              mode: entryMlConfig.mode,
+              bypass_code: entryMlDecision.bypass_code,
+              feature_schema_version: ENTRY_FEATURE_SCHEMA_VERSION,
+              request: entryMlDecision.request_payload,
+              response: entryMlDecision.response,
+            });
+          }
+
+          logWriter.writeMlManagementAction({
+            _type: 'entry_ml_decision',
+            timestamp: new Date().toISOString(),
+            signal_id: signalId,
+            setup_type: bestSetup.setup_type,
+            direction: bestSetup.direction,
+            confirmed: entryMlDecision.confirmed,
+            bypass_code: entryMlDecision.bypass_code,
+            reason: entryMlDecision.reason,
+            confidence: null,
+            expected_r: null,
+            entry_quality_prob: null,
+            inference_ms: entryMlDecision.inference_ms,
+            mode: entryMlConfig.mode,
+            mbo_context: buildMboTradeContext(candidateLobSnap),
+          });
+
+          console.log(
+            `[ENTRY-ML] Bypass (${entryMlDecision.bypass_code}): ` +
+            `${bestSetup.direction} ${bestSetup.setup_type} â€” ${entryMlDecision.reason}`,
+          );
+        }
+      } catch (err) {
+        // ML entry failure is non-fatal: log and continue to rules-based entry
+        console.warn(`[ENTRY-ML] Error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // ── Phase 7 Stage A telemetry + Stage B hybrid-gate scaffold ───
+      //
+      // Rebuilds `bestSetup.quant_shadow_decision` now that entry_ml
+      // has run, so the combined verdict reflects the actual entry_ml
+      // outcome instead of the Phase 1-6 stub.
+      //
+      // Stage gating (plan §5 Phase 7):
+      //   - `quant_entry.enabled = false` → skip entirely. Logs stay
+      //     diff-free versus the post-Phase-6 baseline.
+      //   - `enabled = true, hybrid_gate = false` → telemetry-only.
+      //     The rebuilt decision lands on the candidate, but this
+      //     block does NOT touch `signal.no_trade` or
+      //     `signal.reason_for_skip`. Legacy entry_ml gating still
+      //     runs independently below.
+      //   - `enabled = true, hybrid_gate = true` → Stage B AND-gate.
+      //     Only `combined_verdict = 'pass'` lets execution proceed.
+      //     Other verdicts set `signal.no_trade = true` and append
+      //     the combined reason to `signal.reason_for_skip`. Legacy
+      //     `stop` / `target_*` / `rr_*` / `confidence` fields are
+      //     NEVER rewritten — plan §3 no-overwrite rule.
+      const quantCfgRunner = resolveQuantEntryConfig(effectiveConfig.quant_entry);
+      if (
+        quantCfgRunner.enabled &&
+        bestSetup &&
+        (bestSetup.setup_type === 'trend_pullback_long' ||
+          bestSetup.setup_type === 'trend_pullback_short')
+      ) {
+        const mlDisabled = entryMlConfig.mode === 'off';
+        const mlNoData = !mlDisabled && !entryMlDecision;
+        const mlConfirmed = !!(entryMlDecision && entryMlDecision.confirmed);
+        const entryMlSource: EntryMlVerdictSource = {
+          disabled: mlDisabled,
+          confirmed: mlConfirmed,
+          no_data: mlNoData,
+          reason: entryMlDecision
+            ? `entry_ml:${entryMlDecision.bypass_code}:${entryMlDecision.reason}`
+            : null,
+        };
+        const oflowBuf = snap ? (() => {
+          const sessionId = deriveOrderflowSessionId(snap);
+          const buf = getOrderflowBuffer(snap.symbol, sessionId);
+          return buf;
+        })() : null;
+        const noDataCtx: ExpectancyNoDataContext = {
+          bucket_table_loaded: expectancyTable !== null,
+          orderflow_buffer_ready: oflowBuf
+            ? oflowBuf.ofi_10s_history.length >= ORDERFLOW_Z_WARMUP_SAMPLES
+            : false,
+          orderflow_buffer_sample_count: oflowBuf
+            ? oflowBuf.ofi_10s_history.length
+            : 0,
+        };
+        bestSetup.quant_shadow_decision = buildQuantShadowDecision({
+          setup: bestSetup,
+          direction: bestSetup.direction as 'long' | 'short',
+          quantConfig: quantCfgRunner,
+          entryMl: entryMlSource,
+          noDataContext: noDataCtx,
+        });
+
+        // Stage B gate enforcement — dead path unless both flags are true.
+        if (quantCfgRunner.hybrid_gate) {
+          const decision = bestSetup.quant_shadow_decision;
+          const combined = decision.combined_verdict;
+          // Only 'pass' lets execution proceed. 'no_data' is treated
+          // as neutral — explicitly NOT a rejection, per the plan's
+          // "no helpful fallback that silently turns missing bucket
+          // tables into live gate behavior" rule.
+          if (combined !== 'pass' && combined !== 'no_data') {
+            const reason = decision.combined_reason ?? combined;
+            signal.reason_for_skip =
+              (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') +
+              `quant_shadow:${reason}`;
+            signal.no_trade = true;
+            console.log(
+              `[QUANT-SHADOW] Stage B reject: ${bestSetup.direction} ` +
+              `${bestSetup.setup_type} — ${reason}`,
+            );
+          }
         }
       }
 
-      // If ML rejected in confirm_only mode, skip to logging
+      // If ML rejected in confirm_only mode, skip to logging.
+      // Shadow-status block is enforced earlier via tradeAllowed (see the
+      // _shadowBlocked check right after bestSetup is resolved), so this
+      // code path never runs for a shadow-selected winner — no duplicate
+      // candidate event is produced here.
       if (entryMlDecision && !entryMlDecision.confirmed && entryMlConfig.mode === 'confirm_only') {
         // Entry blocked by ML — falls through to signal logging below
+      } else if (signal.no_trade === true) {
+        // Phase 7 Stage B gate blocked execution — fall through to logging
       } else {
       // ── Risk check + entry execution ───────────────────────────────────
       // Pass dynamic min RR from reward plan so the risk manager uses the
@@ -1649,6 +2165,29 @@ async function main(): Promise<void> {
       Date.now() - analysisStartMs,
       effectiveConfig.analysis_interval_seconds * 1000,
     );
+
+    // ─── Delta 6: CUSUM watchdog observation ─────────────────────────────
+    // Feed the cycle-to-cycle gap into the CUSUM tracker. Edge-triggered
+    // stall/recovered events are logged via the main log writer; level
+    // state ("still degraded") is only surfaced via the tracker snapshot.
+    if (previousCycleStartMs !== null) {
+      const cycleGapMs = analysisStartMs - previousCycleStartMs;
+      const events = cycleCusum.observe(cycleGapMs);
+      for (const event of events) {
+        if (event.kind === 'stall') {
+          console.warn(
+            `[CYCLE-CUSUM] stall detected — S+=${event.s_plus.toFixed(2)} duration=${event.duration_ms}ms z=${event.z.toFixed(2)}`,
+          );
+        } else if (event.kind === 'recovered') {
+          console.log(`[CYCLE-CUSUM] recovered — S+=${event.s_plus.toFixed(2)}`);
+        } else if (event.kind === 'baseline_ready') {
+          console.log(
+            `[CYCLE-CUSUM] baseline ready — mean=${event.mean_ms.toFixed(0)}ms std=${event.std_ms.toFixed(0)}ms`,
+          );
+        }
+      }
+    }
+    previousCycleStartMs = analysisStartMs;
     // Update engine phase for dashboard
     dashboardState.updateEnginePhase(phaseManager.snapshot());
     // Flush all accumulated state changes to the dashboard as a single SSE broadcast
@@ -1993,9 +2532,57 @@ async function main(): Promise<void> {
               _response_fallback_reason: mlResult.decision.fallback_reason,
             });
 
-            // Execute approved ML actions under lock (ACTIVE mode only — shadow skips execution)
+            // Phase-aware decision policy (decideAction derives phase internally)
             const mlDec = mlResult.decision;
-            if (!shadowOnly && mlDec.approved && mlDec.action !== 'NO_ACTION' && mlDec.action !== 'HOLD') {
+            const _ageSec = Math.floor((Date.now() - pos.entry_time_unix) / 1000);
+            const _initialRiskPts = Math.abs(pos.entry_price - pos.stop_initial);
+            const _isShort = pos.side === 'short';
+            const _pnlPts = _isShort ? pos.entry_price - price : price - pos.entry_price;
+            const _curR = _initialRiskPts > 0 ? _pnlPts / _initialRiskPts : 0;
+            const _peakR = _initialRiskPts > 0 ? pos.max_favorable_excursion / _initialRiskPts : 0;
+            const _drawdownFromPeakR = _peakR - _curR;
+
+            const phaseDecision = decideAction({
+              prob_hold_raw: mlDec.prob_hold ?? 1.0,
+              // Release 1: prob_hold_cal is NOT populated — the service does not yet
+              // return a separate calibrated field. Leave undefined so decideAction()
+              // falls back to prob_hold_raw.
+              prob_hold_cal: undefined,
+              confidence: mlDec.confidence,
+              age_sec: _ageSec,
+              cur_r: _curR,
+              peak_r: _peakR,
+              drawdown_from_peak_r: _drawdownFromPeakR,
+              quote_age_ms: mlQuoteAge,
+            }, mlConfig);
+
+            // Log phase decision for observability
+            logWriter.writeMlManagementAction({
+              _type: 'phase_decision',
+              timestamp: new Date().toISOString(),
+              trade_id: pos.trade_id,
+              phase: phaseDecision.phase,
+              phase_action: phaseDecision.action,
+              phase_reason: phaseDecision.reason,
+              ml_gate_reason: mlDec.approved ? null : mlDec.rejection_reason,
+              prob_hold_raw: mlDec.prob_hold,
+              prob_hold_cal: null, // Release 2: will populate when service returns calibrated field
+              prob_hold_used: phaseDecision.prob_hold_used ?? null,
+              threshold_used: phaseDecision.threshold_used ?? null,
+              age_sec: _ageSec,
+              cur_r: Math.round(_curR * 1000) / 1000,
+              peak_r: Math.round(_peakR * 1000) / 1000,
+              drawdown_from_peak_r: Math.round(_drawdownFromPeakR * 1000) / 1000,
+            });
+
+            // Execute only when BOTH the gate approves AND the phase policy agrees
+            const shouldExecuteMl = !shadowOnly
+              && mlDec.approved
+              && mlDec.action !== 'NO_ACTION'
+              && mlDec.action !== 'HOLD'
+              && phaseDecision.action !== 'HOLD';
+
+            if (shouldExecuteMl) {
               const mlLobSnapForPolicy = mlLobSnap;
               const policyResult = execPolicy.evaluate(
                 mlDec.action, pos, mlLobSnapForPolicy, mlQuoteAge,
@@ -2024,6 +2611,7 @@ async function main(): Promise<void> {
 
               if (policyResult.should_execute) {
                 let mlExitedAll = false;
+                let actionExecuted = false;
                 await executionLock.runExclusive(async () => {
                   const mlPos = positionManager.getPosition();
                   if (!mlPos) return;
@@ -2083,10 +2671,13 @@ async function main(): Promise<void> {
                     recentEventLog.push(`trade_closed:${mlPos.trade_id}:ml_exit_all:${tradeRecord.outcome_class}`);
                     console.log(`[DASH] position cleared trade_id=${mlPos.trade_id}`);
                     mlExitedAll = true;
+                    actionExecuted = true;
                   } else if (mlDec.action === 'MOVE_TO_BREAKEVEN') {
                     positionManager.moveStopToBreakeven();
+                    actionExecuted = true;
                   } else if (mlDec.action === 'MOVE_STOP' && mlDec.recommended_stop_price !== null) {
                     positionManager.moveStopTo(mlDec.recommended_stop_price);
+                    actionExecuted = true;
                   } else if (mlDec.action === 'EXIT_PARTIAL' && mlConfig.enable_partial_exit) {
                     const frac = mlDec.recommended_size_fraction;
                     if (frac !== null && frac > 0 && frac < 1) {
@@ -2094,15 +2685,18 @@ async function main(): Promise<void> {
                       if (qtyToExit > 0 && qtyToExit < mlPos.quantity_remaining) {
                         const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'ml_exit_partial');
                         positionManager.applyPartialExit(qtyToExit, partialResult.fill_price, partialResult.fill_time_iso, partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig);
+                        actionExecuted = true;
                       }
                     }
                   }
+                }, { isExit: mlDec.action === 'EXIT_ALL', skipIfExitInFlight: mlDec.action === 'EXIT_ALL' });
 
-                  // Record execution timestamp for cooldown
+                // Only stamp cooldown when an action actually executed
+                if (actionExecuted) {
                   v2LastMlActionTimestamp = Date.now();
                   sharedState.lastMlActionTimestamp = v2LastMlActionTimestamp;
                   execPolicy.recordExecution(mlDec.action);
-                }, { isExit: mlDec.action === 'EXIT_ALL', skipIfExitInFlight: mlDec.action === 'EXIT_ALL' });
+                }
                 if (mlExitedAll) dashboardState.flush();
               }
             }
@@ -2540,29 +3134,80 @@ async function main(): Promise<void> {
 
     try {
       console.log('\n[RUNNER] Shutting down...');
-      engineShuttingDown = true;                                        // 1. block new entries
-      if (perfCheckpointTimer) { clearInterval(perfCheckpointTimer); perfCheckpointTimer = null; } // 1b. stop checkpoint
-      // (scheduler already stopped by its own SIGINT handler)          // 2. scheduler stopped
-      await sleep(250);                                                 // 3. cushion
-      logWriter.flushAll();                                             // 4. flush logs
-      runtimeState.writeOpenTradeState(positionManager.getPosition());  // 5. persist state
+      if (perfCheckpointTimer) { clearInterval(perfCheckpointTimer); perfCheckpointTimer = null; }
       const finalStats = perfTracker.getStats();
-      logWriter.updateSessionEnd(sessionId, {                           // 6. session end record
-        timestamp_end: new Date().toISOString(),
-        total_signals: totalSignals,
-        total_trades: finalStats.total_trades,
-        wins: finalStats.wins,
-        losses: finalStats.losses,
-        scratches: finalStats.scratches,
-        total_pnl_usd: finalStats.total_pnl_usd,
-        daily_loss_pct: riskManager.getState().daily_loss_pct,
-        shutdown_reason: reason,
-      });
-      dashboardState.setEngineRunning(false);                           // 7. dashboard state
-      dashboardServer.stop();                                           // 8. HTTP server
-      runtimeState.markCleanShutdown(reason);                           // 9. stops heartbeat, writes state
-      perfTracker.printSelfReview();
-      logWriter.destroy();                                              // 10. final flush
+      engineShuttingDown = true;
+      await sleep(250);
+
+      if (!env.AUTOTRADE_RUNTIME_STATE_HARDENING) {
+        logWriter.flushAll();
+        runtimeState.writeOpenTradeState(positionManager.getPosition());
+        logWriter.updateSessionEnd(sessionId, {
+          timestamp_end: new Date().toISOString(),
+          total_signals: totalSignals,
+          total_trades: finalStats.total_trades,
+          wins: finalStats.wins,
+          losses: finalStats.losses,
+          scratches: finalStats.scratches,
+          total_pnl_usd: finalStats.total_pnl_usd,
+          daily_loss_pct: riskManager.getState().daily_loss_pct,
+          shutdown_reason: reason,
+        });
+        dashboardState.setEngineRunning(false);
+        dashboardServer.stop();
+        runtimeState.markCleanShutdown(reason);
+        perfTracker.printSelfReview();
+        logWriter.destroy();
+      } else {
+        const runStep = async (label: string, action: () => void | Promise<void>): Promise<void> => {
+          try {
+            await action();
+          } catch (err) {
+            console.error(`[SHUTDOWN] ${label} failed:`, err);
+          }
+        };
+
+        await runStep('flush logs', () => {
+          logWriter.flushAll();
+        });
+        await runStep('persist open trade state', () => {
+          runtimeState.writeOpenTradeState(positionManager.getPosition());
+        });
+        await runStep('write session end', () => {
+          logWriter.updateSessionEnd(sessionId, {
+            timestamp_end: new Date().toISOString(),
+            total_signals: totalSignals,
+            total_trades: finalStats.total_trades,
+            wins: finalStats.wins,
+            losses: finalStats.losses,
+            scratches: finalStats.scratches,
+            total_pnl_usd: finalStats.total_pnl_usd,
+            daily_loss_pct: riskManager.getState().daily_loss_pct,
+            shutdown_reason: reason,
+          });
+        });
+        await runStep('mark dashboard stopped', () => {
+          dashboardState.setEngineRunning(false);
+        });
+        await runStep('stop dashboard server', () => dashboardServer.stop());
+        await runStep('persist orderflow buffer', () => {
+          try {
+            persistOrderflowBuffersToDisk(env.LOG_DIR);
+            console.log('[ORDERFLOW] Buffer state persisted to disk for next startup');
+          } catch (err) {
+            console.warn('[ORDERFLOW] Failed to persist buffer state:', err);
+          }
+        });
+        await runStep('mark clean shutdown', () => {
+          runtimeState.markCleanShutdown(reason);
+        });
+        await runStep('print self review', () => {
+          perfTracker.printSelfReview();
+        });
+        await runStep('destroy log writer', () => {
+          logWriter.destroy();
+        });
+      }
     } catch (err) {
       console.error('[SHUTDOWN] Error during teardown:', err);
     } finally {

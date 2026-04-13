@@ -16,6 +16,9 @@ import type {
   MlServiceResponse,
   MlDecision,
   MlDecisionResult,
+  DecideActionInput,
+  DecideActionResult,
+  DevelopmentPhase,
 } from './types.js';
 import { buildMlFeatures } from './feature-builder.js';
 import { evaluateMlGate } from './execution-gate.js';
@@ -139,6 +142,111 @@ export async function checkMlHealth(serviceUrl: string, timeoutMs: number = 2000
     return false;
   }
 }
+
+// ─── Phase-Aware Decision Policy ────────────────────────────────────────────
+
+/**
+ * Phase-aware exit decision. Derives phase internally from age_sec, cur_r,
+ * and config thresholds — callers do NOT pass a development_phase field.
+ *
+ * This is the live policy function. For training labels, use
+ * computeTrainingDevelopmentPhase() which uses train_min_development_seconds.
+ */
+export function decideAction(
+  input: DecideActionInput,
+  cfg: MlManagementConfig,
+): DecideActionResult {
+  const pHold =
+    cfg.use_probability_calibration && input.prob_hold_cal != null
+      ? input.prob_hold_cal
+      : input.prob_hold_raw;
+
+  // ── Pre-check: minimum hold time ─────────────────────────────────────
+  if (input.age_sec < cfg.min_hold_seconds_before_ml_exit) {
+    return { action: 'HOLD', reason: 'min_hold', phase: 'EARLY' };
+  }
+
+  // ── EARLY phase ──────────────────────────────────────────────────────
+  if (input.age_sec < cfg.early_phase_end_seconds) {
+    if (input.cur_r > cfg.early_green_trade_exit_block_r) {
+      return { action: 'HOLD', reason: 'early_green_block', phase: 'EARLY' };
+    }
+    if (
+      pHold < cfg.exit_threshold_early &&
+      input.confidence >= cfg.min_confidence_to_exit_early
+    ) {
+      return {
+        action: 'EXIT_ALL',
+        reason: 'early_exit_threshold',
+        phase: 'EARLY',
+        threshold_used: cfg.exit_threshold_early,
+        prob_hold_used: pHold,
+      };
+    }
+    return { action: 'HOLD', reason: 'early_hold', phase: 'EARLY' };
+  }
+
+  // ── RUNNER phase ─────────────────────────────────────────────────────
+  const inRunnerPhase =
+    input.age_sec >= cfg.runner_phase_min_seconds ||
+    input.cur_r >= cfg.runner_trigger_r;
+
+  if (inRunnerPhase) {
+    if (input.drawdown_from_peak_r < cfg.runner_drawdown_from_peak_r) {
+      return { action: 'HOLD', reason: 'runner_protection', phase: 'RUNNER' };
+    }
+    if (
+      pHold < cfg.exit_threshold_runner &&
+      input.confidence >= cfg.min_confidence_to_exit_runner
+    ) {
+      return {
+        action: 'EXIT_ALL',
+        reason: 'runner_exit_threshold',
+        phase: 'RUNNER',
+        threshold_used: cfg.exit_threshold_runner,
+        prob_hold_used: pHold,
+      };
+    }
+    return { action: 'HOLD', reason: 'runner_hold', phase: 'RUNNER' };
+  }
+
+  // ── ACTIVE phase (default) ───────────────────────────────────────────
+  if (
+    pHold < cfg.exit_threshold_active &&
+    input.confidence >= cfg.min_confidence_to_exit_active
+  ) {
+    return {
+      action: 'EXIT_ALL',
+      reason: 'active_exit_threshold',
+      phase: 'ACTIVE',
+      threshold_used: cfg.exit_threshold_active,
+      prob_hold_used: pHold,
+    };
+  }
+  return { action: 'HOLD', reason: 'active_hold', phase: 'ACTIVE' };
+}
+
+/**
+ * Compute development phase for TRAINING labels only.
+ * Uses train_min_development_seconds for the EARLY threshold (differs from
+ * the live early_phase_end_seconds). NOT used in live execution.
+ */
+export function computeTrainingDevelopmentPhase(
+  ageSec: number,
+  curR: number,
+  cfg: MlManagementConfig,
+): DevelopmentPhase {
+  if (ageSec < cfg.train_min_development_seconds) return 'EARLY';
+  if (
+    ageSec >= cfg.runner_phase_min_seconds ||
+    curR >= cfg.runner_trigger_r
+  ) {
+    return 'RUNNER';
+  }
+  return 'ACTIVE';
+}
+
+// ─── Error Helpers ──────────────────────────────────────────────────────────
 
 function makeErrorDecision(reason: string, elapsedMs: number): MlDecision {
   return {

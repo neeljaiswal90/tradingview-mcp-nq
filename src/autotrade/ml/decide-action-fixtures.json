@@ -1,0 +1,56 @@
+[
+  {
+    "name": "min_hold_block",
+    "input": { "prob_hold_raw": 0.01, "confidence": 0.95, "age_sec": 10, "cur_r": -0.20, "peak_r": 0.0, "drawdown_from_peak_r": 0.20, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "HOLD", "reason": "min_hold", "phase": "EARLY" }
+  },
+  {
+    "name": "early_green_block",
+    "input": { "prob_hold_raw": 0.05, "confidence": 0.90, "age_sec": 20, "cur_r": 0.15, "peak_r": 0.15, "drawdown_from_peak_r": 0.0, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "HOLD", "reason": "early_green_block", "phase": "EARLY" }
+  },
+  {
+    "name": "early_exit_on_red",
+    "input": { "prob_hold_raw": 0.04, "confidence": 0.90, "age_sec": 20, "cur_r": -0.05, "peak_r": 0.02, "drawdown_from_peak_r": 0.07, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "EXIT_ALL", "reason": "early_exit_threshold", "phase": "EARLY" }
+  },
+  {
+    "name": "early_hold_low_confidence",
+    "input": { "prob_hold_raw": 0.04, "confidence": 0.50, "age_sec": 20, "cur_r": -0.05, "peak_r": 0.02, "drawdown_from_peak_r": 0.07, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "HOLD", "reason": "early_hold", "phase": "EARLY" }
+  },
+  {
+    "name": "active_exit",
+    "input": { "prob_hold_raw": 0.10, "confidence": 0.80, "age_sec": 45, "cur_r": 0.30, "peak_r": 0.45, "drawdown_from_peak_r": 0.15, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "EXIT_ALL", "reason": "active_exit_threshold", "phase": "ACTIVE" }
+  },
+  {
+    "name": "active_hold",
+    "input": { "prob_hold_raw": 0.50, "confidence": 0.80, "age_sec": 45, "cur_r": 0.30, "peak_r": 0.45, "drawdown_from_peak_r": 0.15, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "HOLD", "reason": "active_hold", "phase": "ACTIVE" }
+  },
+  {
+    "name": "runner_protection",
+    "input": { "prob_hold_raw": 0.05, "confidence": 0.90, "age_sec": 90, "cur_r": 1.0, "peak_r": 1.1, "drawdown_from_peak_r": 0.10, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "HOLD", "reason": "runner_protection", "phase": "RUNNER" }
+  },
+  {
+    "name": "runner_exit_after_drawdown",
+    "input": { "prob_hold_raw": 0.05, "confidence": 0.90, "age_sec": 90, "cur_r": 0.80, "peak_r": 1.10, "drawdown_from_peak_r": 0.30, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "EXIT_ALL", "reason": "runner_exit_threshold", "phase": "RUNNER" }
+  },
+  {
+    "name": "runner_by_r_not_time",
+    "input": { "prob_hold_raw": 0.05, "confidence": 0.90, "age_sec": 45, "cur_r": 0.80, "peak_r": 1.10, "drawdown_from_peak_r": 0.30, "quote_age_ms": 100 },
+    "config_overrides": {},
+    "expected": { "action": "EXIT_ALL", "reason": "runner_exit_threshold", "phase": "RUNNER" }
+  }
+]

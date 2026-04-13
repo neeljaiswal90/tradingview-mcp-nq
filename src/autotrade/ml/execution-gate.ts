@@ -25,6 +25,14 @@ import type {
   MlGateCheck,
 } from './types.js';
 
+function getPositionAgeSec(pos: Position): number {
+  return Math.floor((Date.now() - pos.entry_time_unix) / 1000);
+}
+
+function getInitialRiskPts(pos: Position): number {
+  return Math.abs(pos.entry_price - pos.stop_initial);
+}
+
 export function evaluateMlGate(
   response: MlServiceResponse,
   config: MlManagementConfig,
@@ -34,6 +42,29 @@ export function evaluateMlGate(
 ): MlGateResult {
   const checks: MlGateCheck[] = [];
   const action = response.action as ManagementAction;
+
+  // ── Gate 0: Invalid risk geometry ─────────────────────────────────
+  // Block all executable ML actions when initial risk is zero/invalid
+  // to prevent NaN/Infinity in R calculations.
+  if (position !== null) {
+    const riskPts = getInitialRiskPts(position);
+    const riskOk = riskPts > 0;
+    checks.push({
+      name: 'valid_risk_geometry',
+      passed: riskOk,
+      reason: riskOk
+        ? `initial risk ${riskPts.toFixed(2)} pts > 0`
+        : `initial risk ${riskPts.toFixed(2)} pts <= 0 — entry_price equals stop_initial`,
+    });
+    if (!riskOk) {
+      return {
+        approved: false,
+        action: response.action,
+        rejection_reason: 'invalid_risk_geometry',
+        checks,
+      };
+    }
+  }
 
   // ── Gate 1: Feature enabled ────────────────────────────────────────
   checks.push({
@@ -136,7 +167,85 @@ export function evaluateMlGate(
     });
   }
 
-  // ── Gate 8: Stop can only tighten ──────────────────────────────────
+  // ── Gate 8: Minimum hold time before EXIT_ALL ─────────────────────
+  if (action === 'EXIT_ALL' && config.min_hold_seconds_before_ml_exit > 0 && position) {
+    const holdTimeSec = (Date.now() - position.entry_time_unix) / 1000;
+    const holdOk = holdTimeSec >= config.min_hold_seconds_before_ml_exit;
+    checks.push({
+      name: 'min_hold_time',
+      passed: holdOk,
+      reason: holdOk
+        ? `hold time ${holdTimeSec.toFixed(0)}s >= ${config.min_hold_seconds_before_ml_exit}s minimum`
+        : `hold time ${holdTimeSec.toFixed(0)}s < ${config.min_hold_seconds_before_ml_exit}s — trade too young for ML exit`,
+    });
+  }
+
+  // ── Gate 8b: Minimum hold time before REDUCE ──────────────────────
+  if (
+    (action === 'EXIT_PARTIAL' || action === 'SCALE_OUT') &&
+    config.min_hold_seconds_before_ml_reduce > 0 &&
+    position
+  ) {
+    const holdTimeSec = getPositionAgeSec(position);
+    const holdOk = holdTimeSec >= config.min_hold_seconds_before_ml_reduce;
+    checks.push({
+      name: 'min_hold_reduce',
+      passed: holdOk,
+      reason: holdOk
+        ? `hold time ${holdTimeSec}s >= ${config.min_hold_seconds_before_ml_reduce}s minimum for reduce`
+        : `hold time ${holdTimeSec}s < ${config.min_hold_seconds_before_ml_reduce}s — trade too young for ML reduce`,
+    });
+  }
+
+  // ── Gate 8c: Early green trade block ──────────────────────────────
+  if (action === 'EXIT_ALL' && position && config.early_phase_end_seconds > 0) {
+    const ageSec = getPositionAgeSec(position);
+    if (ageSec < config.early_phase_end_seconds) {
+      const riskPts = getInitialRiskPts(position);
+      const isShort = position.side === 'short';
+      const pnlPts = isShort
+        ? position.entry_price - position.last_checked_price
+        : position.last_checked_price - position.entry_price;
+      const unrealizedR = riskPts > 0 ? pnlPts / riskPts : 0;
+      const greenOk = unrealizedR <= config.early_green_trade_exit_block_r;
+      checks.push({
+        name: 'early_green_block',
+        passed: greenOk,
+        reason: greenOk
+          ? `unrealized_r ${unrealizedR.toFixed(3)} <= ${config.early_green_trade_exit_block_r} in early phase (${ageSec}s)`
+          : `unrealized_r ${unrealizedR.toFixed(3)} > ${config.early_green_trade_exit_block_r} in early phase (${ageSec}s) — blocking tiny green exit`,
+      });
+    }
+  }
+
+  // ── Gate 8d: Runner protection ────────────────────────────────────
+  if (action === 'EXIT_ALL' && position) {
+    const ageSec = getPositionAgeSec(position);
+    const riskPts = getInitialRiskPts(position);
+    const isShort = position.side === 'short';
+    const pnlPts = isShort
+      ? position.entry_price - position.last_checked_price
+      : position.last_checked_price - position.entry_price;
+    const curR = riskPts > 0 ? pnlPts / riskPts : 0;
+    const peakR = riskPts > 0 ? position.max_favorable_excursion / riskPts : 0;
+    const drawdown = peakR - curR;
+    const inRunnerPhase =
+      ageSec >= config.runner_phase_min_seconds ||
+      curR >= config.runner_trigger_r;
+
+    if (inRunnerPhase) {
+      const ddOk = drawdown >= config.runner_drawdown_from_peak_r;
+      checks.push({
+        name: 'runner_protection',
+        passed: ddOk,
+        reason: ddOk
+          ? `drawdown ${drawdown.toFixed(3)} >= ${config.runner_drawdown_from_peak_r} — runner exit allowed`
+          : `drawdown ${drawdown.toFixed(3)} < ${config.runner_drawdown_from_peak_r} — protecting runner`,
+      });
+    }
+  }
+
+  // ── Gate 9: Stop can only tighten ──────────────────────────────────
   if (action === 'MOVE_STOP' && response.recommended_stop_price !== null && position) {
     const isShort = position.side === 'short';
     const newStop = response.recommended_stop_price;

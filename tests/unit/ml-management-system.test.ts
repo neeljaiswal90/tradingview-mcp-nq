@@ -714,7 +714,192 @@ describe('Management ML feature parity (cross-source)', () => {
   });
 });
 
-// ─── 8. Claude Removal (re-confirmation) ────────────────────────────────────
+// ─── 8. Phase-Aware Decision Policy (decideAction) ─────────────────────────
+
+import { decideAction } from '../../src/autotrade/ml/decision-engine.js';
+import type { DecideActionInput } from '../../src/autotrade/ml/types.js';
+import fixtures from '../../src/autotrade/ml/decide-action-fixtures.json';
+
+describe('decideAction() phase-aware policy', () => {
+  const cfg: MlManagementConfig = {
+    ...DEFAULT_ML_CONFIG,
+    enabled: true,
+  };
+
+  for (const fixture of fixtures) {
+    it(`fixture: ${fixture.name}`, () => {
+      const mergedCfg = { ...cfg, ...fixture.config_overrides };
+      const result = decideAction(fixture.input as DecideActionInput, mergedCfg);
+      expect(result.action).toBe(fixture.expected.action);
+      expect(result.reason).toBe(fixture.expected.reason);
+      expect(result.phase).toBe(fixture.expected.phase);
+    });
+  }
+
+  it('uses prob_hold_cal when available and calibration enabled', () => {
+    const result = decideAction({
+      prob_hold_raw: 0.50,      // above active threshold → would HOLD
+      prob_hold_cal: 0.10,      // below active threshold → should EXIT
+      confidence: 0.80,
+      age_sec: 45,
+      cur_r: 0.20,
+      peak_r: 0.30,
+      drawdown_from_peak_r: 0.10,
+      quote_age_ms: 100,
+    }, { ...cfg, use_probability_calibration: true });
+    expect(result.action).toBe('EXIT_ALL');
+    expect(result.prob_hold_used).toBe(0.10);
+  });
+
+  it('falls back to prob_hold_raw when prob_hold_cal is undefined', () => {
+    const result = decideAction({
+      prob_hold_raw: 0.50,
+      prob_hold_cal: undefined,
+      confidence: 0.80,
+      age_sec: 45,
+      cur_r: 0.20,
+      peak_r: 0.30,
+      drawdown_from_peak_r: 0.10,
+      quote_age_ms: 100,
+    }, { ...cfg, use_probability_calibration: true });
+    expect(result.action).toBe('HOLD');
+    expect(result.reason).toBe('active_hold');
+  });
+
+  it('ignores prob_hold_cal when calibration disabled', () => {
+    const result = decideAction({
+      prob_hold_raw: 0.50,
+      prob_hold_cal: 0.10,
+      confidence: 0.80,
+      age_sec: 45,
+      cur_r: 0.20,
+      peak_r: 0.30,
+      drawdown_from_peak_r: 0.10,
+      quote_age_ms: 100,
+    }, { ...cfg, use_probability_calibration: false });
+    expect(result.action).toBe('HOLD');
+    expect(result.reason).toBe('active_hold');
+  });
+});
+
+// ─── 9. Execution Gate V2 Acceptance Tests ─────────────────────────────────
+
+describe('execution gate V2 acceptance tests', () => {
+  const cfg: MlManagementConfig = {
+    ...DEFAULT_ML_CONFIG,
+    enabled: true,
+    action_cooldown_seconds: 20,
+    min_hold_seconds_before_ml_exit: 15,
+    min_hold_seconds_before_ml_reduce: 10,
+    early_phase_end_seconds: 30,
+    early_green_trade_exit_block_r: 0.10,
+    runner_phase_min_seconds: 60,
+    runner_trigger_r: 0.75,
+    runner_drawdown_from_peak_r: 0.25,
+  };
+
+  it('Test 1a: cooldown enforced — second action within cooldown is blocked', () => {
+    // Position with enough drawdown to pass runner protection
+    // entry=24200, stop=24160 (40pts risk), last_checked=24210 (cur_r=0.25)
+    // mfe=40 (peak_r=1.0), drawdown = 1.0 - 0.25 = 0.75 > 0.25 threshold
+    const pos = makePosition({
+      entry_time_unix: Date.now() - 120_000,
+      max_favorable_excursion: 40,
+      last_checked_price: 24210,
+    });
+    const exitResponse = makeResponse({ action: 'EXIT_ALL', action_confidence: 0.95 });
+    // First call — no prior action timestamp
+    const first = evaluateMlGate(exitResponse, cfg, pos, 100, null);
+    expect(first.approved).toBe(true);
+
+    // Second call — within cooldown window (5s ago)
+    const recentTimestamp = Date.now() - 5_000;
+    const second = evaluateMlGate(exitResponse, cfg, pos, 100, recentTimestamp);
+    expect(second.approved).toBe(false);
+    const cooldownCheck = second.checks.find(c => c.name === 'action_cooldown');
+    expect(cooldownCheck).toBeDefined();
+    expect(cooldownCheck!.passed).toBe(false);
+  });
+
+  it('Test 1c: invalid_risk_geometry blocks when entry_price == stop_initial', () => {
+    const pos = makePosition({
+      entry_price: 24200,
+      stop_initial: 24200, // zero risk
+      entry_time_unix: Date.now() - 120_000,
+    });
+    const response = makeResponse({ action: 'EXIT_ALL', action_confidence: 0.95 });
+    const result = evaluateMlGate(response, cfg, pos, 100);
+    expect(result.approved).toBe(false);
+    expect(result.rejection_reason).toBe('invalid_risk_geometry');
+  });
+
+  it('Test 2: min_hold blocks instant exit (age_sec ~3)', () => {
+    const pos = makePosition({ entry_time_unix: Date.now() - 3_000 });
+    const response = makeResponse({ action: 'EXIT_ALL', action_confidence: 0.95 });
+    const result = evaluateMlGate(response, cfg, pos, 100);
+    expect(result.approved).toBe(false);
+    const holdCheck = result.checks.find(c => c.name === 'min_hold_time');
+    expect(holdCheck).toBeDefined();
+    expect(holdCheck!.passed).toBe(false);
+  });
+
+  it('Test 3: early_green_trade block (age=18s, cur_r=+0.14)', () => {
+    // Position 18s old with +0.14R unrealized
+    const entryPrice = 24200;
+    const stopInitial = 24160; // 40pts risk
+    // For +0.14R: pnl_pts = 0.14 * 40 = 5.6, so price = 24205.6
+    const curPrice = 24205.6;
+    const pos = makePosition({
+      entry_price: entryPrice,
+      stop_initial: stopInitial,
+      entry_time_unix: Date.now() - 18_000,
+      last_checked_price: curPrice,
+    });
+    const response = makeResponse({ action: 'EXIT_ALL', action_confidence: 0.95 });
+    const result = evaluateMlGate(response, cfg, pos, 100);
+    expect(result.approved).toBe(false);
+    const greenCheck = result.checks.find(c => c.name === 'early_green_block');
+    expect(greenCheck).toBeDefined();
+    expect(greenCheck!.passed).toBe(false);
+  });
+
+  it('Test 4: runner_protection (cur_r=+1.10, peak_r=+1.22, dd=0.12)', () => {
+    const entryPrice = 24200;
+    const stopInitial = 24160; // 40pts risk
+    // cur_r = +1.10: pnl_pts = 1.10 * 40 = 44, price = 24244
+    // peak_r = +1.22: mfe_pts = 1.22 * 40 = 48.8
+    const curPrice = 24244;
+    const pos = makePosition({
+      entry_price: entryPrice,
+      stop_initial: stopInitial,
+      entry_time_unix: Date.now() - 120_000,
+      last_checked_price: curPrice,
+      max_favorable_excursion: 48.8,
+    });
+    const response = makeResponse({ action: 'EXIT_ALL', action_confidence: 0.95 });
+    const result = evaluateMlGate(response, cfg, pos, 100);
+    expect(result.approved).toBe(false);
+    const runnerCheck = result.checks.find(c => c.name === 'runner_protection');
+    expect(runnerCheck).toBeDefined();
+    expect(runnerCheck!.passed).toBe(false);
+  });
+
+  it('Test 8b: min_hold_reduce blocks EXIT_PARTIAL when too young', () => {
+    const pos = makePosition({ entry_time_unix: Date.now() - 5_000 });
+    const response = makeResponse({
+      action: 'EXIT_PARTIAL',
+      action_confidence: 0.95,
+      recommended_size_fraction: 0.5,
+    });
+    const result = evaluateMlGate(response, { ...cfg, enable_partial_exit: true }, pos, 100);
+    expect(result.approved).toBe(false);
+    const reduceCheck = result.checks.find(c => c.name === 'min_hold_reduce');
+    expect(reduceCheck).toBeDefined();
+    expect(reduceCheck!.passed).toBe(false);
+  });
+});
+
+// ─── 10. Claude Removal (re-confirmation) ────────────────────────────────────
 
 describe('Claude live management is removed', () => {
   const runnerSource = readFileSync('src/autotrade/runner.ts', 'utf8');

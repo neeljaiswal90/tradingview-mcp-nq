@@ -22,6 +22,56 @@ export interface MlManagementConfig {
   action_cooldown_seconds: number;
   /** Feature flag: enable EXIT_PARTIAL execution path. Default false. */
   enable_partial_exit: boolean;
+  /** Minimum seconds a position must be held before ML can issue EXIT_ALL. 0 = disabled. */
+  min_hold_seconds_before_ml_exit: number;
+
+  // ── Runtime inference/gating config ───────────────────────────────────
+  // Used by the live execution path (decideAction + execution gate).
+
+  /** Minimum seconds before ML can issue EXIT_PARTIAL / SCALE_OUT. */
+  min_hold_seconds_before_ml_reduce: number;
+  /** Use Platt-calibrated probabilities for threshold decisions. */
+  use_probability_calibration: boolean;
+  /** Path to calibration artifact (Platt params JSON). */
+  calibration_path?: string;
+  /** End of EARLY phase in seconds from entry. */
+  early_phase_end_seconds: number;
+  /** Minimum age (seconds) to qualify for RUNNER phase on time alone. */
+  runner_phase_min_seconds: number;
+  /** Minimum cur_r to qualify for RUNNER phase on R alone. */
+  runner_trigger_r: number;
+  /** EARLY phase: prob_hold below this → EXIT_ALL candidate. */
+  exit_threshold_early: number;
+  /** ACTIVE phase: prob_hold below this → EXIT_ALL candidate. */
+  exit_threshold_active: number;
+  /** RUNNER phase: prob_hold below this → EXIT_ALL candidate. */
+  exit_threshold_runner: number;
+  /** EARLY phase: minimum confidence to execute exit. */
+  min_confidence_to_exit_early: number;
+  /** ACTIVE phase: minimum confidence to execute exit. */
+  min_confidence_to_exit_active: number;
+  /** RUNNER phase: minimum confidence to execute exit. */
+  min_confidence_to_exit_runner: number;
+  /** EARLY phase: block EXIT_ALL when cur_r > this (protect tiny green trades). */
+  early_green_trade_exit_block_r: number;
+  /** RUNNER phase: block EXIT_ALL when drawdown_from_peak < this. */
+  runner_drawdown_from_peak_r: number;
+
+  // ── Training/labeling config ──────────────────────────────────────────
+  // Used ONLY by offline training/labeling scripts, NOT by the live path.
+
+  /** Minimum seconds of trade development before a row is training-eligible. */
+  train_min_development_seconds: number;
+  /** Margin above cur_r for counterfactual hold to count as "better". */
+  hold_label_margin_r: number;
+  /** Max forward horizon (seconds) for counterfactual hold simulation. */
+  counterfactual_max_horizon_seconds: number;
+  /** Exclude training rows that occur after any ML action in the same trade. */
+  exclude_rows_after_any_ml_action: boolean;
+  /** Exclude training rows where a future ML exit/reduce occurs before close. */
+  exclude_rows_with_future_ml_exit: boolean;
+  /** Minimum seconds between sampled decision rows in the same trade. */
+  decision_stride_seconds: number;
 }
 
 export const DEFAULT_ML_CONFIG: MlManagementConfig = {
@@ -34,8 +84,30 @@ export const DEFAULT_ML_CONFIG: MlManagementConfig = {
   min_confidence_partial: 0.55,
   min_confidence_stop_move: 0.5,
   max_quote_age_ms: 5000,
-  action_cooldown_seconds: 0,
+  action_cooldown_seconds: 20,
   enable_partial_exit: false,
+  min_hold_seconds_before_ml_exit: 15,
+  // Runtime inference/gating
+  min_hold_seconds_before_ml_reduce: 10,
+  use_probability_calibration: true,
+  early_phase_end_seconds: 30,
+  runner_phase_min_seconds: 60,
+  runner_trigger_r: 0.75,
+  exit_threshold_early: 0.06,
+  exit_threshold_active: 0.18,
+  exit_threshold_runner: 0.10,
+  min_confidence_to_exit_early: 0.85,
+  min_confidence_to_exit_active: 0.75,
+  min_confidence_to_exit_runner: 0.85,
+  early_green_trade_exit_block_r: 0.10,
+  runner_drawdown_from_peak_r: 0.25,
+  // Training/labeling (offline only)
+  train_min_development_seconds: 15,
+  hold_label_margin_r: 0.05,
+  counterfactual_max_horizon_seconds: 120,
+  exclude_rows_after_any_ml_action: true,
+  exclude_rows_with_future_ml_exit: false,
+  decision_stride_seconds: 2,
 };
 
 // ─── ML Service Request/Response ─────────────────────────────────────────────
@@ -182,6 +254,37 @@ export interface MlDecision {
   /** Reason for fallback (missing_required_fields | stale_bbo | etc). */
   fallback_reason: string | null;
 }
+
+// ─── Phase-Aware Decision Types ─────────────────────────────────────────────
+
+/** Development phase for live policy decisions and training labels. */
+export type DevelopmentPhase = 'EARLY' | 'ACTIVE' | 'RUNNER';
+
+/**
+ * Input to decideAction(). Phase is derived internally from age_sec, cur_r,
+ * and config thresholds — no development_phase field to avoid competing
+ * phase definitions between live policy and training labels.
+ */
+export type DecideActionInput = {
+  prob_hold_raw: number;
+  /** Only populated when the service explicitly returns a calibrated value. */
+  prob_hold_cal?: number;
+  confidence: number;
+  age_sec: number;
+  cur_r: number;
+  peak_r: number;
+  drawdown_from_peak_r: number;
+  quote_age_ms: number;
+};
+
+export type DecideActionResult = {
+  action: 'HOLD' | 'EXIT_ALL';
+  reason: string;
+  /** Computed phase, for logging/observability only. */
+  phase: DevelopmentPhase;
+  threshold_used?: number;
+  prob_hold_used?: number;
+};
 
 /**
  * Result from getMlDecision — includes the decision, the exact serialized
