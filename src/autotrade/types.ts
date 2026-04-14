@@ -18,19 +18,11 @@ export type MarketRegime =
 
 export type Direction = 'long' | 'short' | 'none';
 
-export type SetupType =
-  | 'trend_pullback_long'
-  | 'trend_pullback_short'
-  | 'breakout_retest_long'
-  | 'breakdown_retest_short'
-  | 'momentum_continuation'
-  // ── NQ-oriented setup families ─────────────────────────────────────────
-  | 'opening_drive_continuation_long'
-  | 'opening_drive_continuation_short'
-  | 'or_retest_continuation_long'
-  | 'or_retest_continuation_short'
-  | 'failed_or_break_short'
-  | 'failed_or_break_long';
+// SetupType is the canonical union of strategy IDs. It is derived from
+// src/shared/strategy-ids.ts so the type layer stays free of runtime
+// dependencies on the registry. See Phase 2 of the scoring refactor.
+export type { SetupType } from '../shared/strategy-ids.js';
+import type { SetupType } from '../shared/strategy-ids.js';
 
 // ── Setup Families (direction-agnostic grouping for management profiles) ────
 export type SetupFamily =
@@ -41,6 +33,50 @@ export type SetupFamily =
   | 'failed_or_break'
   | 'momentum_continuation'
   | 'default';
+
+export type DecisionStage =
+  | 'strategy_no_candidate'
+  | 'strategy_hard_gates'
+  | 'strategy_score_gate'
+  | 'cooldown_gate'
+  | 'extension_gate'
+  | 'position_open_gate'
+  | 'entry_ml_gate'
+  | 'risk_gate'
+  | 'executed';
+
+export interface ReversalPackageTelemetry {
+  reversal_package_suppressed_by_warmup?: boolean;
+  reversal_package_suppressed_reason?: string | null;
+  reversal_package_attributable?: boolean;
+  reversal_package_attribution_flags?: string[];
+}
+
+export interface CandidateGeneratorDiagnostic {
+  setup_type: SetupType;
+  setup_family: SetupFamily;
+  accepted: boolean;
+  rejection_reason_primary: string | null;
+  rejection_reason_all: string[];
+}
+
+export interface TrendFreshnessContext {
+  vwap_distance_session_atr: number | null;
+  above_vwap_allowed: boolean;
+  reversal_bundle_name: string | null;
+  reversal_bundle_passed: boolean;
+  bars_since_flip: number | null;
+  structure_deterioration_passed: boolean;
+  ema_formation_passed: boolean;
+  regime_filter_passed: boolean;
+}
+
+export interface TrendFreshnessResult {
+  fresh: boolean;
+  reason: string;
+  soft_penalty: number;
+  context: TrendFreshnessContext;
+}
 
 // ── Management Profiles (ATR-relative trade management templates) ───────────
 
@@ -73,6 +109,38 @@ export interface ManagementProfile {
   time_stop_minutes: number;
   time_stop_max_r_pre_t1: number;
   time_stop_max_r_post_t1: number;
+  // ── Pre-T1 failure-to-launch exit (Dead-Trade Guard) ───────────────────
+  // All optional: when unset, resolution defaults to the feature being OFF.
+  // Units: all *_minutes fields in minutes, all *_rate_* fields in R/min.
+  pre_t1_failure_exit_enabled?: boolean;
+  pre_t1_failure_shadow_mode?: boolean;
+  /** τ_decay: decayRate is forced to 0 until (t − t_peak) ≥ this gap. */
+  pre_t1_failure_decay_min_gap_minutes?: number;
+  /** λ for netProgress = currentR − λ · maeR. */
+  pre_t1_failure_lambda_net?: number;
+  // Lane A — soft review (logs only, never flattens)
+  pre_t1_failure_soft_min_minutes?: number;
+  pre_t1_failure_soft_progress_rate_max?: number;
+  pre_t1_failure_soft_failure_ratio_min?: number;
+  // Lane B — empirical quantile cut (requires failure_exit_curves.json)
+  pre_t1_failure_hard_min_minutes?: number;
+  /** currentR cap = α · Q20_peak_win(t), with α in [0.3, 0.5] typically. */
+  pre_t1_failure_hard_current_r_alpha?: number;
+  /** Curve family key to query (defaults to management profile family name). */
+  pre_t1_failure_curves_key?: string;
+  /** Per-bucket minimum observation count; buckets below this are low-confidence. */
+  pre_t1_failure_min_n_per_bucket?: number;
+  // Lane C — emergency shape cut (runs without curves)
+  pre_t1_failure_emergency_min_minutes?: number;
+  /** maeR floor: prevents flat-chop false fires when failureRatio is unstable. */
+  pre_t1_failure_emergency_mae_r_floor?: number;
+  pre_t1_failure_emergency_failure_ratio_min?: number;
+  pre_t1_failure_emergency_peak_r_max?: number;
+  /** Optional decayRate gate (R/min), only enforced when state.decayRate > 0. */
+  pre_t1_failure_emergency_decay_rate_min?: number;
+  // Expectancy inputs (v2 hook; inert in v1 engine code)
+  /** c in EV formula: slippage + commissions + adverse execution cost (in R). */
+  pre_t1_failure_cost_r?: number;
 }
 
 /**
@@ -97,6 +165,31 @@ export interface ResolvedManagementParams {
   time_stop_minutes: number;
   time_stop_max_r_pre_t1: number;
   time_stop_max_r_post_t1: number;
+  // ── Pre-T1 failure-to-launch (Dead-Trade Guard) — concrete resolved values.
+  // Defaults are applied at resolveProfile(): when the profile does not set
+  // pre_t1_failure_exit_enabled, resolved value is `false` and the engine
+  // short-circuits before doing any state computation.
+  pre_t1_failure_exit_enabled: boolean;
+  pre_t1_failure_shadow_mode: boolean;
+  pre_t1_failure_decay_min_gap_minutes: number;
+  pre_t1_failure_lambda_net: number;
+  // Lane A
+  pre_t1_failure_soft_min_minutes: number;
+  pre_t1_failure_soft_progress_rate_max: number;
+  pre_t1_failure_soft_failure_ratio_min: number;
+  // Lane B
+  pre_t1_failure_hard_min_minutes: number;
+  pre_t1_failure_hard_current_r_alpha: number;
+  pre_t1_failure_curves_key: string;
+  pre_t1_failure_min_n_per_bucket: number;
+  // Lane C
+  pre_t1_failure_emergency_min_minutes: number;
+  pre_t1_failure_emergency_mae_r_floor: number;
+  pre_t1_failure_emergency_failure_ratio_min: number;
+  pre_t1_failure_emergency_peak_r_max: number;
+  pre_t1_failure_emergency_decay_rate_min: number;
+  // Expectancy hook
+  pre_t1_failure_cost_r: number;
 }
 
 export type ExitReason =
@@ -119,12 +212,18 @@ export type ExitReason =
   /** Final runner exit — the remaining position after PT1+PT2 partials. */
   | 'final_runner_exit'
   | 'time_stop'
-  | 'invalidation'
+  /** Pre-PT1 failure-to-launch exit (Dead-Trade Guard: hard or emergency lane). */
+  | 'failure_to_launch'
   /** ML management decided EXIT_ALL — full position closed by ML advisory. */
   | 'ml_exit_all'
   /** ML management decided EXIT_PARTIAL — partial reduction by ML advisory. */
   | 'ml_exit_partial'
-  | 'manual'
+  /** Target-position layer: partial reduce toward a lower q_target (V1a). */
+  | 'target_position_reduce'
+  /** Target-position layer: q_target hit 0 and flatten_on_zero_target was enabled. */
+  | 'target_position_flatten'
+  /** Target-position layer: proposed residual would be below min_residual_contracts. */
+  | 'target_position_residual_below_minimum'
   | 'daily_loss_limit'
   | 'session_end';
 
@@ -494,6 +593,102 @@ export interface MultiTfBias {
   alignment_score: number; // 0–4
 }
 
+// ─── Entry State Vector (Phase 1 of the quant trend-pullback refactor) ──────
+//
+// The EntryStateVector is the canonical frozen snapshot of the decision
+// state at signal-generation time. It is populated by
+// features/entry-state.ts, attached to CandidateSetup.entry_state_vector,
+// and later consumed by the expectancy engine and the historical labeler.
+//
+// Phase 1 populates the geometric + volatility fields only. The orderflow
+// fields (ofi_*, z_ofi_*, queue_imbalance_5, microprice_offset_pts) are
+// reserved for Phase 2 and ship as `null`. The LOB degradation matrix in
+// plan §4.4 is enforced in Phase 2; for Phase 1 every vector emits
+// `lob_state = 'missing'` and `ofi_reliability = 'unknown'`.
+//
+// Schema versioning (plan §4.6): any field add/remove/rename or any change
+// to how an existing field is computed or rounded MUST bump
+// ENTRY_STATE_VECTOR_SCHEMA_VERSION so frozen rows from different commits
+// are never silently merged.
+
+export const ENTRY_STATE_VECTOR_SCHEMA_VERSION = '0.1.0';
+
+/** LOB state classification from the §4.4 degradation matrix. */
+export type EntryStateLobState =
+  | 'missing'
+  | 'stale'
+  | 'misaligned'
+  | 'invalid'
+  | 'sparse'
+  | 'fresh';
+
+/** OFI reliability tag carried on the emitted vector. */
+export type EntryStateOfiReliability = 'full' | 'sparse' | 'unknown';
+
+export interface EntryStateVector {
+  /** Bumped per plan §4.6 whenever any field semantic changes. */
+  schema_version: string;
+  /** Anchor timestamp — must match snap.timestamp_unix that produced it. */
+  timestamp_unix: number;
+  direction: 'long' | 'short';
+  setup_type: SetupType;
+
+  // ── Volatility scales ────────────────────────────────────────────────
+  /** Blended volatility scale used for z-scoring and stop sizing. */
+  sigma_pts: number;
+  /** Raw 1m ATR_14 at signal time, passed through for diagnostics. */
+  micro_atr: number | null;
+  /** Room-scale ATR from existing three-family normalization. */
+  room_atr: number | null;
+  /** Session-scale ATR from existing three-family normalization. */
+  session_atr: number | null;
+
+  // ── Direction-aware geometric z-scores ───────────────────────────────
+  //
+  // Sign convention: for LONGS, z_ema9 = (price - ema9) / sigma_pts;
+  // for SHORTS the sign is flipped so that both directions share the
+  // same semantic: NEGATIVE = price has undercut EMA9 (past the pullback
+  // tag), POSITIVE = price is still on the "trend" side of EMA9.
+  //
+  // This is the minimum convention the symmetry property test relies on:
+  // mirrored price inputs produce mirrored z-scores on long and short.
+  z_ema9: number | null;
+  z_ema21: number | null;
+  z_vwap: number | null;
+
+  // ── Pullback structure (populated in Phase 3 rewrite) ────────────────
+  /** (price − pullback_low) / (impulse_high − pullback_low), long sign. */
+  pullback_ratio: number | null;
+  /** Bars since the last impulse swing that initiated this pullback. */
+  impulse_maturity_bars: number | null;
+
+  // ── Regime hook (plan §2 regime field on day one) ────────────────────
+  regime: MarketRegime | null;
+
+  // ── Orderflow (Phase 2 populates; Phase 1 emits null) ────────────────
+  ofi_10s: number | null;
+  ofi_30s: number | null;
+  z_ofi_10s: number | null;
+  z_ofi_30s: number | null;
+  /** Blended OFI score used as the third expectancy bucket dimension. */
+  z_ofi_blend: number | null;
+  queue_imbalance_5: number | null;
+  /** Microprice − mid, in points, direction-signed like z_ema9. */
+  microprice_offset_pts: number | null;
+
+  // ── LOB provenance (§4.4) ────────────────────────────────────────────
+  lob_state: EntryStateLobState;
+  ofi_reliability: EntryStateOfiReliability;
+
+  // ── Orderflow readiness (Phase 4) ───────────────────────────────────
+  /** True when the rolling OFI buffer has enough samples for z-scores. */
+  orderflow_buffer_ready?: boolean;
+  /** Number of OFI window samples currently in the rolling buffer. */
+  orderflow_buffer_sample_count?: number;
+  /** True when the buffer was restored from disk (shutdown persist or LOB replay). */
+  orderflow_buffer_restored?: boolean;
+}
+
 export interface CandidateSetup {
   direction: Direction;
   setup_type: SetupType;
@@ -525,6 +720,153 @@ export interface CandidateSetup {
   target_repair_applied: boolean;
   /** Human-readable description of any repairs made. Empty string if none. */
   target_repair_reason: string;
+  /** Optional HTF zone evaluation attached during candidate scoring. */
+  htfEval?: HtfSetupEvaluation | null;
+  freshness?: TrendFreshnessResult | null;
+  /**
+   * Frozen entry state vector from features/entry-state.ts, attached at
+   * signal-generation time by trend_pullback_long/short (Phase 1). Null
+   * for strategies that have not yet been wired into the quant pipeline
+   * — management and telemetry code must handle null gracefully.
+   */
+  entry_state_vector?: EntryStateVector | null;
+
+  // ── Parallel quant reward contract (Phase 4 of the trend-pullback refactor) ──
+  //
+  // Populated for trend_pullback_long/short candidates when sigma_pts is
+  // computable. These fields NEVER overwrite the legacy `stop` / `target_*`
+  // / `rr_*` / `risk_pts` fields during Stages A and B — they live in
+  // parallel until a Stage C single-assignment-point copy (plan §3).
+  //
+  // Nulls mean "quant pipeline did not produce a value" — either because
+  // the state vector was unavailable or the strategy isn't part of the
+  // Phase 4 rollout. Downstream consumers must handle nulls gracefully.
+  /** Quant initial stop from features/initial-risk.ts (tighter-of-both). */
+  stop_quant?: number | null;
+  /** Cold-start target_1 — entry ± 0.7·sigma_pts. */
+  target_1_quant?: number | null;
+  /** Cold-start target_2 — entry ± 1.4·sigma_pts. */
+  target_2_quant?: number | null;
+  /** |entry − stop_quant|, computed AFTER tick rounding. */
+  risk_pts_quant?: number | null;
+  /** |target_1_quant − entry| / risk_pts_quant, computed AFTER tick rounding. */
+  rr_t1_quant?: number | null;
+  /** |target_2_quant − entry| / risk_pts_quant, computed AFTER tick rounding. */
+  rr_t2_quant?: number | null;
+  /**
+   * Source tag for the quant expectancy estimate:
+   *   - `'cold_start'`: no bucket table available — Phase 4 only.
+   *   - `'full'` / `'backoff_1d'` / `'backoff_2d'` / `'side_prior'`:
+   *     Phase 6 expectancy engine hierarchical fallback levels.
+   *
+   * Note on `target_*_quant` provenance: Phase 4's HARD RULE says
+   * empirical bucket-conditioned targets are forbidden until a plan
+   * update. So even when this field is `'full'`, the target_*_quant
+   * values still come from the 0.7σ / 1.4σ cold-start formulas.
+   * bucket_source_quant describes ONLY the source of the expectancy
+   * estimate, not the targets.
+   */
+  bucket_source_quant?:
+    | 'cold_start'
+    | 'full'
+    | 'backoff_1d'
+    | 'backoff_2d'
+    | 'side_prior'
+    | null;
+
+  /**
+   * Diagnostic tag describing the bucket lookup outcome. Always populated
+   * when quant_entry is active. Used by the Stage A evaluator debug export.
+   */
+  bucket_lookup_status?:
+    | 'full_match'
+    | 'backoff_1d'
+    | 'backoff_2d'
+    | 'side_prior'
+    | 'cold_start_no_match'
+    | null;
+
+  // ── Phase 6 quant expectancy contract ────────────────────────────────
+  //
+  // Populated by the expectancy engine (features/expectancy-engine.ts)
+  // when a bucket table is loaded. `expected_r_30s_quant` is the
+  // POST-COST expectancy at the 30-second horizon per plan §10/11:
+  //   E[R_post] = E[R_raw] − (fees + slippage) / risk_pts_quant
+  // `win_prob_30s_quant` is the raw (no cost subtraction) empirical
+  // fraction of samples in the bucket with positive forward return.
+  //
+  // Nulls mean "bucket table unavailable or state vector missing".
+  // `quality_band_quant` is derived from expected_r / win_prob and is
+  // one of 'A' | 'B' | 'C' | 'D' — 'D' covers both cold buckets and
+  // sub-threshold empirical buckets.
+  /** Post-cost expected R at 30s from the expectancy engine. */
+  expected_r_30s_quant?: number | null;
+  /** Empirical win probability at 30s for the resolved bucket. */
+  win_prob_30s_quant?: number | null;
+  /** Quality band derived from expectancy + win probability. */
+  quality_band_quant?: 'A' | 'B' | 'C' | 'D' | null;
+  /** Canonical bucket id string (serialized 3D or fallback key). */
+  bucket_id_quant?: string | null;
+  /** Number of historical samples backing the resolved bucket. */
+  bucket_sample_count_quant?: number | null;
+  /**
+   * Shadow telemetry tag written by the Phase 6 expectancy engine and
+   * the Phase 8 `deriveExpectancyVerdict` helper. Phase 6 only POPULATES
+   * this — it does not block execution. Phase 7 Stage A treats it as
+   * pure telemetry; Phase 7 Stage B AND-gate consumes it via
+   * `combineVerdicts` when `hybrid_gate = true`.
+   * Values:
+   *   - null when the candidate would pass (or when the engine is a no-op)
+   *   - 'rejected_by_bucket_sparsity' when the terminal fallback is
+   *     side_prior AND expected_r_30s_quant < side_prior_min_expected_r
+   *   - 'rejected_by_expectancy_below_threshold' when a non-side-prior
+   *     tier (full / backoff_1d / backoff_2d) resolves but the post-cost
+   *     expectancy is below quant_entry.expectancy.min_expected_r_primary
+   *     (Phase 8 Stage A operationalization — plan §11)
+   *   - 'rejected_by_missing_cost_config' when ContractSpec fees /
+   *     slippage are unavailable (fail-closed cost term)
+   */
+  quant_shadow_reject_reason?:
+    | null
+    | 'rejected_by_bucket_sparsity'
+    | 'rejected_by_expectancy_below_threshold'
+    | 'rejected_by_missing_cost_config';
+
+  // ── Phase 7 telemetry ─────────────────────────────────────────────────
+  //
+  // Populated only when `quant_entry.enabled = true` (plan §5 Phase 7).
+  // When the flag is off, both fields remain undefined and the logs
+  // are diff-free relative to the post-Phase-6 baseline.
+  /**
+   * Reproducible hash over the canonically-serialized entry state
+   * vector (plan §4.6 / §15). Used to link shadow and live rows to the
+   * exact feature bundle that drove the decision across replay runs.
+   */
+  entry_state_vector_hash?: string | null;
+  /**
+   * Combined Phase 7 shadow decision — per-gate verdicts + reasons +
+   * the overall AND-gate verdict that Stage B would produce. Phase 7
+   * only POPULATES this; Phase 7 Stage B gate consumes
+   * `shadow_decision.combined_verdict` when `hybrid_gate = true` to
+   * modify `signal.no_trade` / `signal.reason_for_skip` in runner.ts.
+   * Legacy `stop` / `target_*` / `rr_*` / `confidence` are never
+   * touched regardless of the verdict.
+   */
+  quant_shadow_decision?:
+    | import('./features/quant-shadow-decision.js').QuantShadowDecision
+    | null;
+  /**
+   * Number of completed 1m bars since the last bearish 1m SuperTrend flip,
+   * populated by setups that care about reversal timing (currently
+   * post_flip_first_pullback_short). Used by the shaped reversal-transition
+   * bonus in applyContextualScoreAdjustments(). Null/undefined when the
+   * setup does not track flip timing.
+   */
+  bars_since_flip?: number | null;
+  generator_diagnostic?: CandidateGeneratorDiagnostic | null;
+  rejections_by_setup?: Record<string, string[]>;
+  top_rejection_reason?: string | null;
+  count_rejections_this_cycle?: number;
 }
 
 // ─── Dual-Direction Confluence Model ────────────────────────────────────────
@@ -627,6 +969,23 @@ export interface ScoringWeights {
   cvd_divergence: number;
   /** Bonus when CVD confirms trade direction. */
   cvd_aligned: number;
+  /** Narrow ETH short reversal relief when HTF conflict is transitional, not disqualifying. */
+  htf_conflict_transition_relief: number;
+  /** Small contextual bonus for the first ETH reversal pullback after a fresh flip. */
+  reversal_transition_bonus: number;
+  /** Maximum total positive uplift from contextual reversal adjustments. */
+  contextual_positive_cap: number;
+  /**
+   * Centre of the Gaussian shaping the reversal_transition_bonus by
+   * bars_since_flip. The full `reversal_transition_bonus` is awarded at
+   * exactly this many bars; fewer or more bars produce a smaller bonus.
+   */
+  reversal_bonus_peak_bars_since_flip?: number;
+  /**
+   * Standard deviation (in bars) of the Gaussian shaping the
+   * reversal_transition_bonus. Larger σ → gentler rolloff.
+   */
+  reversal_bonus_sigma_bars?: number;
 }
 
 /**
@@ -650,6 +1009,11 @@ export interface ScoreBreakdown {
   adx_trend_strength: number;
   ttm_squeeze: number;
   cvd_alignment: number;
+  pre_context_total?: number;
+  vwap_soft_penalty?: number;
+  htf_conflict_relief?: number;
+  reversal_transition_bonus?: number;
+  contextual_positive_cap_applied?: number;
   total: number;
   factors: string[];
   /**
@@ -671,12 +1035,40 @@ export interface DirectionalCandidate {
   scoreBreakdown: ScoreBreakdown;
   hardGateFailures: string[];
   passedHardGates: boolean;
+  score_pre_context?: number;
+  score_post_context?: number;
+  min_score_threshold?: number;
+  score_passed?: boolean;
+  vwap_soft_penalty?: number;
+  htf_conflict_relief?: number;
+  reversal_transition_bonus?: number;
+  contextual_positive_cap_applied?: number;
+  layered_pre_context_total?: number | null;
+  layered_post_context_total?: number | null;
   /** Dynamic reward plan built at candidate evaluation time (null when disabled). */
   rewardPlan: import('./features/dynamic-reward-plan.js').DynamicRewardPlan | null;
   /** Layered score result (populated when layered_scoring shadow_log or enabled is true). */
   layered?: import('./features/layered-scoring.js').LayeredScoreResult;
   /** HTF zone evaluation for this candidate (null when study absent or HTF disabled). */
   htfEval?: HtfSetupEvaluation | null;
+  generatorDiagnostics?: CandidateGeneratorDiagnostic[];
+  rejection_reason_primary?: string | null;
+  rejection_reason_all?: string[];
+  rejections_by_setup?: Record<string, string[]>;
+  top_rejection_reason?: string | null;
+  count_rejections_this_cycle?: number;
+  decision_stage?: DecisionStage;
+  decision_reason_primary?: string | null;
+  decision_reason_all?: string[];
+  cooldown_passed?: boolean;
+  extension_passed?: boolean;
+  position_open_blocked?: boolean;
+  execution_allowed_final?: boolean;
+  selection_only?: boolean;
+  reversal_package_suppressed_by_warmup?: boolean;
+  reversal_package_suppressed_reason?: string | null;
+  reversal_package_attributable?: boolean;
+  reversal_package_attribution_flags?: string[];
 }
 
 /**
@@ -688,6 +1080,7 @@ export type DualDirectionDecision =
   | 'wait_no_candidates'
   | 'wait_no_gates_passed'
   | 'wait_below_min_score'
+  | 'wait_below_execution_floor'
   | 'wait_insufficient_margin'
   | 'wait_both_weak'
   | 'wait_cooldown'
@@ -720,6 +1113,24 @@ export interface DualDirectionResult {
   tradeAllowed: boolean;
   skipReasons: string[];
   mlFeatures: SignalContextSnapshot;
+  score_passed?: boolean;
+  cooldown_passed?: boolean;
+  extension_passed?: boolean;
+  position_open_blocked?: boolean;
+  execution_allowed_final?: boolean;
+  /**
+   * True when the candidate passed its session-specific selection floor but
+   * failed the global `dual_min_score` execution floor. Such candidates are
+   * forwarded for logging/replay but NOT executed.
+   */
+  selection_only?: boolean;
+  decision_stage?: DecisionStage;
+  decision_reason_primary?: string | null;
+  decision_reason_all?: string[];
+  rejections_by_setup?: Record<string, string[]>;
+  top_rejection_reason?: string | null;
+  count_rejections_this_cycle?: number;
+  candidate_diagnostics?: CandidateGeneratorDiagnostic[];
   /** Whether upstream dynamic RR was active for this signal cycle. */
   dynamicRrUpstreamActive: boolean;
   /** Source of the upstream dynamic RR config: 'default' | 'config' | 'argument' | 'explicit_disable'. */
@@ -750,6 +1161,28 @@ export interface Signal {
   execution_occurred: boolean;
   no_trade: boolean;
   near_miss_filters_failed: string[];
+  score_passed?: boolean;
+  cooldown_passed?: boolean;
+  extension_passed?: boolean;
+  position_open_blocked?: boolean;
+  execution_allowed_final?: boolean;
+  selection_only?: boolean;
+  decision_stage?: DecisionStage;
+  decision_reason_primary?: string | null;
+  decision_reason_all?: string[];
+  rejections_by_setup?: Record<string, string[]>;
+  top_rejection_reason?: string | null;
+  count_rejections_this_cycle?: number;
+  score_pre_context?: number | null;
+  score_post_context?: number | null;
+  vwap_soft_penalty?: number | null;
+  htf_conflict_relief?: number | null;
+  reversal_transition_bonus?: number | null;
+  contextual_positive_cap_applied?: number | null;
+  reversal_package_suppressed_by_warmup?: boolean;
+  reversal_package_suppressed_reason?: string | null;
+  reversal_package_attributable?: boolean;
+  reversal_package_attribution_flags?: string[];
   // ML features
   ml_features: SignalContextSnapshot;
   // filled after trade closes
@@ -840,7 +1273,14 @@ export type ManagementEventType =
   | 'pt1_trigger' | 'pt2_trigger'
   | 'pre_t1_be_move' | 'pre_t1_trail_activation'
   | 'post_pt1_trail_activation' | 'trail_ratchet'
-  | 'final_runner_exit';
+  | 'final_runner_exit'
+  // ── Dead-Trade Guard (pre-PT1 failure-to-launch) ──────────────────────
+  /** Lane A: soft review — logs weak progress; never flattens. */
+  | 'failure_review_soft'
+  /** Lane B/C: live flatten via failure-to-launch. */
+  | 'failure_exit'
+  /** Lane B/C: shadow-mode hypothetical flatten (no real exit). */
+  | 'failure_exit_shadow';
 
 export interface ManagementEvent {
   row_type: 'management_event';
@@ -865,6 +1305,22 @@ export interface ManagementEvent {
   trail_distance_pts: number | null;
   pt1_trigger_pts: number | null;
   pt2_trigger_pts: number | null;
+  // ── Dead-Trade Guard snapshot (set on failure_review_soft / failure_exit /
+  //    failure_exit_shadow events only; null for all other event types) ────
+  failure_lane?: 'soft' | 'hard' | 'emergency';
+  failure_reason?: string | null;
+  hold_minutes_at_event?: number;
+  current_r_at_event?: number;
+  peak_r_at_event?: number;
+  mae_r_at_event?: number;
+  failure_ratio_at_event?: number;
+  progress_rate_at_event?: number;
+  recovery_gap_at_event?: number;
+  decay_rate_at_event?: number;
+  /** Interpolated Q20_peak_win(t) at event time, or null if curve unavailable. */
+  q20_peak_at_event?: number | null;
+  /** Interpolated Q80_mae_win(t) at event time, or null if curve unavailable. */
+  q80_mae_at_event?: number | null;
 }
 
 export interface Position {
@@ -943,6 +1399,49 @@ export interface Position {
   mae_at_pt1_trigger: number;
   /** Continuously tracked peak R before any partial exit fires. */
   peak_r_before_first_partial: number;
+  // ── Dead-Trade Guard telemetry (pre-PT1 failure-to-launch) ─────────────
+  // All times in minutes; all rates in R/min. Updated every evaluation cycle.
+  /** Minutes since entry at which currentR first became ≥ 0. Null until reached. */
+  time_to_first_positive_r_minutes: number | null;
+  /** Minutes since entry at which peak_r_before_first_partial was last updated. */
+  t_peak_r_minutes: number | null;
+  /** Minutes since entry at which peak was first observed (frozen after first peak). */
+  time_to_peak_r_before_first_partial_minutes: number | null;
+  /** MAE expressed in R (computed each cycle pre-partial; last-seen value). */
+  mae_r_before_first_partial: number;
+  /** Last-computed progressRate (R/min) from the failure-exit state vector. */
+  last_progress_rate_r_per_min: number;
+  /** Last-computed drawdownRate (R/min). */
+  last_drawdown_rate_r_per_min: number;
+  /** Last-computed failureRatio = (maeR + ε) / (peakR + ε). */
+  last_failure_ratio: number;
+  /** Last-computed netProgress = currentR − λ · maeR. */
+  last_net_progress: number;
+  /** Last-computed efficiency = peakR / (maeR + ε). */
+  last_efficiency: number;
+  /** Last-computed recoveryGap = peakR − currentR. */
+  last_recovery_gap: number;
+  /** Last-computed decayRate (R/min since peak; 0 if gating condition not met). */
+  last_decay_rate_r_per_min: number;
+  // ── Dead-Trade Guard per-lane single-fire latches ─────────────────────
+  /** Lane A fired at least once (soft review was emitted). */
+  failure_review_soft_emitted: boolean;
+  /** Lane B fired at least once (shadow or live). */
+  failure_exit_hard_fired: boolean;
+  /** Lane C fired at least once (shadow or live). */
+  failure_exit_emergency_fired: boolean;
+  /**
+   * Lane that caused the LIVE flatten, or 'none' if no live flatten occurred.
+   * Soft is deliberately excluded: soft never flattens, so it is not a valid
+   * value here (see plan §"same-cycle precedence").
+   */
+  failure_exit_active_lane: 'none' | 'hard' | 'emergency';
+  /** Reason string from the first non-soft fire (shadow or live), or null. */
+  failure_exit_reason: string | null;
+  /** Minutes since entry at the first non-soft fire, or null. */
+  failure_exit_trigger_time_minutes: number | null;
+  /** True if ANY failure-exit fire was shadow-only (never flattened live). */
+  failure_exit_shadow_only: boolean;
   /** Management variant label for A/B comparison. */
   management_variant?: string;
 }
@@ -1076,6 +1575,31 @@ export interface TradeRecord {
   peak_unrealized_r_before_first_partial?: number | null;
   /** Management variant label for A/B comparison (e.g., 'baseline_tight_exit', 'conservative_wider_exit'). */
   management_variant?: string | null;
+  // ── Dead-Trade Guard telemetry (pre-PT1 failure-to-launch) ───────────
+  // Null for trades that exited before/without the feature being enabled.
+  // Units: all *_minutes fields in minutes; all *_rate_* fields in R/min.
+  time_to_first_positive_r_minutes?: number | null;
+  time_to_peak_r_before_first_partial_minutes?: number | null;
+  mae_r_before_first_partial?: number | null;
+  last_progress_rate_r_per_min?: number | null;
+  last_drawdown_rate_r_per_min?: number | null;
+  last_failure_ratio?: number | null;
+  last_net_progress?: number | null;
+  last_efficiency?: number | null;
+  last_recovery_gap?: number | null;
+  last_decay_rate_r_per_min?: number | null;
+  // Per-lane single-fire latches (booleans; true if ever fired on this trade)
+  failure_review_soft_emitted?: boolean | null;
+  failure_exit_hard_fired?: boolean | null;
+  failure_exit_emergency_fired?: boolean | null;
+  /** Lane that caused the LIVE flatten ('none' | 'hard' | 'emergency'). */
+  failure_exit_active_lane?: 'none' | 'hard' | 'emergency' | null;
+  /** Reason string from the first non-soft fire. */
+  failure_exit_reason?: string | null;
+  /** Minutes since entry at the first non-soft fire. */
+  failure_exit_trigger_time_minutes?: number | null;
+  /** True if ANY fire was shadow-only (never flattened live). */
+  failure_exit_shadow_only?: boolean | null;
 }
 
 // ─── Session ─────────────────────────────────────────────────────────────────
@@ -1105,6 +1629,37 @@ export interface SessionRecord {
   recovery_action?: string | null;
 }
 
+export interface DirectionalFreshnessConfig {
+  enabled: boolean;
+  long_vwap_mode: 'hard' | 'soft';
+  short_vwap_mode: 'hard' | 'soft';
+  short_above_vwap_allowance_session_atr: number;
+  short_above_vwap_penalty: number;
+  require_5m_structure: boolean;
+  require_supertrend_or_ema21_exception: boolean;
+  /**
+   * Sigmoid midpoint (in session-ATR units) for the shaped short-above-VWAP
+   * penalty. At z = midpoint the penalty is ≈ −penalty/2. Defaults to 0.20.
+   */
+  short_above_vwap_penalty_midpoint_atr?: number;
+  /**
+   * Sigmoid slope width (in session-ATR units) — larger values give a gentler
+   * ramp, smaller values sharpen the transition. Defaults to 0.08.
+   */
+  short_above_vwap_penalty_slope_atr?: number;
+}
+
+export interface SessionScoreOverrides {
+  ETH?: {
+    short?: Partial<Record<SetupType, number>>;
+    long?: Partial<Record<SetupType, number>>;
+  };
+  RTH?: {
+    short?: Partial<Record<SetupType, number>>;
+    long?: Partial<Record<SetupType, number>>;
+  };
+}
+
 // ─── Indicator Config ────────────────────────────────────────────────────────
 
 export interface IndicatorConfig {
@@ -1128,7 +1683,6 @@ export interface IndicatorConfig {
   // Risk controls
   max_risk_per_trade_pct: number;
   max_daily_loss_pct: number;
-  max_consecutive_losses: number;
   account_equity: number;
   time_stop_minutes: number;
   /**
@@ -1223,6 +1777,45 @@ export interface IndicatorConfig {
    * a trade was closed. Requires at least 1 bar of separation.
    */
   no_same_bar_reversal: boolean;
+  /** Minutes of historical bars to reconstruct before live cycles resume after a dirty restart. */
+  startup_backfill_minutes?: number;
+  /** Explicit cycle-stall threshold in milliseconds. */
+  cycle_stall_threshold_ms?: number;
+  /** CUSUM reference value k (higher = harder to trip). */
+  cycle_cusum_k?: number;
+  /** CUSUM trip threshold h on S+. */
+  cycle_cusum_h?: number;
+  /** Samples required to build the CUSUM baseline before evaluation starts. */
+  cycle_cusum_baseline_samples?: number;
+  /** Enables the ETH first-pullback reversal short setup. */
+  enable_post_flip_first_pullback_short?: boolean;
+  /**
+   * Maximum distance (in session ATR units) from the EMA9/21 cluster high
+   * allowed for the post-flip-first-pullback retest gate. Controls how close
+   * price must be to the cluster before a pullback entry is allowed. Default
+   * 0.20 (tightened from legacy max(25 pts, 0.75 × ATR)).
+   */
+  post_flip_first_pullback_short_max_retest_atr?: number;
+  /** Direction-aware freshness rules for above-VWAP handling. */
+  directional_freshness?: DirectionalFreshnessConfig;
+  /**
+   * Legacy: session/direction/setup-specific selection-floor overrides.
+   * Kept for backwards compatibility — NEW code should use
+   * `session_selection_floor_overrides` instead. Entries here are treated
+   * as a lower-priority fallback to that new key.
+   */
+  session_score_overrides?: SessionScoreOverrides;
+  /**
+   * Session/direction/setup-specific SELECTION floor overrides.
+   *
+   * A candidate whose final score is below the global `dual_min_score`
+   * (execution floor) but at or above this per-setup selection floor will
+   * still be logged/forwarded for replay + observability — but its decision
+   * is demoted to `wait_below_execution_floor` so it is NOT executed. This
+   * makes near-miss candidates visible in replay metrics without relaxing
+   * live trading discipline.
+   */
+  session_selection_floor_overrides?: SessionScoreOverrides;
   // ── In-position quote freshness ──────────────────────────────────────────
   /**
    * Max age (ms) of a quote before onMonitor refuses to act on it.
@@ -1234,11 +1827,6 @@ export interface IndicatorConfig {
    * Default: 1000ms — must stay well under in_position_monitor_seconds.
    */
   quote_poll_timeout_ms?: number;
-  /**
-   * When true: if getQuote() fails or times out, fall back to lastSnap.price
-   * rather than skipping the monitor tick. Default: false (skip on failure).
-   */
-  enable_stale_quote_fallback?: boolean;
   // ── Management profiles (setup-specific trade management) ─────────────
   /**
    * Per-setup-family management profiles with ATR-relative thresholds.
@@ -1258,6 +1846,8 @@ export interface IndicatorConfig {
   entry_ml?: import('./ml-entry/types.js').EntryMlConfig;
   /** Execution policy: microstructure-aware execution behavior. */
   execution_policy?: import('./execution-policy/types.js').ExecutionPolicyConfig;
+  /** Dynamic target-position model (V1a): q*(t) = floor(min(q_risk, q_softcap, q_hardcap)). */
+  position_target?: import('./target-position.js').PositionTargetConfig;
   /** Anti-chase / entry extension filters. */
   entry_extension_filters?: import('./features/extension.js').EntryExtensionFilterConfig;
   /** Microstructure score overlay: setup-aware LOB/MBO confidence adjustment. */
@@ -1270,11 +1860,21 @@ export interface IndicatorConfig {
   layered_scoring?: import('./features/layered-scoring.js').LayeredScoringConfig;
   /** HTF zone awareness: higher-timeframe support/resistance scoring and veto. */
   htf_zones?: HtfZonesConfig;
+  /**
+   * Quant trend-pullback config (Phase 7 of the refactor — plan §4.3/§5).
+   * Controls Stage A telemetry activation, Stage B hybrid-gate
+   * scaffolding, and every code constant from the Phase 1-6 rollout
+   * (stop multiplier, cold-start target multipliers, band thresholds,
+   * expectancy bucket rules, LOB degradation thresholds, orderflow
+   * windows). When absent, `DEFAULT_QUANT_ENTRY_CONFIG` is used — which
+   * disables all Phase 7 new-telemetry paths AND leaves every Phase 1-6
+   * code constant at its current value, so the system remains a pure
+   * no-op relative to the post-Phase-6 baseline.
+   */
+  quant_entry?: import('./features/quant-entry-config.js').QuantEntryConfig;
   // ── V2 Multi-Lane Engine ─────────────────────────────────────────────────
-  /** Enable the v2 multi-lane scheduler (default: false — uses legacy hybrid scheduler). */
-  runner_v2_enabled?: boolean;
-  /** When true with runner_v2_enabled, new lanes run observationally without owning exits. */
-  runner_v2_shadow_only?: boolean;
+  /** Canonical runtime control: 'shadow' | 'paper' | 'live'. Default: 'paper'. */
+  execution_mode?: 'shadow' | 'paper' | 'live';
   /** Per-lane timing overrides for the v2 scheduler. */
   lane_timing?: {
     hard_risk_interval_ms?: number;

@@ -1,5 +1,5 @@
 {
-  "version": "IC_v1.1_BASELINE_NQ",
+  "version": "IC_v1.1_BASELINE_MICROS",
   "type": "BASELINE",
   "created_at": "2026-04-06T14:00:00.000Z",
   "ema_fast": 9,
@@ -12,7 +12,7 @@
   "max_confidence": 10,
   "min_rr": 2,
   "max_risk_per_trade_pct": 1.5,
-  "max_daily_loss_pct": 8,
+  "max_daily_loss_pct": 4,
   "account_equity": 25000,
   "time_stop_minutes": 30,
   "time_stop_max_r_pre_t1": 0.25,
@@ -36,7 +36,6 @@
   "cooldown_bars": 1,
   "no_same_bar_reversal": true,
   "startup_backfill_minutes": 60,
-  "enable_cycle_watchdog": true,
   "cycle_stall_threshold_ms": 15000,
   "cycle_cusum_k": 0.5,
   "cycle_cusum_h": 5.0,
@@ -418,8 +417,47 @@
       "cold_start_tp2_k": 1.4
     }
   },
-  "runner_v2_enabled": false,
-  "runner_v2_shadow_only": true,
+  "position_target": {
+    "enabled": true,
+    "hard_cap": 10,
+    "soft_cap_base": 10,
+    "regime_factors": {
+      "trending_up": 1.0,
+      "trending_down": 1.0,
+      "range_bound": 0.8,
+      "breakout_attempt": 0.9,
+      "breakdown_attempt": 0.9,
+      "compression": 0.7,
+      "high_volatility_impulse": 0.6,
+      "choppy": 0.5,
+      "default": 0.8
+    },
+    "session_factors": {
+      "NY_AM": 1.0,
+      "NY_PM": 0.95,
+      "NY_LUNCH": 0.85,
+      "LONDON": 0.9,
+      "ASIA": 0.85,
+      "default": 0.95
+    },
+    "min_confidence_for_full_size": 0.7,
+    "enable_fractional_entry": false,
+    "fractional_entry_min_confidence": 0.65,
+    "fractional_entry_mode": "confidence_scaled",
+    "management_recompute_enabled": true,
+    "management_reduce_min_delta": 1,
+    "management_reduce_cooldown_sec": 20,
+    "reduce_large_delta_threshold": 2,
+    "reduce_persistence_cycles_small_delta": 2,
+    "min_residual_contracts": 1,
+    "flatten_on_zero_target": true,
+    "max_target_reduce_per_cycle": 2,
+    "stop_widening_allowed": false,
+    "stale_input_policy": "hold_prior_target"
+  },
+  "runner_v2_enabled": true,
+  "execution_mode": "paper",
+  "runner_v2_shadow_only": false,
   "lane_timing": {
     "hard_risk_interval_ms": 500,
     "hard_risk_quote_timeout_bbo_ms": 150,

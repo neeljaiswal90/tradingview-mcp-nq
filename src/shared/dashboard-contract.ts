@@ -45,6 +45,38 @@ export interface DashboardKpis {
   profit_factor: number | null;
 }
 
+/**
+ * Closed enum describing what the target-position layer wants to do this cycle.
+ * Rendered in the UI as `${kind} ${qty}` (e.g. "REDUCE 2", "WOULD_ADD 1", "ON_TARGET").
+ *
+ * The HOLD_* variants all mean "the layer wanted to reduce but can't this cycle";
+ * the specific variant tells operators WHY the pause:
+ *   - HOLD_PERSISTENCE: small-drop hysteresis counter not yet satisfied
+ *   - HOLD_COOLDOWN: within management_reduce_cooldown_sec since the last reduce
+ *   - HOLD_BRACKET_SYNC: bracket-sync guard active after a reduce sync failure
+ *   - HOLD_STALE_INPUT: target is a frozen prior value due to stale inputs
+ */
+export type DashboardTargetActionKind =
+  | 'ON_TARGET'
+  | 'REDUCE'
+  | 'WOULD_ADD'
+  | 'FLATTEN_PENDING'
+  | 'HOLD_PERSISTENCE'
+  | 'HOLD_COOLDOWN'
+  | 'HOLD_BRACKET_SYNC'
+  | 'HOLD_STALE_INPUT';
+
+/**
+ * Which of the three caps drove the sizing. Stable precedence on tie:
+ * softcap > risk > hardcap.
+ */
+export type DashboardBoundBy = 'risk' | 'softcap' | 'hardcap';
+
+export type DashboardConfidenceSource =
+  | 'entry_setup'
+  | 'management_pop_t2'
+  | 'management_pop_t1';
+
 export interface DashboardActiveTrade {
   is_open: boolean;
   trade_id: string | null;
@@ -73,6 +105,36 @@ export interface DashboardActiveTrade {
   pt1_resolved_pts: number | null;
   pt2_resolved_pts: number | null;
   trail_resolved_ticks: number | null;
+
+  // ── Target-position layer (V1a) ─────────────────────────────────────────
+  // Semantic layout:
+  //   current position:   quantity_remaining (above)
+  //   target position:    q_target
+  //   action (requested): q_target_action_kind + q_target_action_qty
+  //   binding cap:        q_target_bound_by (+ bound_by_all for ties)
+  //   blocked action:     HOLD_* action_kinds AND explicit block flags below
+  //   stale-input hold:   q_target_from_stale_cache + HOLD_STALE_INPUT kind
+  q_target: number | null;
+  /** q_target - quantity_remaining (signed: negative = reduce wanted). */
+  q_target_delta: number | null;
+  q_target_action_kind: DashboardTargetActionKind | null;
+  /** |delta| for REDUCE / WOULD_ADD / HOLD_*; 0 for ON_TARGET / FLATTEN / STALE. */
+  q_target_action_qty: number | null;
+  q_target_bound_by: DashboardBoundBy | null;
+  q_target_bound_by_all: DashboardBoundBy[] | null;
+  q_risk_component: number | null;
+  q_softcap_component: number | null;
+  q_softcap_confidence_factor: number | null;
+  q_softcap_confidence_raw: number | null;
+  q_softcap_confidence_source: DashboardConfidenceSource | null;
+  q_softcap_regime_factor: number | null;
+  q_softcap_session_factor: number | null;
+  q_softcap_drawdown_factor: number | null;
+  // ── Block / stale flags (distinct from action_kind for clarity) ──────
+  /** True when q_target is a cached prior value because inputs are stale. */
+  q_target_from_stale_cache: boolean | null;
+  /** True when target-position reduces are suppressed until bracket sync reconciles. */
+  q_target_bracket_sync_blocked: boolean | null;
 }
 
 export interface DashboardMarketState {
@@ -230,11 +292,8 @@ export type DashboardDeltaEvent =
   | { type: 'position_updated'; active_trade: DashboardActiveTrade }
   | { type: 'management_update'; management: DashboardManagement; active_trade: DashboardActiveTrade }
   | { type: 'ml_decision'; ml_management: DashboardMlManagement }
-  | { type: 'trade_closed'; recent_trades: DashboardRecentTrade[]; pnl_history: PnlPoint[]; kpis: DashboardKpis }
   | { type: 'recent_trade_added'; recent_trades: DashboardRecentTrade[]; pnl_history: PnlPoint[]; kpis: DashboardKpis }
-  | { type: 'market_update'; market_state: DashboardMarketState; directional: DashboardDirectionalAssessment; htf_context: DashboardHtfContext | null }
-  | { type: 'app_update'; app: DashboardAppMeta }
-  | { type: 'resync'; reason: string };
+  | { type: 'app_update'; app: DashboardAppMeta };
 
 /** A batch of typed delta events — one SSE message, one unique publish_seq. */
 export interface DashboardDeltaBatch {

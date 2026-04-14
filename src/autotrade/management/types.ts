@@ -11,6 +11,11 @@
  */
 
 import type { MarketRegime, SetupType } from '../types.js';
+import type {
+  BoundBy,
+  ConfidenceSource,
+  TargetActionKind,
+} from '../target-position.js';
 
 // ─── Feature Vector ───────────────────────────────────────────────────────────
 
@@ -78,6 +83,19 @@ export interface ManagementFeatures {
   regime: MarketRegime | null;
   session_bucket: string | null;
   ttm_squeeze_firing: boolean | null;
+
+  // ── Risk-state snapshot (threaded from RiskManager.getState() + config) ─
+  /**
+   * Current daily drawdown magnitude (always >= 0, percent of equity).
+   * Feeds q_softcap's drawdown ratchet. See risk.ts:228-230 for sign convention.
+   */
+  daily_loss_pct: number;
+  /** Max daily loss limit (percent of equity). Divisor for the drawdown ratchet. */
+  max_daily_loss_pct: number;
+  /** Account equity used for q_risk computation in the target-position model. */
+  account_equity: number;
+  /** Max risk per trade (percent of equity) used for q_risk computation. */
+  max_risk_per_trade_pct: number;
 }
 
 // ─── Probability of Profit ────────────────────────────────────────────────────
@@ -125,6 +143,50 @@ export interface ProbabilityModel {
 export type ManagementState = 'HOLD' | 'REDUCE' | 'MOVE_STOP' | 'EXIT_NOW';
 
 /**
+ * Target-position layer snapshot attached to ManagementMetrics. Fully populated
+ * when position_target.enabled + management_recompute_enabled + fresh inputs.
+ * null when the target-position path was skipped (stale inputs, cold-start,
+ * or config-disabled).
+ */
+export interface ManagementTargetPositionSnapshot {
+  q_target: number;
+  q_risk: number;
+  q_softcap: number;
+  q_hardcap: number;
+  bound_by: BoundBy;
+  bound_by_all: BoundBy[];
+
+  /** q_target - quantity_remaining (signed; negative = reduce). */
+  delta: number;
+  /** Single enum describing the action this cycle. See describeTargetAction(). */
+  action_kind: TargetActionKind;
+  /** abs(delta) for REDUCE/WOULD_ADD; 0 otherwise. */
+  action_qty: number;
+
+  // Factor breakdown (audit trail)
+  confidence_raw: number;
+  confidence_factor: number; // c_t normalized
+  confidence_source: ConfidenceSource;
+  regime_factor: number;
+  session_factor: number;
+  drawdown_factor: number;
+
+  /** True when this snapshot came from cache (stale-input policy). */
+  from_stale_cache: boolean;
+  /** Persistence counter value AFTER this cycle updated it. Useful for dashboard. */
+  small_drop_cycles_consecutive: number;
+  /** Seconds remaining on the reduce cooldown (0 if elapsed). */
+  cooldown_remaining_sec: number;
+  /**
+   * True when the per-trade bracket-sync guard is active — target-position
+   * reduces are suppressed until the bracket is verified reconciled. Distinct
+   * from cooldown/persistence holds because the reason is state inconsistency,
+   * not timing.
+   */
+  bracket_sync_block_active: boolean;
+}
+
+/**
  * Full management metrics snapshot computed each monitor cycle.
  */
 export interface ManagementMetrics {
@@ -145,4 +207,17 @@ export interface ManagementMetrics {
   /** Factors that drove the management_state decision. */
   decision_factors: string[];
   timestamp_iso: string;
+
+  // ── Target-position layer (V1a) ─────────────────────────────────────────
+  /**
+   * Full target-position snapshot. null when the recompute was skipped
+   * (stale inputs with no prior cache, or config disabled).
+   */
+  target_position: ManagementTargetPositionSnapshot | null;
+  /**
+   * When management_state === 'REDUCE' because of target-position drift,
+   * this is the exact number of contracts to exit this cycle. Clamped by
+   * max_target_reduce_per_cycle. null when REDUCE is EV-driven or not firing.
+   */
+  requested_qty_to_exit: number | null;
 }

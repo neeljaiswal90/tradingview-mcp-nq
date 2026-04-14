@@ -17,6 +17,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
+import { readFileSync, existsSync } from 'fs';
 
 // Feature schema version — must stay in sync with FEATURE_SCHEMA_VERSION in
 // python-market-data-service/lob_features/ml_feature_registry.py.
@@ -24,6 +25,7 @@ import { createHash, randomUUID } from 'crypto';
 const ML_FEATURE_SCHEMA_VERSION = 'v3_advanced_mbo';
 import * as tvHealth from '../core/tradingview/health.js';
 import * as tvChart from '../core/tradingview/chart.js';
+import * as tvPane from '../core/tradingview/pane.js';
 import { QuoteService, BookmapQuoteProvider } from './quote-service.js';
 import { LobClient } from './lob-client.js';
 
@@ -41,13 +43,13 @@ import { getManagementProfile, resolveProfile } from './management-profiles.js';
 import { LogWriter } from './log-writer.js';
 import { IndicatorConfigManager } from './indicator-config-manager.js';
 import { PerformanceTracker } from './performance-tracker.js';
-import { Scheduler, LaneScheduler } from './scheduler.js';
+import { LaneScheduler } from './scheduler.js';
 import type { LaneConfig } from './scheduler.js';
 import { ExecutionLock } from './execution-lock.js';
 import { createLaneSharedState } from './lane-state.js';
 import type { LaneSharedState } from './lane-state.js';
 import { EnginePhaseManager } from './engine-phase.js';
-import { getContractSpec } from './contracts.js';
+import { getContractSpec, tryGetContractSpec, assertLiveTradingAllowed } from './contracts.js';
 import { EventCalendar } from './events.js';
 import { classifySession } from './session.js';
 import { DashboardStateManager, DashboardServer } from './dashboard/index.js';
@@ -122,7 +124,42 @@ async function verifyConnection(retries = MAX_STARTUP_RETRIES): Promise<void> {
   throw new Error(`Failed to connect to TradingView after ${retries} attempts`);
 }
 
-async function ensureChartSetup(tvSymbol: string, contractRoot: string): Promise<void> {
+/**
+ * Discover which TradingView pane contains the given contract root.
+ * Returns the pane index, or undefined for single-pane layouts.
+ */
+async function discoverPaneIndex(contractRoot: string): Promise<number | undefined> {
+  const paneState = await tvPane.list() as {
+    chart_count: number;
+    panes: Array<{ index: number; symbol?: string; error?: string }>;
+  };
+
+  if (paneState.chart_count <= 1) return undefined;
+
+  const match = paneState.panes.find(p => {
+    if (!p.symbol || p.error) return false;
+    const spec = tryGetContractSpec(p.symbol);
+    return spec?.root === contractRoot;
+  });
+
+  if (!match) {
+    const paneList = paneState.panes
+      .map(p => `  pane ${p.index}: ${p.symbol ?? p.error ?? 'unknown'}`)
+      .join('\n');
+    throw new Error(
+      `[STARTUP] No pane matches root=${contractRoot} in ${paneState.chart_count}-pane layout.\n` +
+      `Available panes:\n${paneList}`,
+    );
+  }
+
+  console.log(
+    `[STARTUP] Multi-pane layout detected (${paneState.chart_count} panes). ` +
+    `Discovered pane ${match.index} for ${contractRoot} (symbol: ${match.symbol}).`,
+  );
+  return match.index;
+}
+
+async function ensureChartSetup(tvSymbol: string, contractRoot: string): Promise<number | undefined> {
   const health = await tvHealth.healthCheck() as Record<string, unknown>;
   const currentSymbol = (health['chart_symbol'] as string | undefined) ?? '';
 
@@ -153,6 +190,10 @@ async function ensureChartSetup(tvSymbol: string, contractRoot: string): Promise
   } catch (err) {
     console.warn('[STARTUP] ⚠️ Could not auto-add indicators (non-fatal):', err);
   }
+
+  // ── Multi-pane discovery ─────────────────────────────────────────────
+  const paneIndex = await discoverPaneIndex(contractRoot);
+  return paneIndex;
 }
 
 async function quickHealthCheck(): Promise<boolean> {
@@ -211,17 +252,30 @@ function printCycleSummary(opts: {
 }
 
 async function main(): Promise<void> {
-  console.log('\n🚀 NQ / MNQ Futures Autonomous Trading Engine starting (PAPER-ONLY)…\n');
-
   const env = loadEnv();
   printEnv(env);
 
   const contract = getContractSpec(env.SYMBOL);
   const instrumentSymbol = contract.app_symbol;
+  console.log(`\n🚀 ${contract.display} Autonomous Trading Engine starting (${env.MODE.toUpperCase()})…\n`);
   console.log(
     `[STARTUP] Contract: ${contract.display} (${contract.root}) | venue=${contract.venue} ` +
     `| tick=${contract.tick_size} pt_value=$${contract.point_value} tick_value=$${contract.tick_value}`,
   );
+
+  // ─── Legacy contract guard ─────────────────────────────────────────────────
+  // NQ and ES remain in the registry for replay and log-parsing but are not
+  // allowed for live/paper trading. Refuse startup if the selected symbol is
+  // one of those — signal_only and shadow are allowed for replay tooling.
+  if (env.MODE === 'paper' || env.MODE === 'live') {
+    assertLiveTradingAllowed(contract);
+  } else if (contract.live_trading_allowed !== true) {
+    console.warn(
+      `[STARTUP] ⚠ Contract ${contract.root} is legacy/replay-only ` +
+      `(live_trading_allowed=false). Continuing in ${env.MODE} mode — ` +
+      `this runner will NOT submit live or paper orders.`,
+    );
+  }
 
   const sessionId = `SESSION_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${randomUUID().slice(0, 8)}`;
 
@@ -240,12 +294,21 @@ async function main(): Promise<void> {
 
   runtimeState.cleanupStaleTmpFiles();
 
+  // Read cycle-stall threshold early (before full config manager init) for recovery.
+  let earlyBootCycleStallMs: number | null = null;
+  try {
+    const rawCfg = JSON.parse(readFileSync('./config/indicator-config.json', 'utf-8'));
+    earlyBootCycleStallMs = typeof rawCfg.cycle_stall_threshold_ms === 'number'
+      ? rawCfg.cycle_stall_threshold_ms : null;
+  } catch { /* use null — cycle stall detection disabled if config unreadable */ }
+
   const tradeJournal = new TradeJournal(env.LOG_DIR, sessionId);
   const recoveryArtifacts = readRecoveryArtifacts(runtimeState, tradeJournal);
   const recoveryReport = buildRecoveryReport(
     recoveryArtifacts, tradeJournal,
     env.RESTART_MODE, env.MODE,
     env.RUNTIME_HEARTBEAT_STALE_MS,
+    earlyBootCycleStallMs,
   );
   runtimeState.writeRecoveryReport(recoveryReport);
 
@@ -263,6 +326,10 @@ async function main(): Promise<void> {
 
   // Recovery gate passed — safe to create LogWriter and proceed
   const logWriter = new LogWriter(env.LOG_DIR);
+  logWriter.setOnCriticalDiskError((filePath, err) => {
+    console.error(`[RUNNER] [CRITICAL] Disk write failure on ${filePath} — audit trail compromised. ` +
+      `Manual intervention required. Error: ${err}`);
+  });
   logWriter.startFlushTimer();
 
   // Write the canonical release stamp so every artifact from this session
@@ -312,6 +379,10 @@ async function main(): Promise<void> {
   configManager.printEffectiveConfig();
 
   const effectiveConfig = configManager.getConfig();
+
+  // ─── Canonical execution_mode normalization ────────────────────────────────
+  const executionMode: 'shadow' | 'paper' | 'live' =
+    effectiveConfig.execution_mode ?? 'paper';
 
   // Short config hash used by every candidate_scores_v2 row so results
   // can be bound to a specific config revision without requiring the
@@ -373,11 +444,13 @@ async function main(): Promise<void> {
     console.log(`[LOB] Bookmap/Rithmic sidecar not available at ${lobServiceUrl} — using TradingView fallback`);
   }
 
-  const managementEngine = new ManagementDecisionEngine(contract);
+  const managementEngine = new ManagementDecisionEngine(
+    contract,
+    effectiveConfig.position_target ?? null,
+  );
   // Persists the latest management metrics across the onMonitor → writeTradePathPoint boundary
   let lastMgmtMetrics: ManagementMetrics | null = null;
   let lastMlDecision: MlDecision | null = null;
-  let lastMlActionTimestampV1 = 0;
   const mlConfig: MlManagementConfig = effectiveConfig.ml_management ?? DEFAULT_ML_CONFIG;
   const entryMlConfig: EntryMlConfig = effectiveConfig.entry_ml ?? DEFAULT_ENTRY_ML_CONFIG;
 
@@ -395,26 +468,90 @@ async function main(): Promise<void> {
   // The table is loaded ONCE at runner startup, not per-cycle. A
   // bucket-table refresh requires a runner restart — which is the
   // correct operational boundary for a calibration change.
+  // ── Artifact gate (paper/live must have symbol-scoped ML artifacts) ──────
+  //
+  // Shadow and signal_only still tolerate cross-symbol fallback with a loud
+  // warning (so the user can replay NQ history into an MNQ stack for
+  // diagnostics). paper and live MUST have symbol-scoped artifacts — the
+  // runner refuses to start otherwise. This is stricter than the previous
+  // behavior, which only warned.
+  const requireStrictArtifacts = env.MODE === 'paper' || env.MODE === 'live';
+  if (requireStrictArtifacts) {
+    const requiredBucketPath = `data/expectancy_bucket_table_${contract.root}.json`;
+    const requiredCurvesPath = `./config/failure_exit_curves_${contract.root}.json`;
+    const missing: string[] = [];
+    if (!existsSync(requiredBucketPath)) missing.push(requiredBucketPath);
+    if (!existsSync(requiredCurvesPath)) missing.push(requiredCurvesPath);
+    if (missing.length > 0) {
+      const msg =
+        `[STARTUP] ❌ Refusing to start in ${env.MODE} mode — required symbol-scoped ` +
+        `ML artifacts are missing:\n` +
+        missing.map(p => `  - ${p}`).join('\n') + '\n' +
+        `Generic fallbacks are not acceptable for ${env.MODE} mode. Build the ` +
+        `symbol-scoped artifacts first:\n` +
+        `  node scripts/build-expectancy-bucket-table.mjs --symbol ${contract.root}\n` +
+        `  node scripts/ml/build_failure_exit_curves.mjs --symbol ${contract.root}\n` +
+        `Or run in shadow/signal_only mode until artifacts are available.`;
+      console.error(msg);
+      throw new Error(
+        `missing_symbol_scoped_artifacts: ${missing.join(', ')}`,
+      );
+    }
+  }
+
   let expectancyTable: ExpectancyBucketTable | null = null;
+  let expectancyTableStatus: { subsystem: string; status: string; reason: string; source_rows: number; fallback_used: boolean } | null = null;
   {
     const quantCfgStartup = resolveQuantEntryConfig(effectiveConfig.quant_entry);
     if (quantCfgStartup.enabled) {
-      const loadResult = loadExpectancyBucketTable(quantCfgStartup.expectancy.bucket_table_path);
-      if (loadResult.status === 'loaded') {
-        expectancyTable = loadResult.table;
-        console.log(`[QUANT-ENGINE] ${loadResult.detail}`);
-        console.log(
-          `[QUANT-ENGINE] provenance: generated_at=${loadResult.provenance.generated_at ?? 'unknown'} ` +
-          `schema=${loadResult.provenance.schema_version_on_disk ?? 'unknown'} ` +
-          `path=${loadResult.path}`
-        );
-      } else {
+      // Symbol-scoped bucket table path: prefer symbol-specific file, no silent cross-symbol fallback.
+      const symbolTablePath = `data/expectancy_bucket_table_${contract.root}.json`;
+      const configuredPath = quantCfgStartup.expectancy.bucket_table_path;
+      const tablePath = existsSync(symbolTablePath) ? symbolTablePath : configuredPath;
+      const expectancyFallbackUsed = tablePath !== symbolTablePath;
+      if (expectancyFallbackUsed && executionMode !== 'shadow') {
         console.warn(
-          `[QUANT-ENGINE] Bucket table NOT loaded (status=${loadResult.status}). ` +
-          `Expectancy will be no_data for every candidate, which the ` +
-          `Phase 7 Stage B gate treats as neutral — NOT as a rejection. ` +
-          `Detail: ${loadResult.detail}`
+          `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath} not found. ` +
+          `Cross-symbol fallback rejected in ${executionMode} mode — marking non-eligible. ` +
+          `Build a symbol-scoped table with: node scripts/build-expectancy-bucket-table.mjs --symbol ${contract.root}`
         );
+        expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'cross_symbol_fallback', reason: `generic fallback rejected in ${executionMode} mode`, source_rows: 0, fallback_used: true };
+      }
+      if (expectancyFallbackUsed && executionMode === 'shadow') {
+        console.warn(
+          `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath} not found, using ${configuredPath}. ` +
+          `Build a symbol-scoped table to eliminate cross-symbol risk.`
+        );
+      }
+
+      if (!expectancyTableStatus) {
+        const loadResult = loadExpectancyBucketTable(tablePath, executionMode !== 'shadow' ? contract.root : undefined);
+        if (loadResult.status === 'loaded') {
+          expectancyTable = loadResult.table;
+          console.log(`[QUANT-ENGINE] ${loadResult.detail}`);
+          console.log(
+            `[QUANT-ENGINE] provenance: generated_at=${loadResult.provenance.generated_at ?? 'unknown'} ` +
+            `schema=${loadResult.provenance.schema_version_on_disk ?? 'unknown'} ` +
+            `path=${loadResult.path}`
+          );
+          expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'ok', reason: 'loaded', source_rows: loadResult.provenance.source_row_count ?? 0, fallback_used: expectancyFallbackUsed };
+        } else if (loadResult.status === 'insufficient_data') {
+          // Table loads for telemetry/diagnostics only — NOT for execution gating.
+          expectancyTable = loadResult.table;
+          console.warn(
+            `[QUANT-ENGINE] ⚠ Bucket table has insufficient data for execution gating (telemetry-only mode). ` +
+            `Detail: ${loadResult.detail}`
+          );
+          expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'insufficient_data', reason: loadResult.detail, source_rows: loadResult.provenance.source_row_count ?? 0, fallback_used: expectancyFallbackUsed };
+        } else {
+          console.warn(
+            `[QUANT-ENGINE] Bucket table NOT loaded (status=${loadResult.status}). ` +
+            `Expectancy will be no_data for every candidate, which the ` +
+            `Phase 7 Stage B gate treats as neutral — NOT as a rejection. ` +
+            `Detail: ${loadResult.detail}`
+          );
+          expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: loadResult.status, reason: loadResult.detail, source_rows: 0, fallback_used: expectancyFallbackUsed };
+        }
       }
     } else {
       console.log('[QUANT-ENGINE] quant_entry.enabled=false — expectancy engine dormant (Phase 7 scaffold only)');
@@ -478,26 +615,122 @@ async function main(): Promise<void> {
     runtimeState.writeOpenTradeState(pos);
   });
   // Load empirical winner-distribution curves for the Dead-Trade Guard Lane B.
-  // Missing file or empty map makes Lane B a no-op; Lanes A and C still work.
   // File path is fixed (matches scripts/ml/build_failure_exit_curves.mjs output).
+  let failureCurvesStatus: { subsystem: string; status: string; reason: string; family_count: number; fallback_used: boolean } | null = null;
   try {
     const { loadCurves } = await import('./failure-exit/index.js');
-    const curves = loadCurves('./config/failure_exit_curves.json');
-    positionManager.setFailureCurves(curves);
-    if (curves.size > 0) {
-      const keys = Array.from(curves.keys()).join(', ');
-      console.log(`[STARTUP] Loaded failure-exit curves for families: ${keys}`);
-    } else {
-      console.log('[STARTUP] No failure-exit curves loaded (Lane B will be no-op)');
+    // Symbol-scoped failure curves: prefer symbol-specific file, no silent cross-symbol fallback.
+    const symbolCurvesPath = `./config/failure_exit_curves_${contract.root}.json`;
+    const defaultCurvesPath = './config/failure_exit_curves.json';
+    const curvesPath = existsSync(symbolCurvesPath) ? symbolCurvesPath : defaultCurvesPath;
+    const curvesFallbackUsed = curvesPath !== symbolCurvesPath;
+    if (curvesFallbackUsed && executionMode !== 'shadow') {
+      console.warn(
+        `[STARTUP] Symbol-specific curves ${symbolCurvesPath} not found. ` +
+        `Cross-symbol fallback rejected in ${executionMode} mode — Lane B disabled. ` +
+        `Build symbol-scoped curves with: node scripts/ml/build_failure_exit_curves.mjs --symbol ${contract.root}`
+      );
+      positionManager.setFailureCurves(null);
+      failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'fallback', reason: `cross_symbol_fallback_rejected_${executionMode}`, family_count: 0, fallback_used: true };
+    }
+    if (curvesFallbackUsed && executionMode === 'shadow') {
+      console.warn(
+        `[STARTUP] Symbol-specific curves ${symbolCurvesPath} not found, using ${defaultCurvesPath}. ` +
+        `Build symbol-scoped curves to eliminate cross-symbol risk.`
+      );
+    }
+    if (!failureCurvesStatus) {
+      const curves = loadCurves(curvesPath, executionMode !== 'shadow' ? contract.root : undefined);
+      if (curves.size > 0) {
+        positionManager.setFailureCurves(curves);
+        const keys = Array.from(curves.keys()).join(', ');
+        console.log(`[STARTUP] Loaded failure-exit curves for families: ${keys}`);
+        failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'ok', reason: 'loaded', family_count: curves.size, fallback_used: curvesFallbackUsed };
+      } else {
+        // Explicitly disable Lane B — do NOT install empty map
+        positionManager.setFailureCurves(null);
+        console.warn('[STARTUP] ⚠ Failure-exit curves are empty — Lane B of Dead-Trade Guard is DISABLED (fallback mode)');
+        failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'fallback', reason: 'empty_curves', family_count: 0, fallback_used: curvesFallbackUsed };
+      }
     }
   } catch (err) {
-    console.warn(`[STARTUP] Failed to load failure-exit curves: ${(err as Error).message}`);
+    positionManager.setFailureCurves(null);
+    console.warn(`[STARTUP] ⚠ Failed to load failure-exit curves: ${(err as Error).message} — Lane B DISABLED`);
+    failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'fallback', reason: 'load_error', family_count: 0, fallback_used: false };
   }
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
   perfCheckpointTimer = setInterval(() => perfTracker.checkpointSession(), 60_000);
   perfCheckpointTimer.unref(); // Don't keep process alive for checkpoint
   const events = EventCalendar.load('./config');
   console.log(`[STARTUP] Loaded event calendar: ${events.size()} events`);
+
+  // ── Artifact execution eligibility policy ──────────────────────────
+  //
+  //  Artifact                  | Missing/Empty (paper)    | Insufficient Data (paper) | Effect
+  //  ─────────────────────────-┼──────────────────────────┼───────────────────────────┼─────────────────────
+  //  failure_exit_curves       | ALLOWED (Lane B optional)| n/a                       | Lane B disabled
+  //  expectancy_bucket_table   | NOT eligible             | NOT eligible (telemetry)  | No execution gating
+  //
+  //  all_checks_passed:      true only when ALL artifacts have execution_eligible=true
+  //  paper_execution_safe:   true when all REQUIRED (non-optional) artifacts are eligible
+  //                          failure_exit_curves is optional → does not block paper_execution_safe
+  // ─────────────────────────────────────────────────────────────────────
+  {
+    const artifacts: Array<{
+      name: string; symbol: string; load_status: string;
+      quality_status: string; fallback_used: boolean; execution_eligible: boolean;
+      degraded_reason: string | null;
+    }> = [];
+
+    if (failureCurvesStatus) {
+      artifacts.push({
+        name: 'failure_exit_curves',
+        symbol: contract.root,
+        load_status: failureCurvesStatus.status === 'ok' ? 'ok' : 'degraded',
+        quality_status: failureCurvesStatus.status === 'ok' ? 'non_empty' : failureCurvesStatus.reason,
+        fallback_used: failureCurvesStatus.fallback_used,
+        execution_eligible: failureCurvesStatus.status === 'ok',
+        degraded_reason: failureCurvesStatus.status !== 'ok' ? failureCurvesStatus.reason : null,
+      });
+    }
+
+    if (expectancyTableStatus) {
+      artifacts.push({
+        name: 'expectancy_bucket_table',
+        symbol: contract.root,
+        load_status: expectancyTableStatus.status === 'ok' ? 'ok' : expectancyTableStatus.status,
+        quality_status: expectancyTableStatus.status === 'ok' ? 'sufficient' : expectancyTableStatus.reason,
+        fallback_used: expectancyTableStatus.fallback_used,
+        execution_eligible: expectancyTableStatus.status === 'ok',
+        degraded_reason: expectancyTableStatus.status !== 'ok' ? expectancyTableStatus.reason : null,
+      });
+    }
+
+    const allChecksPassed = artifacts.every(a => a.execution_eligible);
+    // Lane B (failure_exit_curves) is optional for paper execution — does not block paper_execution_safe.
+    const nonBlockingSubsystems = new Set(['failure_exit_curves']);
+    const paperExecutionSafe = artifacts.every(
+      a => a.execution_eligible || nonBlockingSubsystems.has(a.name),
+    );
+    const healthManifest = {
+      generated_at: new Date().toISOString(),
+      execution_mode: executionMode,
+      symbol: contract.root,
+      artifacts,
+      all_checks_passed: allChecksPassed,
+      paper_execution_safe: paperExecutionSafe,
+    };
+
+    try {
+      const { writeFileSync: wfs, mkdirSync: mks } = await import('fs');
+      const logDir = env.LOG_DIR;
+      if (!existsSync(logDir)) mks(logDir, { recursive: true });
+      wfs(join(logDir, 'startup_artifact_health.json'), JSON.stringify(healthManifest, null, 2));
+      console.log(`[STARTUP] Artifact health manifest: all_checks_passed=${allChecksPassed} paper_execution_safe=${paperExecutionSafe} execution_mode=${executionMode}`);
+    } catch (err) {
+      console.warn(`[STARTUP] Failed to write artifact health manifest: ${(err as Error).message}`);
+    }
+  }
 
   const session: SessionRecord = {
     session_id: sessionId,
@@ -533,6 +766,7 @@ async function main(): Promise<void> {
     contract,
     effectiveConfig.account_equity,
   );
+  dashboardState.setMaxDailyLossPct(effectiveConfig.max_daily_loss_pct);
   // Hydrate recent trades from disk
   dashboardState.loadTradesFromDisk(logWriter.readAllTrades());
   // Hydrate performance stats if available
@@ -557,7 +791,14 @@ async function main(): Promise<void> {
   await verifyConnection();
   dashboardState.setConnectionStatus('connected');
   dashboardState.setEngineRunning(true);
-  await ensureChartSetup(contract.tv_symbol, contract.root);
+  const discoveredPaneIndex = await ensureChartSetup(contract.tv_symbol, contract.root);
+  if (discoveredPaneIndex != null) {
+    console.log(`[STARTUP] Using pane index ${discoveredPaneIndex} for all data reads.`);
+    dataCollector.paneIndex = discoveredPaneIndex;
+    dataCollector.expectedRoot = contract.root;
+    dataCollector.onPaneMismatch = () => discoverPaneIndex(contract.root);
+    quoteService.setPaneIndex(discoveredPaneIndex);
+  }
 
   let totalSignals = 0;
   let lastRegime: MarketRegime = 'range_bound';
@@ -585,7 +826,6 @@ async function main(): Promise<void> {
     console.log('[ML] ML management disabled in config');
   }
 
-  const scheduler = new Scheduler(effectiveConfig.analysis_interval_seconds * 1000);
   console.log(
     `\n[RUNNER] ▶️  Starting hybrid loop in mode: ${env.MODE.toUpperCase()} ` +
     `(analysis=${effectiveConfig.analysis_interval_seconds}s, ` +
@@ -650,435 +890,6 @@ async function main(): Promise<void> {
   const ZOMBIE_THRESHOLD_MS = 60 * 60 * 1000;  // 60 minutes
   const ZOMBIE_LOG_INTERVAL_MS = 10 * 60 * 1000; // re-warn every 10 min
   let lastZombieWarningAt = 0;
-
-  // ─── Fast in-position monitor ───────────────────────────────────────────────
-  const onMonitor = async (_cycleNumber: number): Promise<void> => {
-    if (!positionManager.hasOpenPosition()) return;
-    let price: number | null = null;
-    let quoteResult = await quoteService.fetchFresh().catch(() => null);
-    if (quoteResult) {
-      const age = quoteService.computeAge(quoteResult);
-      const stale = quoteService.isStale(quoteResult);
-      const failoverNote = quoteResult.failover_reason ? ` failover=[${quoteResult.failover_reason}]` : '';
-      console.log(`[QUOTE] source=${quoteResult.source} price=${quoteResult.price} age_ms=${age}${failoverNote}`);
-      dashboardState.updateQuoteInfo({ ...quoteResult, age_ms: age, is_stale: stale });
-      if (stale) {
-        console.warn(`[QUOTE] Stale quote (${age}ms > ${effectiveConfig.max_quote_age_ms_for_management ?? 3_000}ms) — skipping monitor tick`);
-        dashboardState.flush();
-        return;
-      }
-      price = quoteResult.price;
-    } else if (effectiveConfig.enable_stale_quote_fallback && lastSnap) {
-      quoteResult = quoteService.makeFallback(lastSnap.price);
-      dashboardState.updateQuoteInfo(quoteResult);
-      price = lastSnap.price;
-      console.warn(`[QUOTE] fetch failed — fallback to lastSnap price=${price}`);
-    } else {
-      console.warn('[QUOTE] fetch failed, no fallback — skipping monitor tick');
-      return;
-    }
-    if (price === null) return;
-
-    // ── Zombie-trade watchdog ─────────────────────────────────────────────────
-    const zombiePos = positionManager.getPosition();
-    if (zombiePos) {
-      const holdMs = Date.now() - new Date(zombiePos.entry_time_iso).getTime();
-      if (holdMs > ZOMBIE_THRESHOLD_MS && Date.now() - lastZombieWarningAt > ZOMBIE_LOG_INTERVAL_MS) {
-        lastZombieWarningAt = Date.now();
-        const quoteAge = quoteResult ? quoteService.computeAge(quoteResult) : -1;
-        console.warn(
-          `[ZOMBIE-TRADE] trade_id=${zombiePos.trade_id} open for ${Math.round(holdMs / 60000)}min | ` +
-          `price=${price} stop=${zombiePos.stop_current} entry=${zombiePos.entry_price} | ` +
-          `side=${zombiePos.side} qty=${zombiePos.quantity_remaining} | ` +
-          `quote_age=${quoteAge}ms | ` +
-          `last_mgmt_state=${lastMgmtMetrics?.management_state ?? 'none'}`,
-        );
-      }
-    }
-
-    // ── In-trade management metrics (PoP + EV advisory) ──────────────────────
-    const openPos = positionManager.getPosition();
-    if (openPos) {
-      const sessionCtx = classifySession();
-      const mgmtFeatures = buildManagementFeatures(
-        openPos,
-        price,
-        lastSnap?.indicators_1m ?? null,
-        lastRegime,
-        sessionCtx.strategy_bucket ?? null,
-      );
-      const mgmtMetrics = managementEngine.evaluate(mgmtFeatures);
-      lastMgmtMetrics = mgmtMetrics;
-      dashboardState.updateManagement(mgmtMetrics);
-      console.log(
-        `[MGMT] state=${mgmtMetrics.management_state} ` +
-        `pop_t1=${mgmtMetrics.pop.pop_target1_before_stop} ` +
-        `pop_t2=${mgmtMetrics.pop.pop_target2_before_stop} ` +
-        `ev_hold=$${mgmtMetrics.expected_value_hold_usd} ` +
-        `ev_exit=$${mgmtMetrics.expected_value_exit_now_usd} ` +
-        `model=${mgmtMetrics.pop.model_name}(${mgmtMetrics.pop.confidence_in_estimate}) ` +
-        `reason="${mgmtMetrics.management_state_reason}"`,
-      );
-    }
-
-    const exit = positionManager.evaluate(price, effectiveConfig);
-    if (!exit.shouldExit || !exit.reason) {
-      // ── ML management advisory (only when hard stops did NOT trigger) ──
-      // The ML model can suggest actions, but hard stops always take precedence.
-      if (mlConfig.enabled && positionManager.hasOpenPosition()) {
-        try {
-          // Quote is confirmed fresh at this point (stale quotes cause early return above)
-          const mlQuoteAge = quoteResult ? quoteService.computeAge(quoteResult) : 9999;
-          // Fetch LOB snapshot for ML features (non-blocking, null if unavailable)
-          const mlLobSnap = await lobClient.getSnapshot().catch(() => null);
-          const mlResult = await getMlDecision(
-            positionManager.getPosition()!,
-            price,
-            mlQuoteAge,
-            mlConfig,
-            mlLobSnap,
-            lastMlActionTimestampV1 > 0 ? lastMlActionTimestampV1 : null,
-          );
-          const mlDec = mlResult.decision;
-          lastMlDecision = mlDec;
-
-          // Log ML decision + update dashboard
-          const mlLogPos = positionManager.getPosition();
-          dashboardState.updateMlManagement(mlDec, mlConfig);
-          logWriter.writeMlManagementAction({
-            timestamp: new Date().toISOString(),
-            trade_id: mlLogPos?.trade_id ?? '',
-            action: mlDec.action,
-            action_confidence: mlDec.confidence,
-            model_name: mlDec.model_name,
-            model_version: mlDec.model_version || mlConfig.model_version,
-            prob_hold: mlDec.prob_hold,
-            ev_hold_r: mlDec.ev_hold_r,
-            approved: mlDec.approved,
-            rejection_reason: mlDec.rejection_reason,
-            inference_ms: mlDec.inference_ms,
-            quote_age_ms: mlQuoteAge,
-            side: mlLogPos?.side ?? null,
-            setup_type: mlLogPos?.setup_type ?? null,
-            quantity_remaining: mlLogPos?.quantity_remaining ?? null,
-            unrealized_r: mlLogPos ? positionManager.getUnrealizedR(price) : null,
-            tier_used: mlDec.tier_used,
-            fallback_used: mlDec.fallback_used,
-            fallback_reason: mlDec.fallback_reason,
-            notes: mlDec.notes,
-          });
-
-          // ── Log exact feature payload + response for training reproducibility ──
-          // _feature_schema_hash: sha256 of sorted feature names (excluding trade_id),
-          // truncated to 8 hex chars. Changes automatically when the feature set changes.
-          // Use this to detect train/serve schema drift in the audit pipeline.
-          const _featureSchemaHash = createHash('sha256')
-            .update(Object.keys(mlResult.features).filter(k => k !== 'trade_id').sort().join(','))
-            .digest('hex')
-            .slice(0, 8);
-          logWriter.writeMlManagementFeatures({
-            // Exact serialized request body (parsed back = what the service received)
-            ...JSON.parse(mlResult.serializedRequestBody),
-            // Request metadata
-            _timestamp: new Date().toISOString(),
-            _trade_id: mlLogPos?.trade_id ?? '',
-            _request_id: mlResult.requestId,
-            _service_url: mlConfig.service_url,
-            _request_latency_ms: mlResult.requestLatencyMs,
-            _feature_count: Object.keys(mlResult.features).length - 1, // minus trade_id
-            // Schema versioning — for audit/drift detection
-            _log_schema_version: ML_FEATURE_SCHEMA_VERSION,
-            _feature_schema_hash: _featureSchemaHash,
-            // Data quality assessment
-            _lob_available: mlResult.features.lob_spread_ticks !== null,
-            _adv_mbo_available: mlResult.features.adv_cancel_replace_ratio_10s !== null,
-            _data_quality_tier: computeDataQualityTier(mlResult.features),
-            _bbo_age_ms: mlLobSnap?.bbo_age_ms ?? null,
-            // Exact service response (full body for replay/debugging)
-            _serialized_response_body: mlResult.serializedResponseBody,
-            // Response summary (parsed for quick queries)
-            _response_action: mlDec.action,
-            _response_confidence: mlDec.confidence,
-            _response_approved: mlDec.approved,
-            _response_rejection_reason: mlDec.rejection_reason,
-            _response_model_name: mlDec.model_name,
-            _response_model_version: mlDec.model_version,
-            _response_tier_used: mlDec.tier_used,
-            _response_fallback_used: mlDec.fallback_used,
-            _response_fallback_reason: mlDec.fallback_reason,
-          });
-
-          if (mlDec.approved && mlDec.action !== 'NO_ACTION' && mlDec.action !== 'HOLD') {
-            const mlPos = positionManager.getPosition()!;
-
-            // ── Execution policy gate ────────────────────────────────────────
-            const policyResult = execPolicy.evaluate(
-              mlDec.action, mlPos, mlLobSnap, mlQuoteAge,
-              mlDec.recommended_size_fraction !== null
-                ? Math.max(1, Math.floor(mlPos.quantity_remaining * mlDec.recommended_size_fraction))
-                : null,
-              mlDec.recommended_stop_price,
-            );
-
-            // Log intent
-            logWriter.writeMlManagementAction({
-              _type: 'execution_intent',
-              timestamp: new Date().toISOString(),
-              trade_id: mlPos.trade_id,
-              source_action: policyResult.intent.source_action,
-              execution_action: policyResult.intent.execution_action,
-              urgency: policyResult.intent.urgency,
-              timing: policyResult.intent.timing,
-              should_execute: policyResult.should_execute,
-              block_reason: policyResult.block_reason,
-              spread_ticks: policyResult.intent.microstructure.spread_ticks,
-              quote_age_ms: policyResult.intent.microstructure.quote_age_ms,
-              reasons: policyResult.intent.reasons,
-              policy_verdict: policyResult.policy_verdict,
-            });
-
-            if (!policyResult.should_execute) {
-              if (_cycleNumber % 10 === 0) {
-                console.log(`[EXEC-POLICY] Blocked: ${mlDec.action} — ${policyResult.block_reason}`);
-              }
-            } else {
-
-            console.log(
-              `[ML] Approved: ${mlDec.action} conf=${mlDec.confidence.toFixed(2)} ` +
-              `prob_hold=${mlDec.prob_hold?.toFixed(2) ?? 'n/a'} ev_hold=${mlDec.ev_hold_r?.toFixed(3) ?? 'n/a'} ` +
-              `model=${mlDec.model_name} ${mlDec.inference_ms}ms ` +
-              `urgency=${policyResult.intent.urgency} timing=${policyResult.intent.timing}`,
-            );
-
-            if (mlDec.action === 'EXIT_ALL') {
-              logWriter.writeExecutionIntent({
-                event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
-                trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
-                price, quantity: mlPos.quantity_remaining,
-              });
-              const exitResult = await adapter.placeExit(mlPos.side, mlPos.quantity_remaining, price, 'ml_exit_all');
-              logWriter.writeExecutionIntent({
-                event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
-                trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
-                price: exitResult.fill_price, quantity: exitResult.quantity,
-                slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
-              });
-              const tradeRecord = positionManager.closePosition(
-                exitResult, 'ml_exit_all', lastRegime, sessionId, env.STRATEGY_VERSION, price,
-                {
-                  target_1_direction_valid: mlPos.target_1_direction_valid,
-                  target_2_direction_valid: mlPos.target_2_direction_valid,
-                  target_3_direction_valid: mlPos.target_3_direction_valid,
-                  target_ordering_valid: mlPos.target_ordering_valid,
-                  target_repair_applied: mlPos.target_repair_applied,
-                },
-              );
-              logWriter.writeExecutionIntent({
-                event: 'trade_closed', timestamp: new Date().toISOString(),
-                trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management',
-                price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
-                r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
-              });
-              logWriter.writeTrade(tradeRecord);
-              tradeJournal.append('final_close', tradeRecord.trade_id, 'ml_management', tradeRecord.exit_reason, null);
-              riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
-              perfTracker.recordTrade(tradeRecord);
-              dashboardState.updatePosition(null);
-              dashboardState.recordTrade(tradeRecord);
-              dashboardState.updatePerformance(perfTracker.getStats());
-              dashboardState.updateRisk(riskManager.getState());
-              lobClient.endTradeContext(mlPos.trade_id).catch(() => {});
-              phaseManager.transitionTo('EXITING', `ml_exit_all:${mlPos.trade_id}`);
-              phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
-              lastMlActionTimestampV1 = Date.now();
-              console.log(`[ML] Trade closed: ${tradeRecord.outcome_class} $${tradeRecord.pnl_realized.toFixed(2)}`);
-            } else if (mlDec.action === 'MOVE_TO_BREAKEVEN') {
-              const moved = positionManager.moveStopToBreakeven();
-              if (moved) {
-                lastMlActionTimestampV1 = Date.now();
-                console.log('[ML] Stop moved to breakeven');
-              }
-            } else if (mlDec.action === 'MOVE_STOP' && mlDec.recommended_stop_price !== null && mlDec.recommended_stop_price > 0) {
-              const moved = positionManager.moveStopTo(mlDec.recommended_stop_price);
-              if (moved) {
-                lastMlActionTimestampV1 = Date.now();
-                console.log(`[ML] Stop moved to ${mlDec.recommended_stop_price}`);
-              }
-            } else if (mlDec.action === 'EXIT_PARTIAL' && mlConfig.enable_partial_exit) {
-              const frac = mlDec.recommended_size_fraction;
-              if (frac !== null && frac > 0 && frac < 1) {
-                const qtyToExit = Math.max(1, Math.floor(mlPos.quantity_remaining * frac));
-                if (qtyToExit > 0 && qtyToExit < mlPos.quantity_remaining) {
-                  console.log(`[ML] Executing EXIT_PARTIAL (${qtyToExit} of ${mlPos.quantity_remaining})`);
-                  const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'ml_exit_partial');
-                  positionManager.applyPartialExit(
-                    qtyToExit, partialResult.fill_price, partialResult.fill_time_iso,
-                    partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig,
-                  );
-                  lastMlActionTimestampV1 = Date.now();
-                }
-              }
-            }
-
-            // Record execution for cooldown tracking
-            execPolicy.recordExecution(mlDec.action);
-
-            } // end execution policy should_execute block
-          } else if (mlDec.action !== 'HOLD' && mlDec.action !== 'NO_ACTION' && !mlDec.approved) {
-            // Log rejections at lower frequency (every 10th cycle)
-            if (_cycleNumber % 10 === 0) {
-              console.log(`[ML] Rejected: ${mlDec.action} — ${mlDec.rejection_reason}`);
-            }
-          }
-        } catch (err) {
-          // ML failures must never break trading — log and continue
-          if (_cycleNumber % 30 === 0) {
-            console.warn(`[ML] Decision error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-      }
-
-      dashboardState.flush();
-      return;
-    }
-
-    const slipVsPlan = Math.abs(exit.exitPrice - exit.plannedExitPrice);
-    console.log(
-      `[EXIT] trigger=${exit.reason} planned=${exit.plannedExitPrice.toFixed(contract.price_decimals)} ` +
-      `actual=${exit.exitPrice.toFixed(contract.price_decimals)} slip=${slipVsPlan.toFixed(2)}pts`,
-    );
-    const pos = positionManager.getPosition()!;
-    if (exit.isPartial) {
-      logWriter.writeExecutionIntent({
-        event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exit.exitPrice, quantity: exit.partialQuantity,
-      });
-      const partialResult = await adapter.placeExit(pos.side, exit.partialQuantity, exit.exitPrice, exit.reason);
-      logWriter.writeExecutionIntent({
-        event: 'trade_exit_filled', timestamp: partialResult.fill_time_iso,
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: partialResult.fill_price, quantity: partialResult.quantity,
-        slippage_pts: partialResult.slippage_pts, fee_usd: partialResult.fee_usd, order_id: partialResult.order_id,
-      });
-      const fillTimeIso = partialResult.fill_time_iso;
-      const slippagePts = Math.abs(exit.exitPrice - exit.plannedExitPrice);
-      if (exit.reason === 'partial_profit_1') {
-        positionManager.applyPt1Exit(exit.partialQuantity, exit.exitPrice, fillTimeIso, partialResult.fee_usd, slippagePts, effectiveConfig);
-      } else if (exit.reason === 'partial_profit_2') {
-        positionManager.applyPt2Exit(exit.partialQuantity, exit.exitPrice, fillTimeIso, partialResult.fee_usd, slippagePts, effectiveConfig);
-      } else {
-        // T1-hit partial (target_1 as partial trigger)
-        positionManager.applyPartialExit(exit.partialQuantity, exit.exitPrice, fillTimeIso, partialResult.fee_usd, slippagePts, effectiveConfig);
-      }
-    } else if (exit.reason === 'partial_profit_1' && !exit.isPartial) {
-      // Single-contract position: PT1 triggers a full exit — no prior partial leg recorded,
-      // closePosition() will compute pnl from quantity_remaining (= original qty) correctly.
-      logWriter.writeExecutionIntent({
-        event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exit.exitPrice, quantity: pos.quantity_remaining,
-      });
-      const exitResult = await adapter.placeExit(pos.side, pos.quantity_remaining, exit.exitPrice, exit.reason);
-      logWriter.writeExecutionIntent({
-        event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exitResult.fill_price, quantity: exitResult.quantity,
-        slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
-      });
-      // Mark PT1 fields on position for backward-compat consumers
-      const posRef = positionManager.getPosition();
-      if (posRef) {
-        posRef.pt1_done = true;
-        posRef.pt1_qty_exited = pos.quantity_remaining;
-      }
-      const tradeRecord = positionManager.closePosition(
-        exitResult, exit.reason, lastRegime, sessionId, env.STRATEGY_VERSION, exit.plannedExitPrice,
-        {
-          target_1_direction_valid: pos.target_1_direction_valid,
-          target_2_direction_valid: pos.target_2_direction_valid,
-          target_3_direction_valid: pos.target_3_direction_valid,
-          target_ordering_valid: pos.target_ordering_valid,
-          target_repair_applied: pos.target_repair_applied,
-        },
-      );
-      logWriter.writeExecutionIntent({
-        event: 'trade_closed', timestamp: new Date().toISOString(),
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
-        r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
-      });
-      logWriter.writeTrade(tradeRecord);
-      tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
-      riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
-      perfTracker.recordTrade(tradeRecord);
-      dashboardState.updatePosition(null);
-      dashboardState.clearManagement();
-      lastMgmtMetrics = null;
-      dashboardState.recordTrade(tradeRecord);
-      dashboardState.updatePerformance(perfTracker.getStats());
-      dashboardState.updateRisk(riskManager.getState());
-      dashboardState.flush();
-      console.log(
-        `[RUNNER] Trade closed (PT1 full): ${tradeRecord.outcome_class.toUpperCase()} ` +
-        `| $${tradeRecord.pnl_realized.toFixed(2)} | ${tradeRecord.r_multiple}R`,
-      );
-      recentEventLog.push(`trade_closed:${tradeRecord.trade_id}:${tradeRecord.outcome_class}:${tradeRecord.r_multiple}R`);
-      lobClient.endTradeContext(tradeRecord.trade_id).catch(() => {});
-      phaseManager.transitionTo('EXITING', `exit:${exit.reason}`);
-      phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
-      lastCooldownActive = phaseManager.current() === 'COOLDOWN';
-    } else {
-      logWriter.writeExecutionIntent({
-        event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exit.exitPrice, quantity: pos.quantity_remaining,
-      });
-      const exitResult = await adapter.placeExit(pos.side, pos.quantity_remaining, exit.exitPrice, exit.reason);
-      logWriter.writeExecutionIntent({
-        event: 'trade_exit_filled', timestamp: exitResult.fill_time_iso,
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exitResult.fill_price, quantity: exitResult.quantity,
-        slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
-      });
-      const tradeRecord = positionManager.closePosition(
-        exitResult, exit.reason, lastRegime, sessionId, env.STRATEGY_VERSION, exit.plannedExitPrice,
-        {
-          target_1_direction_valid: pos.target_1_direction_valid,
-          target_2_direction_valid: pos.target_2_direction_valid,
-          target_3_direction_valid: pos.target_3_direction_valid,
-          target_ordering_valid: pos.target_ordering_valid,
-          target_repair_applied: pos.target_repair_applied,
-        },
-      );
-      logWriter.writeExecutionIntent({
-        event: 'trade_closed', timestamp: new Date().toISOString(),
-        trade_id: pos.trade_id, side: pos.side, source: 'management', reason: exit.reason,
-        price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
-        r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
-      });
-      logWriter.writeTrade(tradeRecord);
-      tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
-      riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
-      perfTracker.recordTrade(tradeRecord);
-      dashboardState.updatePosition(null);
-      dashboardState.clearManagement();
-      lastMgmtMetrics = null;
-      dashboardState.recordTrade(tradeRecord);
-      dashboardState.updatePerformance(perfTracker.getStats());
-      dashboardState.updateRisk(riskManager.getState());
-      dashboardState.flush();
-      console.log(
-        `[RUNNER] Trade closed: ${tradeRecord.outcome_class.toUpperCase()} ` +
-        `| $${tradeRecord.pnl_realized.toFixed(2)} | ${tradeRecord.r_multiple}R`,
-      );
-      recentEventLog.push(`trade_closed:${tradeRecord.trade_id}:${tradeRecord.outcome_class}:${tradeRecord.r_multiple}R`);
-      lobClient.endTradeContext(tradeRecord.trade_id).catch(() => {});
-      phaseManager.transitionTo('EXITING', `exit:${exit.reason}`);
-      phaseManager.startCooldown(effectiveConfig.cooldown_bars ?? 0, tradeRecord.side);
-      lastCooldownActive = phaseManager.current() === 'COOLDOWN';
-    }
-  };
 
   // ─── Analysis cycle ─────────────────────────────────────────────────────────
   const onAnalysis = async (cycleNumber: number): Promise<void> => {
@@ -1157,9 +968,9 @@ async function main(): Promise<void> {
       }
     }
 
-    // MANAGING: position is open — run exit evaluation + trade-path logging only
+    // MANAGING: position is open — V2 management lane handles exits.
+    // onAnalysis only logs trade-path and dashboard state when MANAGING.
     if (phase === 'MANAGING') {
-      await onMonitor(cycleNumber);
       const pos = positionManager.getPosition();
       if (pos) {
         const direction = pos.side === 'short' ? '🔴' : '🟢';
@@ -1937,11 +1748,24 @@ async function main(): Promise<void> {
       // ── Risk check + entry execution ───────────────────────────────────
       // Pass dynamic min RR from reward plan so the risk manager uses the
       // same canonical gate as applyHardGates() — no more duplicate fixed checks.
-      const riskBlock = riskManager.preTradeCheck(bestSetup, rewardPlan?.dynamic_min_rr);
+      // Pass current open qty so the risk manager can enforce invariant I2
+      // (MAX_NET_POSITION_PER_SYMBOL). Today this is always 0 because the
+      // runner already gates on !hasOpenPosition() upstream, but plumbing the
+      // value through keeps the invariant correct if scale-in ever lands.
+      const _currentOpenQty = positionManager.hasOpenPosition()
+        ? (positionManager.getPosition()?.quantity_remaining ?? 0)
+        : 0;
+      const riskBlock = riskManager.preTradeCheck(
+        bestSetup,
+        rewardPlan?.dynamic_min_rr,
+        _currentOpenQty,
+      );
       if (riskBlock) {
         // Compute sizing detail so we can log every input that contributed to the rejection.
-        const sizingDetail = riskManager.calcPositionSize(bestSetup);
+        const _blockSessionBucket = classifySession().strategy_bucket;
+        const sizingDetail = riskManager.calcTargetSizing(bestSetup, regime, _blockSessionBucket);
         riskManager.logSizingDecision(sizingDetail, bestSetup.direction as 'long' | 'short', contract.root, contract.point_value, false);
+        riskManager.logTargetSizingDecision(sizingDetail, bestSetup.direction as 'long' | 'short', contract.root, false);
         signal.reason_for_skip = (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') + riskBlock;
         signal.no_trade = true;
         console.log(`[RUNNER] 🚫 Risk check blocked trade: ${riskBlock}`);
@@ -1957,8 +1781,23 @@ async function main(): Promise<void> {
       } else {
         phaseManager.transitionTo('ENTERING', `signal_${bestSetup.direction}_${bestSetup.setup_type}`);
         try {
-          const sizing = riskManager.calcPositionSize(bestSetup);
-          riskManager.logSizingDecision(sizing, bestSetup.direction as 'long' | 'short', contract.root, contract.point_value, true);
+          const _entrySessionBucket = classifySession().strategy_bucket;
+          const sizing = riskManager.calcTargetSizing(bestSetup, regime, _entrySessionBucket);
+          const _sizingApproved = sizing.quantity > 0;
+          riskManager.logSizingDecision(sizing, bestSetup.direction as 'long' | 'short', contract.root, contract.point_value, _sizingApproved);
+          riskManager.logTargetSizingDecision(sizing, bestSetup.direction as 'long' | 'short', contract.root, _sizingApproved);
+
+          // Guard: if the target-position model zeroed out (e.g. drawdown ratchet
+          // or softcap collapse), abort entry before creating any order state.
+          // Fall through to the normal rejected-signal logging path below.
+          if (!_sizingApproved) {
+            signal.reason_for_skip =
+              (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') +
+              `target_sizing_zero: ${sizing.reason}`;
+            signal.no_trade = true;
+            console.log(`[RUNNER] 🚫 Target-position sizing produced 0 contracts — ${sizing.reason}`);
+            phaseManager.transitionTo('FLAT', 'target_sizing_zero');
+          } else {
 
           const _entryTradeId = `TRADE_${sessionId}_${String(totalSignals).padStart(4, '0')}`;
           logWriter.writeExecutionIntent({
@@ -2022,6 +1861,7 @@ async function main(): Promise<void> {
           positionManager.openPosition(position);
           tradeJournal.append('trade_opened', tradeId, 'runner', bestSetup.setup_type, position);
           riskManager.recordTradeOpen();
+          managementEngine.beginTrade(tradeId);
           phaseManager.transitionTo('MANAGING', `position_opened:${tradeId}`);
 
           // Notify LOB sidecar of trade context (non-blocking)
@@ -2075,7 +1915,7 @@ async function main(): Promise<void> {
             dashboardState.seedMlConfig(mlConfig);
           }
           recentEventLog.push(`trade_opened:${tradeId}:${bestSetup.direction}:${bestSetup.setup_type}`);
-
+          } // end if (_sizingApproved)
         } catch (entryErr) {
           console.error(`[RUNNER] ❌ Entry failed, reverting to FLAT:`, entryErr);
           phaseManager.transitionTo('FLAT', `entry_failed:${entryErr}`);
@@ -2215,10 +2055,10 @@ async function main(): Promise<void> {
     }
   };
 
-  // ─── V2 Multi-Lane Engine ─────────────────────────────────────────────────
-  if (effectiveConfig.runner_v2_enabled) {
+  // ─── V2 Multi-Lane Engine (canonical) ────────────────────────────────────
+  {
     const laneTiming = effectiveConfig.lane_timing ?? {};
-    const shadowOnly = effectiveConfig.runner_v2_shadow_only ?? true;
+    const shadowOnly = executionMode === 'shadow';
     const executionLock = new ExecutionLock();
     const sharedState: LaneSharedState = createLaneSharedState();
 
@@ -2408,6 +2248,7 @@ async function main(): Promise<void> {
           logWriter.writeTrade(tradeRecord);
           tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
           riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+          managementEngine.endTrade();
           perfTracker.recordTrade(tradeRecord);
           dashboardState.updatePosition(null);
           dashboardState.clearManagement();
@@ -2436,22 +2277,178 @@ async function main(): Promise<void> {
       const price = sharedState.lastPrice;
       if (price === null) return; // no quote yet
 
+      // ── Zombie-trade watchdog (ported from V1 onMonitor) ─────────────────
+      const holdMs = Date.now() - new Date(pos.entry_time_iso).getTime();
+      if (holdMs > ZOMBIE_THRESHOLD_MS && Date.now() - lastZombieWarningAt > ZOMBIE_LOG_INTERVAL_MS) {
+        lastZombieWarningAt = Date.now();
+        const quoteAge = Date.now() - sharedState.lastQuoteAt;
+        console.warn(
+          `[ZOMBIE-TRADE] trade_id=${pos.trade_id} open for ${Math.round(holdMs / 60000)}min | ` +
+          `price=${price} stop=${pos.stop_current} entry=${pos.entry_price} | ` +
+          `side=${pos.side} qty=${pos.quantity_remaining} | ` +
+          `quote_age=${quoteAge}ms | ` +
+          `last_mgmt_state=${lastMgmtMetrics?.management_state ?? 'none'}`,
+        );
+      }
+
       // Freshness gate for price-sensitive decisions
       const quoteAge = Date.now() - sharedState.lastQuoteAt;
       const staleThreshold = laneTiming.management_stale_threshold_ms ?? 3000;
 
       // Management metrics (always compute, even with stale quotes)
       const sessionCtx = classifySession();
+      const _riskState = riskManager.getState();
       const mgmtFeatures = buildManagementFeatures(
         pos, price,
         sharedState.lastLiteSnap?.indicators_1m ?? lastSnap?.indicators_1m ?? null,
         sharedState.lastRegime as MarketRegime,
-        sessionCtx.strategy_bucket ?? null,
+        sessionCtx.strategy_bucket,
+        _riskState.daily_loss_pct,
+        effectiveConfig.max_daily_loss_pct,
+        effectiveConfig.account_equity,
+        effectiveConfig.max_risk_per_trade_pct,
       );
-      const mgmtMetrics = managementEngine.evaluate(mgmtFeatures);
+      const mgmtMetrics = managementEngine.evaluate(mgmtFeatures, pos.trade_id);
       lastMgmtMetrics = mgmtMetrics;
       sharedState.lastMgmtMetrics = mgmtMetrics;
       dashboardState.updateManagement(mgmtMetrics);
+
+      // ── Target-position REDUCE consumer ─────────────────────────────────
+      // When the target-position layer has requested a partial reduce via
+      // management_state === 'REDUCE' with a requested_qty_to_exit, execute
+      // it through the same partial-exit path the ML layer uses. EXIT_NOW
+      // from target-position flatten/dust branches is handled by the existing
+      // full-exit path farther down (reason strings 'target_position_flatten'
+      // and 'target_position_residual_below_minimum').
+      if (
+        mgmtMetrics.management_state === 'REDUCE' &&
+        mgmtMetrics.requested_qty_to_exit != null &&
+        mgmtMetrics.requested_qty_to_exit > 0 &&
+        pos.quantity_remaining > mgmtMetrics.requested_qty_to_exit
+      ) {
+        const qtyToExit = Math.floor(mgmtMetrics.requested_qty_to_exit);
+        try {
+          const exitResult = await adapter.placeExit(
+            pos.side,
+            qtyToExit,
+            price,
+            'target_position_reduce',
+          );
+          if (exitResult.status === 'filled' && exitResult.quantity > 0) {
+            // 1. Apply the partial to local state (updates quantity_remaining).
+            try {
+              positionManager.applyPartialExit(
+                exitResult.quantity,
+                exitResult.fill_price,
+                exitResult.fill_time_iso,
+                exitResult.fee_usd,
+                exitResult.slippage_pts,
+                effectiveConfig,
+              );
+              // 2. Notify the engine — starts cooldown, resets persistence counter.
+              managementEngine.notifyReduceApplied();
+              console.log(
+                `[TARGET_POS][execute] ✅ REDUCE ${qtyToExit} ${contract.root} @ ${exitResult.fill_price} ` +
+                `(${mgmtMetrics.management_state_reason})`,
+              );
+              dashboardState.updatePosition(positionManager.getPosition());
+            } catch (syncErr) {
+              // Bracket-sync failure: the fill happened but local/bracket state
+              // could not be reconciled. Block further target-position reduces
+              // on this trade until reconciliation is verified.
+              managementEngine.notifyBracketSyncFailed();
+              console.error(
+                `[TARGET_POS] bracket_sync_failed on trade_id=${pos.trade_id}: ${syncErr}`,
+              );
+            }
+          } else {
+            console.log(
+              `[TARGET_POS][execute] 🚫 REDUCE ${qtyToExit} rejected (status=${exitResult.status})`,
+            );
+          }
+        } catch (execErr) {
+          console.error(`[TARGET_POS][execute] ❌ REDUCE failed:`, execErr);
+        }
+      }
+
+      // ── Target-position FLATTEN / DUST-RESIDUAL consumer ────────────────
+      // EXIT_NOW driven by target-position (flatten-on-zero-target or
+      // dust-residual) routes to the full-exit path. The management-state
+      // reason string begins with 'target_position_' so we can disambiguate
+      // from legacy EV/PoP EXIT_NOW (which stays advisory-only for V1a).
+      if (
+        mgmtMetrics.management_state === 'EXIT_NOW' &&
+        (mgmtMetrics.management_state_reason.startsWith('target_position_flatten') ||
+          mgmtMetrics.management_state_reason.startsWith('target_position_residual_below_minimum'))
+      ) {
+        const exitReason = mgmtMetrics.management_state_reason.startsWith(
+          'target_position_flatten',
+        )
+          ? 'target_position_flatten'
+          : 'target_position_residual_below_minimum';
+        await executionLock.runExclusive(async () => {
+          const exitPos = positionManager.getPosition();
+          if (!exitPos) return;
+          logWriter.writeExecutionIntent({
+            event: 'trade_exit_submitted',
+            timestamp: new Date().toISOString(),
+            trade_id: exitPos.trade_id,
+            side: exitPos.side,
+            source: 'management',
+            reason: exitReason,
+            price,
+            quantity: exitPos.quantity_remaining,
+          });
+          const exitResult = await adapter.placeExit(
+            exitPos.side,
+            exitPos.quantity_remaining,
+            price,
+            exitReason,
+          );
+          logWriter.writeExecutionIntent({
+            event: 'trade_exit_filled',
+            timestamp: exitResult.fill_time_iso,
+            trade_id: exitPos.trade_id,
+            side: exitPos.side,
+            source: 'management',
+            reason: exitReason,
+            price: exitResult.fill_price,
+            quantity: exitResult.quantity,
+            slippage_pts: exitResult.slippage_pts,
+            fee_usd: exitResult.fee_usd,
+            order_id: exitResult.order_id,
+          });
+          const tradeRecord = positionManager.closePosition(
+            exitResult,
+            exitReason,
+            sharedState.lastRegime as MarketRegime,
+            sessionId,
+            env.STRATEGY_VERSION,
+            price,
+            {
+              target_1_direction_valid: exitPos.target_1_direction_valid,
+              target_2_direction_valid: exitPos.target_2_direction_valid,
+              target_3_direction_valid: exitPos.target_3_direction_valid,
+              target_ordering_valid: exitPos.target_ordering_valid,
+              target_repair_applied: exitPos.target_repair_applied,
+            },
+          );
+          logWriter.writeTrade(tradeRecord);
+          tradeJournal.append('final_close', tradeRecord.trade_id, 'target_position', exitReason, null);
+          riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+          managementEngine.endTrade();
+          perfTracker.recordTrade(tradeRecord);
+          dashboardState.updatePosition(null);
+          dashboardState.clearManagement();
+          dashboardState.clearMlManagement();
+          lastMgmtMetrics = null;
+          dashboardState.recordTrade(tradeRecord);
+          console.log(
+            `[TARGET_POS][execute] ✅ ${exitReason.toUpperCase()} closed trade_id=${exitPos.trade_id} ` +
+              `pnl=$${tradeRecord.pnl_realized.toFixed(2)}`,
+          );
+        }, { isPartial: false, skipIfExitInFlight: true });
+      }
 
       // ML inference (runs in BOTH shadow and active modes for observability)
       if (mlConfig.enabled && positionManager.hasOpenPosition()) {
@@ -2657,6 +2654,7 @@ async function main(): Promise<void> {
                     logWriter.writeTrade(tradeRecord);
                     tradeJournal.append('final_close', tradeRecord.trade_id, 'ml_management', tradeRecord.exit_reason, null);
                     riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+                    managementEngine.endTrade();
                     perfTracker.recordTrade(tradeRecord);
                     dashboardState.updatePosition(null);
                     dashboardState.clearManagement();
@@ -2997,6 +2995,7 @@ async function main(): Promise<void> {
           logWriter.writeTrade(tradeRecord);
           tradeJournal.append('final_close', tradeRecord.trade_id, 'runner', tradeRecord.exit_reason, null);
           riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
+          managementEngine.endTrade();
           perfTracker.recordTrade(tradeRecord);
           dashboardState.updatePosition(null);
           dashboardState.clearManagement();
@@ -3100,18 +3099,6 @@ async function main(): Promise<void> {
     laneSchedulerRef = laneScheduler;
 
     await laneScheduler.run();
-  } else {
-    // ─── V1 Legacy Scheduler ──────────────────────────────────────────────
-    await scheduler.runHybrid({
-      analysisIntervalMs: effectiveConfig.analysis_interval_seconds * 1000,
-      monitorIntervalMs: effectiveConfig.in_position_monitor_seconds * 1000,
-      isInPosition: () => positionManager.hasOpenPosition(),
-      onAnalysis,
-      onMonitor,
-      onShadowAnalysis: async (cycleNumber) => {
-        await runShadowSignal(lastSnap, cycleNumber);
-      },
-    });
   }
 
   // ── Ordered shutdown (explicit drains, not sleep-based) ─────────────────
@@ -3213,6 +3200,9 @@ async function main(): Promise<void> {
     } finally {
       clearTimeout(forceExit);
       runtimeState.releaseLock();                                       // 11. ALWAYS last
+    }
+    if (lobClient.contextErrors > 0) {
+      console.warn(`[LOB] ⚠️ ${lobClient.contextErrors} context management errors during session (trade/signal context start/end failures)`);
     }
     console.log('[RUNNER] ✅ Session ended cleanly.');
   }

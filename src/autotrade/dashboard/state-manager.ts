@@ -98,6 +98,7 @@ export class DashboardStateManager extends EventEmitter {
   // Risk
   private riskState: RiskStateInput | null = null;
   private accountEquity = 25_000;
+  private maxDailyLossPct = 1.5;
 
 
   // ML Management
@@ -140,6 +141,10 @@ export class DashboardStateManager extends EventEmitter {
     this.appMeta = meta;
     this.contract = contract;
     this.accountEquity = equity;
+  }
+
+  setMaxDailyLossPct(pct: number): void {
+    this.maxDailyLossPct = pct;
   }
 
   setEngineRunning(running: boolean): void {
@@ -394,7 +399,7 @@ export class DashboardStateManager extends EventEmitter {
     // Remaining loss budget
     let remainingBudget: number | null = null;
     if (risk) {
-      const maxLossDollar = this.accountEquity * 0.015; // from config
+      const maxLossDollar = this.accountEquity * (this.maxDailyLossPct / 100);
       remainingBudget = Math.round((maxLossDollar - Math.abs(Math.min(0, risk.daily_pnl_usd))) * 100) / 100;
     }
 
@@ -445,6 +450,22 @@ export class DashboardStateManager extends EventEmitter {
         pt1_resolved_pts: null,
         pt2_resolved_pts: null,
         trail_resolved_ticks: null,
+        q_target: null,
+        q_target_delta: null,
+        q_target_action_kind: null,
+        q_target_action_qty: null,
+        q_target_bound_by: null,
+        q_target_bound_by_all: null,
+        q_risk_component: null,
+        q_softcap_component: null,
+        q_softcap_confidence_factor: null,
+        q_softcap_confidence_raw: null,
+        q_softcap_confidence_source: null,
+        q_softcap_regime_factor: null,
+        q_softcap_session_factor: null,
+        q_softcap_drawdown_factor: null,
+        q_target_from_stale_cache: null,
+        q_target_bracket_sync_blocked: null,
       };
     }
 
@@ -452,7 +473,16 @@ export class DashboardStateManager extends EventEmitter {
     const pnlPts = pos.side === 'short'
       ? pos.entry_price - price
       : price - pos.entry_price;
-    const pointValue = this.contract?.point_value ?? 20;
+    // Fail fast: the dashboard must never silently fall back to an NQ
+    // point_value (=20). If this fires, it means a position exists but the
+    // contract was never registered on the state manager — a bug upstream.
+    if (!this.contract) {
+      throw new Error(
+        'state-manager: cannot compute unrealized PnL — contract is not set. ' +
+        'Check that setContract() is called before position updates arrive.',
+      );
+    }
+    const pointValue = this.contract.point_value;
     const pnlUsd = pnlPts * pos.quantity_remaining * pointValue;
     const riskPts = Math.abs(pos.entry_price - pos.stop_initial);
     const unrealizedR = riskPts > 0 ? Math.round((pnlPts / riskPts) * 100) / 100 : 0;
@@ -485,6 +515,32 @@ export class DashboardStateManager extends EventEmitter {
       pt1_resolved_pts: pos.management_params?.pt1_offset_pts ?? null,
       pt2_resolved_pts: pos.management_params?.pt2_offset_pts ?? null,
       trail_resolved_ticks: pos.management_params?.trail_ticks_post_t1 ?? null,
+      // ── Target-position fields (from last ManagementMetrics snapshot) ──
+      q_target: this.managementMetrics?.target_position?.q_target ?? null,
+      q_target_delta: this.managementMetrics?.target_position?.delta ?? null,
+      q_target_action_kind: this.managementMetrics?.target_position?.action_kind ?? null,
+      q_target_action_qty: this.managementMetrics?.target_position?.action_qty ?? null,
+      q_target_bound_by: this.managementMetrics?.target_position?.bound_by ?? null,
+      q_target_bound_by_all:
+        this.managementMetrics?.target_position?.bound_by_all?.slice() ?? null,
+      q_risk_component: this.managementMetrics?.target_position?.q_risk ?? null,
+      q_softcap_component: this.managementMetrics?.target_position?.q_softcap ?? null,
+      q_softcap_confidence_factor:
+        this.managementMetrics?.target_position?.confidence_factor ?? null,
+      q_softcap_confidence_raw:
+        this.managementMetrics?.target_position?.confidence_raw ?? null,
+      q_softcap_confidence_source:
+        this.managementMetrics?.target_position?.confidence_source ?? null,
+      q_softcap_regime_factor:
+        this.managementMetrics?.target_position?.regime_factor ?? null,
+      q_softcap_session_factor:
+        this.managementMetrics?.target_position?.session_factor ?? null,
+      q_softcap_drawdown_factor:
+        this.managementMetrics?.target_position?.drawdown_factor ?? null,
+      q_target_from_stale_cache:
+        this.managementMetrics?.target_position?.from_stale_cache ?? null,
+      q_target_bracket_sync_blocked:
+        this.managementMetrics?.target_position?.bracket_sync_block_active ?? null,
     };
   }
 
@@ -746,7 +802,13 @@ export class DashboardStateManager extends EventEmitter {
     const pnlPts = pos.side === 'short'
       ? pos.entry_price - price
       : price - pos.entry_price;
-    const pointValue = this.contract?.point_value ?? 20;
+    // Fail fast: see companion check in getPositionSection() above.
+    if (!this.contract) {
+      throw new Error(
+        'state-manager: cannot compute unrealized PnL — contract is not set.',
+      );
+    }
+    const pointValue = this.contract.point_value;
     return pnlPts * pos.quantity_remaining * pointValue;
   }
 

@@ -12,11 +12,15 @@ import type { ManagementFeatures } from './types.js';
 /**
  * Build the feature vector for the in-trade management layer.
  *
- * @param pos             The current open Position (position-manager.ts)
- * @param currentPrice    Fresh quote price (from QuoteService)
- * @param snap            The most recent IndicatorSnapshot (may be stale by 1 cycle)
- * @param regime          Last known market regime
- * @param sessionBucket   e.g. 'NY_AM' | 'NY_PM' | 'LUNCH' | null
+ * @param pos               The current open Position (position-manager.ts)
+ * @param currentPrice      Fresh quote price (from QuoteService)
+ * @param snap              The most recent IndicatorSnapshot (may be stale by 1 cycle)
+ * @param regime            Last known market regime
+ * @param sessionBucket     e.g. 'NY_AM' | 'NY_LUNCH' | 'NY_PM' | null
+ * @param dailyLossPct      Positive drawdown magnitude from RiskManager.getState()
+ * @param maxDailyLossPct   Max daily loss limit from config
+ * @param accountEquity     Account equity for q_risk computation
+ * @param maxRiskPerTradePct Max risk per trade (percent) for q_risk computation
  */
 export function buildManagementFeatures(
   pos: Position,
@@ -24,6 +28,10 @@ export function buildManagementFeatures(
   snap: IndicatorSnapshot | null,
   regime: MarketRegime | null,
   sessionBucket: string | null,
+  dailyLossPct: number,
+  maxDailyLossPct: number,
+  accountEquity: number,
+  maxRiskPerTradePct: number,
 ): ManagementFeatures {
   const isLong = pos.side === 'long';
   const initialRiskPts = Math.abs(pos.entry_price - pos.stop_initial);
@@ -136,5 +144,9 @@ export function buildManagementFeatures(
     regime,
     session_bucket: sessionBucket,
     ttm_squeeze_firing: snap?.ttm_squeeze_firing ?? null,
+    daily_loss_pct: dailyLossPct,
+    max_daily_loss_pct: maxDailyLossPct,
+    account_equity: accountEquity,
+    max_risk_per_trade_pct: maxRiskPerTradePct,
   };
 }

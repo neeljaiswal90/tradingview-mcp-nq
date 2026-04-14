@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import type { IndicatorConfig, IndicatorChangeRecord } from './types.js';
 import type { LogWriter } from './log-writer.js';
+import { DEFAULT_POSITION_TARGET_CONFIG } from './target-position.js';
 
 /**
  * DEFAULT_CONFIG must stay in sync with config/indicator-config.json.
@@ -37,7 +38,6 @@ const DEFAULT_CONFIG: IndicatorConfig = {
   min_rr: 2,
   max_risk_per_trade_pct: 1.5,
   max_daily_loss_pct: 1.5,
-  max_consecutive_losses: 5,
   account_equity: 25_000,
   time_stop_minutes: 30,
   time_stop_max_r_pre_t1: 0.25,
@@ -61,11 +61,37 @@ const DEFAULT_CONFIG: IndicatorConfig = {
   dual_min_score: 7.5,
   dual_score_margin: 1.0,
   dual_choppy_extra_margin: 0.5,
+  startup_backfill_minutes: 60,
+  cycle_stall_threshold_ms: 15_000,
+  cycle_cusum_k: 0.5,
+  cycle_cusum_h: 5.0,
+  cycle_cusum_baseline_samples: 60,
+  enable_post_flip_first_pullback_short: false,
+  post_flip_first_pullback_short_max_retest_atr: 0.20,
+  directional_freshness: {
+    enabled: true,
+    long_vwap_mode: 'hard',
+    short_vwap_mode: 'hard',
+    short_above_vwap_allowance_session_atr: 0.35,
+    short_above_vwap_penalty: 0.4,
+    require_5m_structure: true,
+    require_supertrend_or_ema21_exception: true,
+    short_above_vwap_penalty_midpoint_atr: 0.20,
+    short_above_vwap_penalty_slope_atr: 0.08,
+  },
+  session_score_overrides: {},
+  session_selection_floor_overrides: {},
+  scoring_weights: {
+    htf_conflict_transition_relief: 0.35,
+    reversal_transition_bonus: 0.2,
+    contextual_positive_cap: 0.5,
+    reversal_bonus_peak_bars_since_flip: 7,
+    reversal_bonus_sigma_bars: 3,
+  },
   cooldown_bars: 0,
   no_same_bar_reversal: false,
   max_quote_age_ms_for_management: 3_000,
   quote_poll_timeout_ms: 1_000,
-  enable_stale_quote_fallback: false,
   htf_zones: {
     enabled: true,
     study_filter: 'APP HTF Pivot Zones',
@@ -83,6 +109,7 @@ const DEFAULT_CONFIG: IndicatorConfig = {
     score_bonus_near_support: 0.25,
     score_bonus_reclaimed_support: 0.5,
   },
+  position_target: DEFAULT_POSITION_TARGET_CONFIG,
 };
 
 /**
@@ -93,9 +120,9 @@ const VALIDATION_RULES: Array<[keyof IndicatorConfig, number, number, string]> =
   ['account_equity', 100, 10_000_000, 'Account equity (USD)'],
   ['max_risk_per_trade_pct', 0.1, 5.0, 'Max risk per trade (%)'],
   ['max_daily_loss_pct', 0.5, 10.0, 'Max daily loss (%)'],
-  ['max_consecutive_losses', 1, 20, 'Max consecutive losses'],
   ['time_stop_minutes', 5, 120, 'Time stop (minutes)'],
   ['analysis_interval_seconds', 5, 300, 'Analysis interval (seconds)'],
+  ['startup_backfill_minutes', 5, 480, 'Startup backfill minutes'],
   ['min_confidence', 1, 10, 'Min confidence threshold'],
   ['min_rr', 0.5, 10, 'Min reward:risk ratio'],
   ['opening_range_minutes', 5, 60, 'Opening range window (minutes)'],
@@ -111,6 +138,7 @@ const VALIDATION_RULES: Array<[keyof IndicatorConfig, number, number, string]> =
   ['pt2_exit_fraction', 0, 1, 'PT2 exit fraction'],
   ['max_quote_age_ms_for_management', 500, 30_000, 'Max quote age for management (ms)'],
   ['quote_poll_timeout_ms', 100, 5_000, 'Quote poll timeout (ms)'],
+  ['cycle_stall_threshold_ms', 5_000, 3_600_000, 'Cycle stall threshold (ms)'],
 ];
 
 export interface ConfigValidationResult {
@@ -202,6 +230,68 @@ export class IndicatorConfigManager {
       }
     }
 
+    // Validate position_target if present
+    const pt = this.config.position_target;
+    if (pt) {
+      if (pt.hard_cap < 1 || pt.hard_cap > 100) {
+        errors.push(`position_target.hard_cap: ${pt.hard_cap} outside [1, 100]`);
+      }
+      if (pt.soft_cap_base < 1 || pt.soft_cap_base > 100) {
+        errors.push(`position_target.soft_cap_base: ${pt.soft_cap_base} outside [1, 100]`);
+      }
+      if (pt.min_confidence_for_full_size < 0 || pt.min_confidence_for_full_size > 1) {
+        errors.push(`position_target.min_confidence_for_full_size: ${pt.min_confidence_for_full_size} outside [0, 1]`);
+      }
+      if (pt.management_reduce_min_delta < 1) {
+        errors.push(`position_target.management_reduce_min_delta: must be >= 1`);
+      }
+      if (pt.management_reduce_cooldown_sec < 0) {
+        errors.push(`position_target.management_reduce_cooldown_sec: must be >= 0`);
+      }
+      if (pt.reduce_large_delta_threshold < pt.management_reduce_min_delta) {
+        errors.push(
+          `position_target.reduce_large_delta_threshold (${pt.reduce_large_delta_threshold}) must be >= management_reduce_min_delta (${pt.management_reduce_min_delta})`,
+        );
+      }
+      if (pt.reduce_persistence_cycles_small_delta < 1) {
+        errors.push(`position_target.reduce_persistence_cycles_small_delta: must be >= 1`);
+      }
+      if (pt.min_residual_contracts < 0) {
+        errors.push(`position_target.min_residual_contracts: must be >= 0`);
+      }
+      if (pt.max_target_reduce_per_cycle < 1) {
+        errors.push(`position_target.max_target_reduce_per_cycle: must be >= 1`);
+      }
+      if (pt.stop_widening_allowed) {
+        warnings.push(
+          `position_target.stop_widening_allowed=true is not supported in V1a — target-position math may react unpredictably to stop widening`,
+        );
+      }
+      // Regime factors must include 'default' and be finite numbers in [0, 2]
+      if (!pt.regime_factors || typeof pt.regime_factors.default !== 'number') {
+        errors.push(`position_target.regime_factors: missing 'default' fallback`);
+      } else {
+        for (const [key, val] of Object.entries(pt.regime_factors)) {
+          if (typeof val !== 'number' || !Number.isFinite(val)) {
+            errors.push(`position_target.regime_factors.${key}: expected number, got ${typeof val}`);
+          } else if (val < 0 || val > 2) {
+            warnings.push(`position_target.regime_factors.${key}=${val} outside typical [0, 2]`);
+          }
+        }
+      }
+      if (!pt.session_factors || typeof pt.session_factors.default !== 'number') {
+        errors.push(`position_target.session_factors: missing 'default' fallback`);
+      } else {
+        for (const [key, val] of Object.entries(pt.session_factors)) {
+          if (typeof val !== 'number' || !Number.isFinite(val)) {
+            errors.push(`position_target.session_factors.${key}: expected number, got ${typeof val}`);
+          } else if (val < 0 || val > 2) {
+            warnings.push(`position_target.session_factors.${key}=${val} outside typical [0, 2]`);
+          }
+        }
+      }
+    }
+
     return { valid: errors.length === 0, errors, warnings };
   }
 
@@ -220,7 +310,6 @@ export class IndicatorConfigManager {
     console.log(`│  ACCOUNT_EQUITY:      $${c.account_equity.toLocaleString()}`);
     console.log(`│  MAX_RISK_PCT:        ${c.max_risk_per_trade_pct}%  →  risk_budget=$${riskBudget}`);
     console.log(`│  MAX_DAILY_LOSS_PCT:  ${c.max_daily_loss_pct}%`);
-    console.log(`│  MAX_CONSEC_LOSSES:   ${c.max_consecutive_losses}`);
     console.log(`│  MIN_CONFIDENCE:      ${c.min_confidence}`);
     console.log(`│  TIME_STOP:           ${c.time_stop_minutes}min`);
     console.log(`│  ANALYSIS_INTERVAL:   ${c.analysis_interval_seconds}s`);
