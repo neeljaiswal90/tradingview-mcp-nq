@@ -37,6 +37,7 @@ import { APP_VERSION, APP_BUILD_SHA, computeConfigHash } from '../shared/app-ver
 import { computeScoreV2 } from './scoring/score-v2.js';
 import { DEFAULT_SCORING_WEIGHTS } from './strategy.js';
 import { RiskManager } from './risk.js';
+import { normalizeExitOutcome } from './order-outcome.js';
 import { createAdapter } from './execution.js';
 import { PositionManager } from './position-manager.js';
 import { getManagementProfile, resolveProfile } from './management-profiles.js';
@@ -948,6 +949,17 @@ async function main(): Promise<void> {
         console.log(
           `[COLLECT] ${collectionTiming.total_ms}ms | 1m:${collectionTiming.phase_1m_ms}ms ` +
           `| HTF cache hits=[${hits}] misses=[${misses}]`,
+        );
+      }
+      // COLLECT_DIAG=1: emit every miss cycle (not throttled) so we get enough samples quickly
+      if (process.env.COLLECT_DIAG === '1' && collectionTiming.miss_detail) {
+        const md = collectionTiming.miss_detail;
+        const fmt = (tf: string, d?: { stf_ms: number; goh_ms: number }) =>
+          d ? `${tf}:{stf=${d.stf_ms} goh=${d.goh_ms}}` : `${tf}:{hit}`;
+        console.log(
+          `[COLLECT-DIAG] total=${collectionTiming.total_ms}ms ` +
+          `${fmt('5m', md.tf_5m)} ${fmt('15m', md.tf_15m)} ${fmt('1h', md.tf_1h)} ` +
+          `restore=${collectionTiming.phase_restore_ms}ms enrich=${collectionTiming.phase_enrich_ms}ms`,
         );
       }
     }
@@ -2320,6 +2332,10 @@ async function main(): Promise<void> {
       // from target-position flatten/dust branches is handled by the existing
       // full-exit path farther down (reason strings 'target_position_flatten'
       // and 'target_position_residual_below_minimum').
+      //
+      // The adapter result is normalized through normalizeExitOutcome() so
+      // paper fills (status='simulated') and future partial-fill statuses
+      // are handled identically. See src/autotrade/order-outcome.ts.
       if (
         mgmtMetrics.management_state === 'REDUCE' &&
         mgmtMetrics.requested_qty_to_exit != null &&
@@ -2334,12 +2350,16 @@ async function main(): Promise<void> {
             price,
             'target_position_reduce',
           );
-          if (exitResult.status === 'filled' && exitResult.quantity > 0) {
+          const outcome = normalizeExitOutcome(exitResult, qtyToExit);
+          if (outcome.accepted) {
             // 1. Apply the partial to local state (updates quantity_remaining).
+            //    IMPORTANT: use outcome.filledQty, NOT qtyToExit — if a future
+            //    broker adapter returns a partial fill, we must decrement by
+            //    what actually filled, not what we asked for.
             try {
               positionManager.applyPartialExit(
-                exitResult.quantity,
-                exitResult.fill_price,
+                outcome.filledQty,
+                outcome.fillPrice ?? price,
                 exitResult.fill_time_iso,
                 exitResult.fee_usd,
                 exitResult.slippage_pts,
@@ -2348,8 +2368,8 @@ async function main(): Promise<void> {
               // 2. Notify the engine — starts cooldown, resets persistence counter.
               managementEngine.notifyReduceApplied();
               console.log(
-                `[TARGET_POS][execute] ✅ REDUCE ${qtyToExit} ${contract.root} @ ${exitResult.fill_price} ` +
-                `(${mgmtMetrics.management_state_reason})`,
+                `[TARGET_POS][execute] ✅ REDUCE ${outcome.filledQty} ${contract.root} @ ${outcome.fillPrice ?? price} ` +
+                `(status=${outcome.status} ${mgmtMetrics.management_state_reason})`,
               );
               dashboardState.updatePosition(positionManager.getPosition());
             } catch (syncErr) {
@@ -2363,7 +2383,7 @@ async function main(): Promise<void> {
             }
           } else {
             console.log(
-              `[TARGET_POS][execute] 🚫 REDUCE ${qtyToExit} rejected (status=${exitResult.status})`,
+              `[TARGET_POS][execute] 🚫 REDUCE ${qtyToExit} rejected (${outcome.reason ?? 'unknown'})`,
             );
           }
         } catch (execErr) {
@@ -2682,8 +2702,25 @@ async function main(): Promise<void> {
                       const qtyToExit = Math.max(1, Math.floor(mlPos.quantity_remaining * frac));
                       if (qtyToExit > 0 && qtyToExit < mlPos.quantity_remaining) {
                         const partialResult = await adapter.placeExit(mlPos.side, qtyToExit, price, 'ml_exit_partial');
-                        positionManager.applyPartialExit(qtyToExit, partialResult.fill_price, partialResult.fill_time_iso, partialResult.fee_usd, partialResult.slippage_pts, effectiveConfig);
-                        actionExecuted = true;
+                        // Normalize through the shared exit-outcome helper so paper
+                        // ('simulated') and future partial-fill statuses are handled
+                        // identically to the target-position REDUCE path.
+                        const outcome = normalizeExitOutcome(partialResult, qtyToExit);
+                        if (outcome.accepted) {
+                          positionManager.applyPartialExit(
+                            outcome.filledQty,
+                            outcome.fillPrice ?? price,
+                            partialResult.fill_time_iso,
+                            partialResult.fee_usd,
+                            partialResult.slippage_pts,
+                            effectiveConfig,
+                          );
+                          actionExecuted = true;
+                        } else {
+                          console.log(
+                            `[ML_EXIT_PARTIAL] 🚫 rejected qty=${qtyToExit} (${outcome.reason ?? 'unknown'})`,
+                          );
+                        }
                       }
                     }
                   }
