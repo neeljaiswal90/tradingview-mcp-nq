@@ -17,7 +17,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 
 // Feature schema version — must stay in sync with FEATURE_SCHEMA_VERSION in
 // python-market-data-service/lob_features/ml_feature_registry.py.
@@ -41,7 +41,25 @@ import { normalizeExitOutcome } from './order-outcome.js';
 import { createAdapter } from './execution.js';
 import { PositionManager } from './position-manager.js';
 import { getManagementProfile, resolveProfile } from './management-profiles.js';
-import { LogWriter } from './log-writer.js';
+import {
+  LogWriter,
+  registerScalperLogWriter,
+  setScalperRejectionSampleRate,
+  registerScalperDashboardObserver,
+} from './log-writer.js';
+import { registerScalperGeneratorOptions } from './strategies/lob-mbo-scalp.js';
+import { loadScalperExpectancyTable } from './features/scalper-expectancy-loader.js';
+import {
+  resolveScalperModelDir,
+  loadScalperCoefsFromDir,
+  buildScalperMlDecider,
+  buildFallbackScalperMlDecider,
+} from './ml-entry/scalper-local-coefs-loader.js';
+import type { ScalperShadowDecisionConfig } from './features/scalper-shadow-decision.js';
+import {
+  DEFAULT_SCALPER_GATE_CONFIG,
+  type ScalperDeterministicGateConfig,
+} from './features/scalper-state.js';
 import { IndicatorConfigManager } from './indicator-config-manager.js';
 import { PerformanceTracker } from './performance-tracker.js';
 import { LaneScheduler } from './scheduler.js';
@@ -57,6 +75,10 @@ import { DashboardStateManager, DashboardServer } from './dashboard/index.js';
 import { ManagementDecisionEngine, buildManagementFeatures } from './management/index.js';
 import type { ManagementMetrics } from './management/index.js';
 import { getMlDecision, checkMlHealth, DEFAULT_ML_CONFIG, decideAction } from './ml/index.js';
+import { evaluateMlManagementStartupGate } from './ml/ml-management-startup-gate.js';
+import { evaluateMlExecutionReadinessGate, mlStopMoveWidensRisk } from './ml/ml-execution-invariants.js';
+import { buildExecutionIntentPolicyStamp } from './execution-intent-policy.js';
+import { resolveMlPolicy } from './ml-policy.js';
 import type { MlManagementConfig, MlDecision, MlDecisionResult, MlFeatureVector } from './ml/index.js';
 import { getEntryMlDecision, DEFAULT_ENTRY_ML_CONFIG, ENTRY_FEATURE_SCHEMA_VERSION } from './ml-entry/index.js';
 import type { EntryMlConfig, EntryMlDecision } from './ml-entry/index.js';
@@ -253,6 +275,7 @@ function printCycleSummary(opts: {
 }
 
 async function main(): Promise<void> {
+  const runnerProcessStartMs = Date.now();
   const env = loadEnv();
   printEnv(env);
 
@@ -333,6 +356,15 @@ async function main(): Promise<void> {
   });
   logWriter.startFlushTimer();
 
+  // Phase 4.1: register this LogWriter as the destination for scalper
+  // candidate rows. The lob_mbo_scalp generator in
+  // src/autotrade/strategies/lob-mbo-scalp.ts writes via a module-level
+  // wrapper that looks up this registration. Rejection sampling rate
+  // defaults to 1 (no sampling, unbiased early shadow data) — Phase 6
+  // config wiring will let the user raise it via indicator-config.json
+  // if volume becomes a concern.
+  registerScalperLogWriter(logWriter);
+
   // Write the canonical release stamp so every artifact from this session
   // can be correlated to one shipped build. See src/shared/app-version.ts.
   try {
@@ -381,9 +413,183 @@ async function main(): Promise<void> {
 
   const effectiveConfig = configManager.getConfig();
 
+  // ─── Phase 6 scalper generator wiring ──────────────────────────────────────
+  //
+  // Closes the Phase 5 `missing_shadow_config` canary. The scalper
+  // generator refuses to run with implicit defaults (Phase 5 "no
+  // hidden thresholds" rule), so the runner must:
+  //
+  //   1. Read the `lob_mbo_scalp` top-level config block and build a
+  //      typed `ScalperShadowDecisionConfig` from it.
+  //   2. Load the expectancy bucket table from the configured path
+  //      (`reports/ml/lob_mbo_scalp/expectancy_buckets.json` by default).
+  //   3. Resolve the coefs model directory via the standard chain
+  //      (LOB_MBO_SCALP_MODEL_DIR env → promoted.json → latest dir).
+  //   4. Load + validate the six coefs files.
+  //   5. Build a SYNC ML decider closure that runs in-process
+  //      `computeScalperLogisticInference` — no HTTP.
+  //   6. Register the options bag via `registerScalperGeneratorOptions`.
+  //   7. Plumb the rejection sample rate from config into the writer.
+  //
+  // Every step is fail-loud on config errors (throws from the
+  // scalper management profile validator, typed mismatches) but
+  // fail-SOFT on missing artifacts: if the expectancy table or coefs
+  // are not yet built, we log a warning and leave the options bag
+  // unregistered. The Phase 5 generator then emits
+  // `missing_shadow_config` for every scalper cycle — which is
+  // exactly the observable state we want during the bootstrap phase
+  // before any model has been trained.
+  try {
+    const scalperCfg = (effectiveConfig as unknown as {
+      lob_mbo_scalp?: {
+        theta_p?: number;
+        ev_floor_ticks?: number;
+        min_bucket_samples?: number;
+        round_turn_cost_ticks?: number;
+        hybrid_gate?: boolean;
+        rejection_sample_rate?: number;
+        expectancy_bucket_table_path?: string;
+        gate_thresholds?: {
+          spreadMaxTicks?: number;
+          qiMin?: number;
+          edgeMinTicks?: number;
+          zOfiFastMin?: number;
+          zOfiSlowMin?: number;
+          absorptionMin?: number;
+          hazardDiffMin?: number;
+        };
+      };
+    }).lob_mbo_scalp;
+
+    if (!scalperCfg) {
+      console.warn('[SCALPER] No `lob_mbo_scalp` config block found — scalper shadow path stays cold.');
+    } else {
+      // Rejection sample rate into the writer
+      const rsr = scalperCfg.rejection_sample_rate ?? 1;
+      if (typeof rsr === 'number' && Number.isFinite(rsr) && rsr >= 1) {
+        setScalperRejectionSampleRate(rsr);
+      }
+
+      // Typed shadow decision config — explicit fields, no optional chains
+      const shadowDecisionConfig: ScalperShadowDecisionConfig = {
+        theta_p: scalperCfg.theta_p ?? 0.55,
+        ev_floor_ticks: scalperCfg.ev_floor_ticks ?? 0.5,
+        min_bucket_samples: scalperCfg.min_bucket_samples ?? 30,
+        cost_ticks: scalperCfg.round_turn_cost_ticks ?? 0.5,
+        hybrid_gate: scalperCfg.hybrid_gate ?? false,
+      };
+
+      // Deterministic gate thresholds — per-field overrides on top of
+      // DEFAULT_SCALPER_GATE_CONFIG. Missing fields fall through to the
+      // defaults. MNQ operators should set spreadMaxTicks: 2 in config
+      // (the default is 1, tuned for the parent NQ contract which
+      // trades on a tighter book).
+      const gt = scalperCfg.gate_thresholds;
+      const deterministicConfig: ScalperDeterministicGateConfig = {
+        spreadMaxTicks: gt?.spreadMaxTicks ?? DEFAULT_SCALPER_GATE_CONFIG.spreadMaxTicks,
+        qiMin: gt?.qiMin ?? DEFAULT_SCALPER_GATE_CONFIG.qiMin,
+        edgeMinTicks: gt?.edgeMinTicks ?? DEFAULT_SCALPER_GATE_CONFIG.edgeMinTicks,
+        zOfiFastMin: gt?.zOfiFastMin ?? DEFAULT_SCALPER_GATE_CONFIG.zOfiFastMin,
+        zOfiSlowMin: gt?.zOfiSlowMin ?? DEFAULT_SCALPER_GATE_CONFIG.zOfiSlowMin,
+        absorptionMin: gt?.absorptionMin ?? DEFAULT_SCALPER_GATE_CONFIG.absorptionMin,
+        hazardDiffMin: gt?.hazardDiffMin ?? DEFAULT_SCALPER_GATE_CONFIG.hazardDiffMin,
+      };
+
+      // Expectancy bucket table — optional until a table is built
+      const bucketPath = scalperCfg.expectancy_bucket_table_path ?? 'reports/ml/lob_mbo_scalp/expectancy_buckets.json';
+      const bucketResult = loadScalperExpectancyTable(bucketPath);
+      console.log(`[SCALPER] Expectancy bucket load: status=${bucketResult.status} path=${bucketPath}`);
+      console.log(`[SCALPER]   detail: ${bucketResult.detail}`);
+
+      // Coefs — optional until the Phase 4.4 trainer has run and produced a promoted version
+      const modelDir = resolveScalperModelDir(process.cwd());
+      let mlDecider: ReturnType<typeof buildScalperMlDecider> | null = null;
+      if (modelDir) {
+        const coefsResult = loadScalperCoefsFromDir(modelDir);
+        console.log(
+          `[SCALPER] Coefs load: status=${coefsResult.status} modelDir=${modelDir} ` +
+          `version=${coefsResult.modelVersion} loadTimeMs=${coefsResult.loadTimeMs}`,
+        );
+        if (coefsResult.status !== 'loaded') {
+          console.warn(`[SCALPER]   detail: ${coefsResult.detail}`);
+        }
+        if (coefsResult.status === 'loaded') {
+          mlDecider = buildScalperMlDecider({
+            coefsByTargetKey: coefsResult.coefsByTargetKey,
+            modelVersion: coefsResult.modelVersion,
+          });
+        }
+      } else {
+        console.warn('[SCALPER] No scalper model directory resolvable (no env / promoted.json / versions/*).');
+      }
+
+      // Phase 8 Option B — ALWAYS register generator options, even when
+      // the expectancy bucket table and/or coefs are missing. The
+      // fallback decider from `buildFallbackScalperMlDecider()` returns
+      // `ready=false, reason='bootstrap_no_model'` on every call, so
+      // the Phase 5 shadow rule produces a stable ml_readiness /
+      // ml_unavailable / expectancy_no_bucket_match reject chain
+      // instead of the pre-gate `missing_shadow_config` short-circuit.
+      //
+      // Effect: candidate log rows start flowing on day zero. The
+      // gate chain (deterministic + persistence + expectancy) runs
+      // end-to-end against real Phase 1 sidecar features, and every
+      // evaluation writes a JSONL row with honest telemetry. Once
+      // the operator accumulates enough data to build real artifacts,
+      // promoting them and restarting switches the generator from
+      // the fallback to the real ML path — no code change.
+      //
+      // Rows produced via the fallback are TELEMETRY-ONLY. Any
+      // row whose `ml_decision.model_version === 'bootstrap_no_model'`
+      // must NOT feed into training data or rollout gate math; the
+      // trainer + labeler filter them out by model_version.
+      const effectiveDecider = mlDecider ?? buildFallbackScalperMlDecider();
+      const effectiveTable = bucketResult.status === 'loaded' ? bucketResult.table : null;
+
+      registerScalperGeneratorOptions({
+        shadowDecisionConfig,
+        expectancyTable: effectiveTable,
+        mlDecider: effectiveDecider,
+        deterministicConfig,
+      });
+
+      const expectancyTag = bucketResult.status === 'loaded' ? 'real' : 'bootstrap_null';
+      const mlTag = mlDecider !== null ? 'real' : 'bootstrap_fallback';
+      console.log(
+        `[SCALPER] Generator options registered — ` +
+        `theta_p=${shadowDecisionConfig.theta_p} ` +
+        `ev_floor_ticks=${shadowDecisionConfig.ev_floor_ticks} ` +
+        `hybrid_gate=${shadowDecisionConfig.hybrid_gate} ` +
+        `rejection_sample_rate=${rsr} ` +
+        `expectancy=${expectancyTag} ml=${mlTag}`,
+      );
+      console.log(
+        `[SCALPER] Deterministic gate thresholds — ` +
+        `spreadMaxTicks=${deterministicConfig.spreadMaxTicks} ` +
+        `qiMin=${deterministicConfig.qiMin} ` +
+        `edgeMinTicks=${deterministicConfig.edgeMinTicks} ` +
+        `zOfiFastMin=${deterministicConfig.zOfiFastMin} ` +
+        `zOfiSlowMin=${deterministicConfig.zOfiSlowMin} ` +
+        `absorptionMin=${deterministicConfig.absorptionMin} ` +
+        `hazardDiffMin=${deterministicConfig.hazardDiffMin}`,
+      );
+      if (expectancyTag === 'bootstrap_null' || mlTag === 'bootstrap_fallback') {
+        console.warn(
+          `[SCALPER] Running in BOOTSTRAP MODE — telemetry rows will accumulate with ` +
+          `ml_readiness_not_confirmed / ml_unavailable / expectancy_no_bucket_match reject reasons. ` +
+          `Train artifacts and promote to exit bootstrap.`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(`[SCALPER] Phase 6 wiring failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // ─── Canonical execution_mode normalization ────────────────────────────────
   const executionMode: 'shadow' | 'paper' | 'live' =
     effectiveConfig.execution_mode ?? 'paper';
+
+  const resolvedMlPolicy = resolveMlPolicy(effectiveConfig, executionMode);
 
   // Short config hash used by every candidate_scores_v2 row so results
   // can be bound to a specific config revision without requiring the
@@ -454,6 +660,92 @@ async function main(): Promise<void> {
   let lastMlDecision: MlDecision | null = null;
   const mlConfig: MlManagementConfig = effectiveConfig.ml_management ?? DEFAULT_ML_CONFIG;
   const entryMlConfig: EntryMlConfig = effectiveConfig.entry_ml ?? DEFAULT_ENTRY_ML_CONFIG;
+
+  const mlStartupGate = await evaluateMlManagementStartupGate(mlConfig, env.LOG_DIR, {
+    skipHealthProbe: !resolvedMlPolicy.inference_enabled,
+  });
+  let latestRuntimeFeatureSchemaHash: string | null = null;
+  let latestRequiredLiveFeatureGroupOk: boolean | undefined;
+  let mlReadinessGate = evaluateMlExecutionReadinessGate(resolvedMlPolicy, {
+    repoRoot: process.cwd(),
+    processStartedAtMs: runnerProcessStartMs,
+    runtimeCodeSha: APP_BUILD_SHA,
+    mlConfigModelVersion: mlConfig.model_version ?? null,
+    featureSchemaHashRuntime: latestRuntimeFeatureSchemaHash,
+    requiredLiveFeatureGroupOk: latestRequiredLiveFeatureGroupOk,
+  });
+  let mlManagementBrokerExecutionAllowed =
+    resolvedMlPolicy.execution_enabled &&
+    !mlStartupGate.executionBlockedByMismatch &&
+    mlReadinessGate.mlExecutionAllowed;
+  let lastReadinessWarningSig = '';
+  let lastReadinessBlockSig = '';
+
+  const writeReadinessProvenanceArtifact = (): void => {
+    try {
+      const p = join(process.cwd(), 'reports', 'ml', 'readiness');
+      if (!existsSync(p)) mkdirSync(p, { recursive: true });
+      writeFileSync(
+        join(p, 'execution_gate_provenance.json'),
+        JSON.stringify({
+          generated_at: new Date().toISOString(),
+          policy_mode: resolvedMlPolicy.mode,
+          execution_enabled: resolvedMlPolicy.execution_enabled,
+          startup_gate_blocked: mlStartupGate.executionBlockedByMismatch,
+          readiness_reasons: mlReadinessGate.reasons,
+          readiness_warnings: mlReadinessGate.warnings,
+          readiness_allowed: mlReadinessGate.mlExecutionAllowed,
+          ml_management_broker_execution_allowed: mlManagementBrokerExecutionAllowed,
+          provenance: mlReadinessGate.provenance,
+        }, null, 2),
+        'utf8',
+      );
+    } catch (err) {
+      console.warn(`[ML] failed to write execution_gate_provenance.json: ${(err as Error).message}`);
+    }
+  };
+
+  const refreshMlReadinessGate = (): void => {
+    mlReadinessGate = evaluateMlExecutionReadinessGate(resolvedMlPolicy, {
+      repoRoot: process.cwd(),
+      processStartedAtMs: runnerProcessStartMs,
+      runtimeCodeSha: APP_BUILD_SHA,
+      mlConfigModelVersion: mlConfig.model_version ?? null,
+      featureSchemaHashRuntime: latestRuntimeFeatureSchemaHash,
+      requiredLiveFeatureGroupOk: latestRequiredLiveFeatureGroupOk,
+    });
+    mlManagementBrokerExecutionAllowed =
+      resolvedMlPolicy.execution_enabled &&
+      !mlStartupGate.executionBlockedByMismatch &&
+      mlReadinessGate.mlExecutionAllowed;
+    const warnSig = mlReadinessGate.warnings.join(';');
+    if (warnSig && warnSig !== lastReadinessWarningSig) {
+      console.warn(`[ML] Readiness gate warnings: ${warnSig}`);
+      lastReadinessWarningSig = warnSig;
+    }
+    const blockSig = mlReadinessGate.reasons.join(';');
+    if (!mlReadinessGate.mlExecutionAllowed && resolvedMlPolicy.execution_enabled && blockSig !== lastReadinessBlockSig) {
+      console.warn(`[ML] Readiness gate blocking ML broker execution: ${blockSig}`);
+      lastReadinessBlockSig = blockSig;
+    }
+    writeReadinessProvenanceArtifact();
+  };
+  refreshMlReadinessGate();
+
+  const executionIntentPolicyStamp = (): string =>
+    buildExecutionIntentPolicyStamp(executionMode, {
+      mlPolicyMode: resolvedMlPolicy.mode,
+      mlInferenceEnabled: resolvedMlPolicy.inference_enabled,
+      mlBrokerExecutionEnabled:
+        mlManagementBrokerExecutionAllowed && executionMode !== 'shadow',
+    });
+
+  runtimeState.patchMlGovernance({
+    ml_policy_mode: resolvedMlPolicy.mode,
+    ml_model_version: mlConfig.model_version || null,
+    config_sha_short: CONFIG_HASH_SHORT,
+    code_sha: APP_BUILD_SHA,
+  });
 
   // ── Phase 8 Stage A: load expectancy bucket table once at startup ───
   //
@@ -610,6 +902,10 @@ async function main(): Promise<void> {
   const riskManager = new RiskManager(effectiveConfig, contract);
   const adapter = createAdapter(env.MODE, env.LIVE_TRADING_ENABLED, contract);
   const positionManager = new PositionManager(contract, instrumentSymbol);
+  /** Per-trade ML canary cohort (assigned once at entry). */
+  const mlCanaryByTrade = new Map<string, boolean>();
+  /** Monotonic management / ML cycle counter per open trade for `management_cycle_id`. */
+  const mlMgmtCycleSeqByTrade = new Map<string, number>();
   positionManager.setManagementEventHandler((event) => logWriter.writeManagementEvent(event));
   positionManager.setPositionChangeHandler((pos) => {
     runtimeState.updatePositionKnown(pos?.trade_id ?? null);
@@ -768,6 +1064,16 @@ async function main(): Promise<void> {
     effectiveConfig.account_equity,
   );
   dashboardState.setMaxDailyLossPct(effectiveConfig.max_daily_loss_pct);
+
+  // Phase 7: wire the scalper log writer to publish per-family metrics
+  // into the dashboard state manager. One call per scalper candidate
+  // row. The observer is synchronous and must never throw — any error
+  // is logged and suppressed inside writeLobMboScalpCandidate so a
+  // buggy dashboard cannot corrupt the training log pipeline.
+  registerScalperDashboardObserver((row) => {
+    dashboardState.recordScalperShadowDecision(row);
+  });
+
   // Hydrate recent trades from disk
   dashboardState.loadTradesFromDisk(logWriter.readAllTrades());
   // Hydrate performance stats if available
@@ -1816,6 +2122,7 @@ async function main(): Promise<void> {
             event: 'trade_entry_submitted', timestamp: new Date().toISOString(),
             trade_id: _entryTradeId, side: bestSetup.direction as 'long' | 'short', source: 'analysis',
             price: snap.price, quantity: sizing.quantity,
+            policy_mode: executionIntentPolicyStamp(),
           });
 
           const entryResult = await adapter.placeEntry(bestSetup, sizing.quantity, snap.price);
@@ -1826,6 +2133,7 @@ async function main(): Promise<void> {
             trade_id: tradeId, side: bestSetup.direction as 'long' | 'short', source: 'analysis',
             price: entryResult.fill_price, quantity: entryResult.quantity,
             slippage_pts: entryResult.slippage_pts, fee_usd: entryResult.fee_usd, order_id: entryResult.order_id,
+            policy_mode: executionIntentPolicyStamp(),
           });
 
           // ── Resolve management profile for this setup type ─────────────
@@ -1871,6 +2179,16 @@ async function main(): Promise<void> {
           );
           position.management_variant = effectiveConfig.active_management_variant ?? 'baseline_tight_exit';
           positionManager.openPosition(position);
+          {
+            let canaryMl = false;
+            if (resolvedMlPolicy.mode === 'ml_canary_execute' && resolvedMlPolicy.canary_percent > 0) {
+              canaryMl = Math.random() * 100 < resolvedMlPolicy.canary_percent;
+            } else if (resolvedMlPolicy.mode === 'ml_primary_execute') {
+              canaryMl = true;
+            }
+            mlCanaryByTrade.set(tradeId, canaryMl);
+            mlMgmtCycleSeqByTrade.set(tradeId, 0);
+          }
           tradeJournal.append('trade_opened', tradeId, 'runner', bestSetup.setup_type, position);
           riskManager.recordTradeOpen();
           managementEngine.beginTrade(tradeId);
@@ -2223,6 +2541,7 @@ async function main(): Promise<void> {
             event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
             trade_id: exitPos.trade_id, side: exitPos.side, source: 'hard_risk', reason: exitReason,
             price: exitDecision.exitPrice, quantity: exitPos.quantity_remaining,
+            policy_mode: executionIntentPolicyStamp(),
           });
           console.log(`[EXECUTOR] submitting paper exit trade_id=${exitPos.trade_id}`);
 
@@ -2234,6 +2553,7 @@ async function main(): Promise<void> {
             trade_id: exitPos.trade_id, side: exitPos.side, source: 'hard_risk', reason: exitReason,
             price: exitResult.fill_price, quantity: exitResult.quantity,
             slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+            policy_mode: executionIntentPolicyStamp(),
           });
           console.log(`[EXECUTOR] paper exit acknowledged trade_id=${exitPos.trade_id} fill=${exitResult.fill_price}`);
 
@@ -2252,8 +2572,11 @@ async function main(): Promise<void> {
           logWriter.writeExecutionIntent({
             event: 'trade_closed', timestamp: new Date().toISOString(),
             trade_id: exitPos.trade_id, side: exitPos.side, source: 'hard_risk', reason: exitReason,
+            exit_source: 'hard_risk',
+            position_final_state: 'flat',
             price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
             r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+            policy_mode: executionIntentPolicyStamp(),
           });
           console.log(`[POSITION] closed trade_id=${exitPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
 
@@ -2418,6 +2741,7 @@ async function main(): Promise<void> {
             reason: exitReason,
             price,
             quantity: exitPos.quantity_remaining,
+            policy_mode: executionIntentPolicyStamp(),
           });
           const exitResult = await adapter.placeExit(
             exitPos.side,
@@ -2437,6 +2761,7 @@ async function main(): Promise<void> {
             slippage_pts: exitResult.slippage_pts,
             fee_usd: exitResult.fee_usd,
             order_id: exitResult.order_id,
+            policy_mode: executionIntentPolicyStamp(),
           });
           const tradeRecord = positionManager.closePosition(
             exitResult,
@@ -2453,6 +2778,21 @@ async function main(): Promise<void> {
               target_repair_applied: exitPos.target_repair_applied,
             },
           );
+          logWriter.writeExecutionIntent({
+            event: 'trade_closed',
+            timestamp: new Date().toISOString(),
+            trade_id: exitPos.trade_id,
+            side: exitPos.side,
+            source: 'management',
+            reason: exitReason,
+            exit_source: 'target_position',
+            position_final_state: 'flat',
+            price: exitResult.fill_price,
+            pnl_realized: tradeRecord.pnl_realized,
+            r_multiple: tradeRecord.r_multiple,
+            outcome_class: tradeRecord.outcome_class,
+            policy_mode: executionIntentPolicyStamp(),
+          });
           logWriter.writeTrade(tradeRecord);
           tradeJournal.append('final_close', tradeRecord.trade_id, 'target_position', exitReason, null);
           riskManager.recordTradeClose(tradeRecord.pnl_realized, tradeRecord.outcome_class);
@@ -2470,8 +2810,8 @@ async function main(): Promise<void> {
         }, { isPartial: false, skipIfExitInFlight: true });
       }
 
-      // ML inference (runs in BOTH shadow and active modes for observability)
-      if (mlConfig.enabled && positionManager.hasOpenPosition()) {
+      // ML inference — gated by resolved `ml_policy` / legacy `ml_management`.
+      if (resolvedMlPolicy.inference_enabled && positionManager.hasOpenPosition()) {
         const mlInterval = laneTiming.ml_management_interval_ms ?? 8000;
         const sinceLastMl = Date.now() - sharedState.lastMlCallAt;
 
@@ -2523,6 +2863,12 @@ async function main(): Promise<void> {
               .update(Object.keys(mlResult.features).filter(k => k !== 'trade_id').sort().join(','))
               .digest('hex')
               .slice(0, 8);
+            latestRuntimeFeatureSchemaHash = _featureSchemaHash;
+            latestRequiredLiveFeatureGroupOk =
+              mlResult.features.lob_spread_ticks !== null &&
+              mlResult.features.lob_bid_size !== null &&
+              mlResult.features.lob_ask_size !== null;
+            refreshMlReadinessGate();
             logWriter.writeMlManagementFeatures({
               ...JSON.parse(mlResult.serializedRequestBody),
               _timestamp: new Date().toISOString(),
@@ -2593,11 +2939,75 @@ async function main(): Promise<void> {
             });
 
             // Execute only when BOTH the gate approves AND the phase policy agrees
+            const mlCanaryTradeOk =
+              resolvedMlPolicy.mode !== 'ml_canary_execute' ||
+              mlCanaryByTrade.get(pos.trade_id) === true;
+            const actionAllowedByPolicy =
+              mlDec.action === 'NO_ACTION' ||
+              mlDec.action === 'HOLD' ||
+              resolvedMlPolicy.allow_actions.includes(mlDec.action);
             const shouldExecuteMl = !shadowOnly
+              && mlManagementBrokerExecutionAllowed
+              && mlCanaryTradeOk
+              && actionAllowedByPolicy
               && mlDec.approved
               && mlDec.action !== 'NO_ACTION'
               && mlDec.action !== 'HOLD'
               && phaseDecision.action !== 'HOLD';
+
+            {
+              const seq = (mlMgmtCycleSeqByTrade.get(pos.trade_id) ?? 0) + 1;
+              mlMgmtCycleSeqByTrade.set(pos.trade_id, seq);
+              const decisionTs = new Date().toISOString();
+              const managementCycleId = `${pos.trade_id}:${seq}`;
+              const rulesAction = mgmtMetrics.management_state ?? 'UNKNOWN';
+              const gateBlocked = !shouldExecuteMl;
+              const gateReason = gateBlocked
+                ? (!mlManagementBrokerExecutionAllowed
+                  ? 'ml_execution_disabled'
+                  : shadowOnly
+                    ? 'execution_mode_shadow'
+                    : !mlCanaryTradeOk
+                      ? 'canary_cohort_excluded'
+                      : !actionAllowedByPolicy
+                        ? `policy_action_disallowed:${mlDec.action}`
+                      : !mlDec.approved
+                        ? (mlDec.rejection_reason ?? 'ml_rejected')
+                        : mlDec.action === 'NO_ACTION' || mlDec.action === 'HOLD'
+                          ? 'ml_passive'
+                          : phaseDecision.action === 'HOLD'
+                            ? `phase_hold:${phaseDecision.reason}`
+                            : 'blocked_unknown')
+                : 'ok';
+              logWriter.writeMlManagementAction({
+                _type: 'management_decision_v1',
+                management_cycle_id: managementCycleId,
+                decision_ts: decisionTs,
+                trade_id: pos.trade_id,
+                policy_mode: resolvedMlPolicy.mode,
+                rules_action: rulesAction,
+                ml_action: mlDec.action,
+                ml_confidence: mlDec.confidence,
+                gate_verdict: gateBlocked ? 'blocked' : 'allowed',
+                gate_reason: gateReason,
+                executed_action: shouldExecuteMl ? mlDec.action : rulesAction,
+                executed_source: shouldExecuteMl ? 'ml_management' : 'rules',
+                should_execute_ml: shouldExecuteMl,
+                model_version: mlDec.model_version || mlConfig.model_version,
+                current_unrealized_r: Math.round(_curR * 1000) / 1000,
+                current_pnl_pts: Math.round(_pnlPts * 100) / 100,
+                current_price: price,
+              });
+              logWriter.appendManagementShadowReplay({
+                _type: 'shadow_hypothesis_v1',
+                management_cycle_id: managementCycleId,
+                decision_ts: decisionTs,
+                trade_id: pos.trade_id,
+                rules_action: rulesAction,
+                ml_action: mlDec.action,
+                shadow_hypo_note: 'hypothetical_state_not_computed',
+              });
+            }
 
             if (shouldExecuteMl) {
               const mlLobSnapForPolicy = mlLobSnap;
@@ -2639,6 +3049,7 @@ async function main(): Promise<void> {
                       event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
                       trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management', reason: 'ml_exit_all',
                       price, quantity: mlPos.quantity_remaining,
+                      policy_mode: executionIntentPolicyStamp(),
                     });
                     console.log(`[EXECUTOR] submitting paper exit trade_id=${mlPos.trade_id}`);
 
@@ -2649,6 +3060,7 @@ async function main(): Promise<void> {
                       trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management', reason: 'ml_exit_all',
                       price: exitResult.fill_price, quantity: exitResult.quantity,
                       slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+                      policy_mode: executionIntentPolicyStamp(),
                     });
                     console.log(`[EXECUTOR] paper exit acknowledged trade_id=${mlPos.trade_id} fill=${exitResult.fill_price}`);
 
@@ -2666,8 +3078,11 @@ async function main(): Promise<void> {
                     logWriter.writeExecutionIntent({
                       event: 'trade_closed', timestamp: new Date().toISOString(),
                       trade_id: mlPos.trade_id, side: mlPos.side, source: 'ml_management', reason: 'ml_exit_all',
+                      exit_source: 'ml_management',
+                      position_final_state: 'flat',
                       price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
                       r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+                      policy_mode: executionIntentPolicyStamp(),
                     });
                     console.log(`[POSITION] closed trade_id=${mlPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
 
@@ -2694,8 +3109,15 @@ async function main(): Promise<void> {
                     positionManager.moveStopToBreakeven();
                     actionExecuted = true;
                   } else if (mlDec.action === 'MOVE_STOP' && mlDec.recommended_stop_price !== null) {
-                    positionManager.moveStopTo(mlDec.recommended_stop_price);
-                    actionExecuted = true;
+                    if (mlStopMoveWidensRisk(mlPos.side, mlPos.stop_current, mlDec.recommended_stop_price)) {
+                      console.warn(
+                        `[ML] blocked MOVE_STOP: proposed stop would widen risk ` +
+                        `(side=${mlPos.side} current=${mlPos.stop_current} proposed=${mlDec.recommended_stop_price})`,
+                      );
+                    } else {
+                      positionManager.moveStopTo(mlDec.recommended_stop_price);
+                      actionExecuted = true;
+                    }
                   } else if (mlDec.action === 'EXIT_PARTIAL' && mlConfig.enable_partial_exit) {
                     const frac = mlDec.recommended_size_fraction;
                     if (frac !== null && frac > 0 && frac < 1) {
@@ -2925,6 +3347,9 @@ async function main(): Promise<void> {
         stop_current: pos.stop_current,
         trailing_active: pos.trailing_active,
         target_1: pos.target_1,
+        planned_target_1: pos.planned_target_1 ?? pos.target_1,
+        effective_target_1: pos.effective_target_1 ?? null,
+        first_partial_fill_price: pos.first_partial_fill_price ?? null,
         target_2: pos.target_2,
         partial_exit_done: pos.partial_exit_done,
         quantity_remaining: pos.quantity_remaining,
@@ -2997,6 +3422,7 @@ async function main(): Promise<void> {
             event: 'trade_exit_submitted', timestamp: new Date().toISOString(),
             trade_id: exitPos.trade_id, side: exitPos.side, source: 'management', reason: exitReason,
             price: exit.exitPrice, quantity: exitPos.quantity_remaining,
+            policy_mode: executionIntentPolicyStamp(),
           });
           console.log(`[EXECUTOR] submitting paper exit trade_id=${exitPos.trade_id}`);
 
@@ -3007,6 +3433,7 @@ async function main(): Promise<void> {
             trade_id: exitPos.trade_id, side: exitPos.side, source: 'management', reason: exitReason,
             price: exitResult.fill_price, quantity: exitResult.quantity,
             slippage_pts: exitResult.slippage_pts, fee_usd: exitResult.fee_usd, order_id: exitResult.order_id,
+            policy_mode: executionIntentPolicyStamp(),
           });
           console.log(`[EXECUTOR] paper exit acknowledged trade_id=${exitPos.trade_id} fill=${exitResult.fill_price}`);
 
@@ -3024,8 +3451,11 @@ async function main(): Promise<void> {
           logWriter.writeExecutionIntent({
             event: 'trade_closed', timestamp: new Date().toISOString(),
             trade_id: exitPos.trade_id, side: exitPos.side, source: 'management', reason: exitReason,
+            exit_source: 'management',
+            position_final_state: 'flat',
             price: exitResult.fill_price, pnl_realized: tradeRecord.pnl_realized,
             r_multiple: tradeRecord.r_multiple, outcome_class: tradeRecord.outcome_class,
+            policy_mode: executionIntentPolicyStamp(),
           });
           console.log(`[POSITION] closed trade_id=${exitPos.trade_id} pnl=$${tradeRecord.pnl_realized.toFixed(2)}`);
 

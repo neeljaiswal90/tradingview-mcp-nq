@@ -32,6 +32,7 @@ export type SetupFamily =
   | 'or_retest'
   | 'failed_or_break'
   | 'momentum_continuation'
+  | 'lob_mbo_scalp'
   | 'default';
 
 export type DecisionStage =
@@ -141,6 +142,32 @@ export interface ManagementProfile {
   // Expectancy inputs (v2 hook; inert in v1 engine code)
   /** c in EV formula: slippage + commissions + adverse execution cost (in R). */
   pre_t1_failure_cost_r?: number;
+
+  // ── lob_mbo_scalp family (Phase 3a: additive; wired in Phase 6) ──────────
+  // All fields are optional/nullable. ScalperExitEngine is the SINGLE owner
+  // of every time-based scalper exit — `position-manager.ts` must NOT read
+  // these fields to enforce a second hard-coded cap. See plan Phase 6.
+  /**
+   * Extended hold cap in whole seconds. Applied ONLY when the position was
+   * entered with an absorption+refill confirmation flag
+   * (Position.scalper_extended_cap === true). Must be ≥ scalper_hard_cap_seconds
+   * or config load fails. Typical default: 10.
+   */
+  time_stop_seconds?: number | null;
+  /**
+   * Base unconditional hard cap in whole seconds applied to every scalper
+   * position. Default: 5.
+   */
+  scalper_hard_cap_seconds?: number | null;
+  /**
+   * If hold time exceeds this and the current P&L is below 1 tick, the
+   * position exits with reason `scalper_no_progress`. Default: 2.
+   */
+  scalper_no_progress_seconds?: number | null;
+  /** Lower bound on the entry-time microstructure stop distance (ticks). */
+  scalper_micro_stop_min_ticks?: number | null;
+  /** Upper bound on the entry-time microstructure stop distance (ticks). */
+  scalper_micro_stop_max_ticks?: number | null;
 }
 
 /**
@@ -190,6 +217,15 @@ export interface ResolvedManagementParams {
   pre_t1_failure_emergency_decay_rate_min: number;
   // Expectancy hook
   pre_t1_failure_cost_r: number;
+
+  // ── lob_mbo_scalp family resolved params (Phase 3a: additive; wired in Phase 6) ──
+  // Frozen on Position.management_params at entry. ScalperExitEngine is the
+  // single reader. All optional — non-scalper positions leave them null.
+  time_stop_seconds?: number | null;
+  scalper_hard_cap_seconds?: number | null;
+  scalper_no_progress_seconds?: number | null;
+  scalper_micro_stop_min_ticks?: number | null;
+  scalper_micro_stop_max_ticks?: number | null;
 }
 
 export type ExitReason =
@@ -225,7 +261,16 @@ export type ExitReason =
   /** Target-position layer: proposed residual would be below min_residual_contracts. */
   | 'target_position_residual_below_minimum'
   | 'daily_loss_limit'
-  | 'session_end';
+  | 'session_end'
+  // ── lob_mbo_scalp family exit labels (Phase 3a: additive; wired in Phase 6) ──
+  /** Scalper base or extended hard-cap on hold time (owned by ScalperExitEngine). */
+  | 'scalper_hard_cap'
+  /** Scalper early exit: 2-of-N microstructure reversal signals fired. */
+  | 'scalper_reversal'
+  /** Scalper early exit: specifically an absorption-driven reversal / edge decay. */
+  | 'microstructure_edge_decay'
+  /** Scalper early exit: hold time exceeded with no favorable progress. */
+  | 'scalper_no_progress';
 
 export type TfBias = 'bullish' | 'bearish' | 'neutral';
 
@@ -867,6 +912,36 @@ export interface CandidateSetup {
   rejections_by_setup?: Record<string, string[]>;
   top_rejection_reason?: string | null;
   count_rejections_this_cycle?: number;
+
+  // ── lob_mbo_scalp family (Phase 3a: additive; consumers land in Phase 3b+) ──
+  //
+  // The real types live in future files that do not yet exist:
+  //   - ScalperStateVector      → src/autotrade/features/scalper-state.ts (Phase 2)
+  //   - ScalperShadowDecision   → src/autotrade/features/scalper-shadow-decision.ts (Phase 5)
+  //
+  // They are typed `unknown | null` here so Phase 3a is compile-clean with
+  // zero import dependency on unbuilt modules. When Phase 2 / Phase 5 land,
+  // narrow these to the real interfaces in a single focused edit. Any
+  // consumer that reads these fields MUST tolerate `unknown` (i.e. narrow
+  // before use) until the narrowing happens.
+  /**
+   * Scalper microstructure state vector attached at signal-generation time
+   * by the lob_mbo_scalp generators. Null on non-scalper candidates.
+   */
+  scalper_state_vector?: unknown | null;
+  /**
+   * Scalper shadow-decision record bundling deterministic gate, persistence
+   * gate, ML gate, expectancy, and the single combined verdict from
+   * `shouldAllowScalperEntry`. Null on non-scalper candidates.
+   */
+  scalper_shadow_decision?: unknown | null;
+  /**
+   * True iff the entry-side gate observed an absorption+refill confirmation
+   * at candidate time. ScalperExitEngine uses this to pick between the base
+   * `scalper_hard_cap_seconds` and the extended `time_stop_seconds` hold cap
+   * when the trade is live. Null on non-scalper candidates.
+   */
+  scalper_extended_cap_eligible?: boolean | null;
 }
 
 // ─── Dual-Direction Confluence Model ────────────────────────────────────────
@@ -1334,6 +1409,12 @@ export interface Position {
   stop_initial: number;
   stop_current: number;
   target_1: number;
+  /** Planned first profit target at entry (frozen from setup). */
+  planned_target_1?: number;
+  /** Effective first partial target after any intra-trade adjustments. */
+  effective_target_1?: number | null;
+  /** Fill price of the first partial exit (PT1), when taken. */
+  first_partial_fill_price?: number | null;
   target_2: number;
   target_3: number | null;
   quantity: number;
@@ -1444,6 +1525,35 @@ export interface Position {
   failure_exit_shadow_only: boolean;
   /** Management variant label for A/B comparison. */
   management_variant?: string;
+
+  // ── lob_mbo_scalp family (Phase 3a: additive; wired in Phase 6) ──────────
+  // All fields are optional and null/false on non-scalper positions.
+  /**
+   * True if the entry-side gate observed absorption+refill confirmation,
+   * allowing ScalperExitEngine to use the extended `time_stop_seconds` cap
+   * instead of the base `scalper_hard_cap_seconds`. Copied from
+   * CandidateSetup.scalper_extended_cap_eligible at fill time.
+   */
+  scalper_extended_cap?: boolean;
+  /** Frozen microstructure stop distance in ticks (entry-time resolved). */
+  scalper_stop_ticks?: number | null;
+  /** Frozen microstructure target distance in ticks (entry-time resolved). */
+  scalper_target_ticks?: number | null;
+  /**
+   * Single-flight exit guard for the fast scalper monitor loop. When true,
+   * the runner suppresses any additional exit intents (from the scalper
+   * monitor, trend monitor, or fill-event callback) until the broker acks
+   * the in-flight order. See plan Phase 6 "Single-flight exit guard".
+   */
+  exit_intent_in_flight?: boolean;
+  /** Reason tag of the exit intent currently in flight (for audit). */
+  exit_intent_reason?: ExitReason | null;
+  /**
+   * Earliest wall-clock ms (Date.now()) at which a new exit intent may be
+   * armed after a broker reject. Prevents tight retry loops. Null when no
+   * retry backoff is active.
+   */
+  exit_retry_backoff_until_ms?: number | null;
 }
 
 export interface OrderResult {
@@ -1506,7 +1616,17 @@ export interface TradeRecord {
   mae: number;
   // Outcome labels (ML)
   outcome_class: 'winner' | 'loser' | 'scratch';
+  /**
+   * True when the authoritative PT1 state completed (`pt1_done`) or legacy
+   * `applyPartialExit` set `partial_exit_done` (target_1 partial).
+   */
   hit_target_1: boolean;
+  /** Planned PT1 price at entry (audit trail). */
+  planned_target_1?: number | null;
+  /** Effective PT1 price after any intra-trade adjustment (null if PT1 never armed). */
+  effective_target_1?: number | null;
+  /** Fill price of the first partial exit leg when present. */
+  first_partial_fill_price?: number | null;
   hit_target_2: boolean;
   stopped_out: boolean;
   exited_on_time_stop: boolean;
@@ -1842,6 +1962,8 @@ export interface IndicatorConfig {
   management_profile_variants?: Record<string, Record<string, Partial<ManagementProfile>>>;
   /** ML-based position management via local inference service. */
   ml_management?: import('./ml/types.js').MlManagementConfig;
+  /** Canonical ML execution policy (Track B). When omitted, derived from `ml_management`. */
+  ml_policy?: import('./ml-policy.js').MlPolicyConfig;
   /** ML-based entry confirmation (gated confirmer, not sole trigger). */
   entry_ml?: import('./ml-entry/types.js').EntryMlConfig;
   /** Execution policy: microstructure-aware execution behavior. */
@@ -1892,6 +2014,8 @@ export interface IndicatorConfig {
     midday_analysis_interval_ms?: number;
     /** Max staleness (ms) of full snapshot before shadow signal skips. Default 300000 (5min). */
     shadow_snap_stale_ms?: number;
+    /** Warn when a full management lane callback exceeds this wall time (ms). */
+    management_cycle_budget_warn_ms?: number;
   };
 }
 

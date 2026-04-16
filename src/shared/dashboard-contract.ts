@@ -280,6 +280,43 @@ export interface DashboardSnapshot {
   recent_trades: DashboardRecentTrade[];
   pnl_history: PnlPoint[];
   freshness: FreshnessMetadata;
+  /** Phase 7: per-family telemetry. Null key `lob_mbo_scalp` until a shadow decision lands. */
+  family_metrics: Record<string, DashboardFamilyMetrics>;
+}
+
+/**
+ * Per-strategy-family telemetry block. One entry per setup family
+ * active in the current session. The dashboard reads this to render
+ * family-scoped tiles (e.g. an `lob_mbo_scalp` tile showing shadow
+ * decision pass rate, ml readiness, expectancy bucket hit rate)
+ * without the trend-side global KPIs mixing scalper numbers in.
+ *
+ * Phase 7 populates ONLY the lob_mbo_scalp family initially —
+ * extending to trend or other families is additive and does not
+ * require a schema bump. The UI tolerates unknown keys so new
+ * families automatically appear as their own tiles once the runner
+ * starts recording them.
+ */
+export interface DashboardFamilyMetrics {
+  family: string;
+  /** Human-readable label for the UI tile. Maps 1:1 with `family`. */
+  label: string;
+  /** Number of scalper shadow decisions observed this session. */
+  shadow_decision_count: number;
+  /** Count where the combined rule returned `allowed=true`. */
+  shadow_allowed_count: number;
+  /** Count where the combined rule rejected with a stable reason. */
+  shadow_rejected_count: number;
+  /** Rate = allowed / decision_count. 0 when no decisions yet. */
+  shadow_allowed_rate: number;
+  /** Tally of the top N reject reasons seen this session, keyed by reason. */
+  top_reject_reasons: Record<string, number>;
+  /** Count of cycles where ml_ready was true (regardless of final verdict). */
+  ml_ready_count: number;
+  /** Count of cycles where the expectancy lookup resolved to a bucket. */
+  expectancy_resolved_count: number;
+  /** Latest wall-clock ms when a decision landed (ms since epoch). Null when none yet. */
+  last_decision_ts_ms: number | null;
 }
 
 // ─── Typed SSE Delta Events ──────────────────────────────────────────────────
@@ -293,7 +330,15 @@ export type DashboardDeltaEvent =
   | { type: 'management_update'; management: DashboardManagement; active_trade: DashboardActiveTrade }
   | { type: 'ml_decision'; ml_management: DashboardMlManagement }
   | { type: 'recent_trade_added'; recent_trades: DashboardRecentTrade[]; pnl_history: PnlPoint[]; kpis: DashboardKpis }
-  | { type: 'app_update'; app: DashboardAppMeta };
+  | { type: 'app_update'; app: DashboardAppMeta }
+  /**
+   * Phase 7: family metrics delta. Emitted once per batch when ANY
+   * family metrics entry changed since the last publish. Contains the
+   * full `family_metrics` map so the UI always has the complete
+   * picture (simpler than diff-patching individual fields and
+   * coalescable by type).
+   */
+  | { type: 'family_metrics_update'; family_metrics: Record<string, DashboardFamilyMetrics> };
 
 /** A batch of typed delta events — one SSE message, one unique publish_seq. */
 export interface DashboardDeltaBatch {

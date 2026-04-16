@@ -159,3 +159,95 @@ export function normalizeSession(distancePts: number, sessionAtr: number): numbe
   if (sessionAtr <= 0) return 0;
   return Math.round(Math.abs(distancePts) / sessionAtr * 100) / 100;
 }
+
+// ── Quant entry-state sigma (Phase 1 of the trend-pullback refactor) ────────
+//
+// sigma_pts is an ADDITIONAL blended volatility scale used only by the new
+// EntryStateVector pipeline for stop sizing and z-scored entry geometry.
+// It does NOT replace MICRO / ROOM / SESSION — those continue to serve
+// their existing consumers (VWAP-distance filter, room-to-structure, etc.).
+//
+// Formula (from the refactor plan §5 / §4.3):
+//     sigma_pts = max(ATR_14_1m, rv_20_pts, 4 * tick)
+//
+// where rv_20_pts is the root-mean-square of the last 20 close-to-close
+// 1-minute deltas — a simple realized-volatility proxy on the same 1m bar
+// stream that feeds ATR. The 4*tick floor prevents degenerate values in
+// ultra-quiet conditions.
+
+/**
+ * Compute rv_20_pts — realized volatility proxy over the last N 1-minute
+ * close-to-close deltas. Returns null if there are not enough bars.
+ *
+ * rv = sqrt((1/N) * sum(delta_p^2)) where delta_p = close[i] - close[i-1].
+ */
+export function computeRv20Pts(
+  snap: MarketSnapshot,
+  lookbackBars: number = 20,
+): number | null {
+  const bars = snap.bars_1m;
+  if (!bars || bars.length < lookbackBars + 1) return null;
+
+  // Use the most recent (lookbackBars + 1) bars to get exactly lookbackBars deltas.
+  const recent = bars.slice(-(lookbackBars + 1));
+  let sumSq = 0;
+  let count = 0;
+  for (let i = 1; i < recent.length; i++) {
+    const prev = recent[i - 1];
+    const curr = recent[i];
+    if (!prev || !curr) continue;
+    const d = curr.close - prev.close;
+    sumSq += d * d;
+    count++;
+  }
+  if (count === 0) return null;
+  const rv = Math.sqrt(sumSq / count);
+  return Math.round(rv * 10000) / 10000;
+}
+
+/**
+ * Compute sigma_pts, the blended volatility scale used by the quant
+ * EntryStateVector. Returns null when the inputs are insufficient to
+ * compute a trustworthy value (missing ATR and not enough bars for RV).
+ *
+ * @param snap - Market snapshot (needs bars_1m and indicators_1m.atr_14)
+ * @param tickSize - Native contract tick size (e.g. 0.25 for NQ). Used for
+ *                   the `4 * tick` floor.
+ */
+export function computeSigmaPts(
+  snap: MarketSnapshot,
+  tickSize: number,
+): number | null {
+  if (!(tickSize > 0)) return null;
+
+  const atr14 = snap.indicators_1m?.atr_14;
+  const atrVal = (atr14 !== null && atr14 !== undefined && atr14 > 0) ? atr14 : null;
+
+  const rv20 = computeRv20Pts(snap, 20);
+
+  // If neither ATR nor RV is available we cannot produce a meaningful
+  // sigma — the 4*tick floor alone would be misleading.
+  if (atrVal === null && rv20 === null) return null;
+
+  const tickFloor = 4 * tickSize;
+  const sigma = Math.max(
+    atrVal ?? 0,
+    rv20 ?? 0,
+    tickFloor,
+  );
+  return Math.round(sigma * 10000) / 10000;
+}
+
+/**
+ * z-score a signed point distance by sigma_pts. Unlike normalizeMicro /
+ * normalizeSession, this does NOT take the absolute value — sign is
+ * preserved so callers can express direction-aware geometry bands
+ * (e.g. "price is 0.45 sigma above EMA9" vs "0.45 sigma below").
+ *
+ * Returns 0 when sigmaPts is non-positive, matching the conservative
+ * behavior of the other normalizers.
+ */
+export function zScorePts(distancePts: number, sigmaPts: number): number {
+  if (!(sigmaPts > 0)) return 0;
+  return Math.round((distancePts / sigmaPts) * 10000) / 10000;
+}

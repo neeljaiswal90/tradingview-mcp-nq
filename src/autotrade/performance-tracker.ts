@@ -164,7 +164,6 @@ export class PerformanceTracker {
    */
   checkpointSession(): void {
     this.logWriter.updateSessionEnd(this.sessionId, {
-      signal_count: this.stats.total_signals,
       trade_count: this.stats.total_trades,
       pnl_realized: this.stats.total_pnl_usd,
       updated_at: new Date().toISOString(),

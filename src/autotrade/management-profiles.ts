@@ -17,26 +17,38 @@ import type {
 } from './types.js';
 import type { ContractSpec } from './contracts.js';
 import { priceToTicks } from './contracts.js';
+import { STRATEGY_REGISTRY } from './strategy.js';
 
 // ── Setup family mapping ────────────────────────────────────────────────────
+//
+// Phase 2: FAMILY_MAP is DERIVED from STRATEGY_REGISTRY rather than
+// hand-maintained. Adding a new strategy to the registry automatically
+// updates the family mapping — no second inventory to keep in sync.
+//
+// The map is built LAZILY on first access because management-profiles.ts
+// is indirectly imported by strategy.ts (via features/dynamic-reward-plan.ts),
+// which creates a circular import. At module init time STRATEGY_REGISTRY
+// is still undefined; by the first call to getSetupFamily() the circle
+// has finished resolving and the array is populated.
+//
+// The 'or_retest' family remains declared in SetupFamily for historical
+// config compatibility but no live setup maps to it.
 
-const FAMILY_MAP: Record<SetupType, SetupFamily> = {
-  trend_pullback_long: 'trend_pullback',
-  trend_pullback_short: 'trend_pullback',
-  breakout_retest_long: 'breakout_retest',
-  breakdown_retest_short: 'breakout_retest',
-  momentum_continuation: 'momentum_continuation',
-  opening_drive_continuation_long: 'opening_drive',
-  opening_drive_continuation_short: 'opening_drive',
-  or_retest_continuation_long: 'or_retest',
-  or_retest_continuation_short: 'or_retest',
-  failed_or_break_short: 'failed_or_break',
-  failed_or_break_long: 'failed_or_break',
-};
+let _familyMap: Record<SetupType, SetupFamily> | null = null;
+
+function familyMap(): Record<SetupType, SetupFamily> {
+  if (_familyMap) return _familyMap;
+  const map = {} as Record<SetupType, SetupFamily>;
+  for (const def of STRATEGY_REGISTRY) {
+    map[def.strategy_id] = def.family;
+  }
+  _familyMap = map;
+  return map;
+}
 
 /** Map a directional SetupType to its direction-agnostic family. */
 export function getSetupFamily(setupType: SetupType): SetupFamily {
-  return FAMILY_MAP[setupType] ?? 'default';
+  return familyMap()[setupType] ?? 'default';
 }
 
 // ── Profile selection ───────────────────────────────────────────────────────
@@ -93,6 +105,12 @@ export function getManagementProfile(
     profile = { ...profile, ...overrides };
     console.log(`[MGMT-VARIANT] Applied "${variantName}" overrides to ${family}: ${JSON.stringify(overrides)}`);
   }
+
+  // Phase 6: fail-loud validation for scalper profiles. Any rule
+  // violation (extended cap < base cap, no-progress >= base cap,
+  // negative thresholds) throws immediately so operators see the
+  // problem at profile resolution — never silently at exit time.
+  validateScalperManagementProfile(profile);
 
   return profile;
 }
@@ -211,5 +229,134 @@ export function resolveProfile(
     time_stop_minutes: profile.time_stop_minutes,
     time_stop_max_r_pre_t1: profile.time_stop_max_r_pre_t1,
     time_stop_max_r_post_t1: profile.time_stop_max_r_post_t1,
+    // ── Dead-Trade Guard (pre-PT1 failure-to-launch) ──────────────────
+    // Defaults: FEATURE OFF. Any profile or variant that sets
+    // pre_t1_failure_exit_enabled=true supplies its own thresholds via
+    // the optional fields below; the defaults here are inert when the
+    // flag is off, and safe starting values if the flag flips on without
+    // explicit overrides.
+    pre_t1_failure_exit_enabled: profile.pre_t1_failure_exit_enabled ?? false,
+    pre_t1_failure_shadow_mode: profile.pre_t1_failure_shadow_mode ?? true,
+    pre_t1_failure_decay_min_gap_minutes: profile.pre_t1_failure_decay_min_gap_minutes ?? 0.5,
+    pre_t1_failure_lambda_net: profile.pre_t1_failure_lambda_net ?? 1.0,
+    // Lane A (soft review)
+    pre_t1_failure_soft_min_minutes: profile.pre_t1_failure_soft_min_minutes ?? 4,
+    pre_t1_failure_soft_progress_rate_max: profile.pre_t1_failure_soft_progress_rate_max ?? 0.05,
+    pre_t1_failure_soft_failure_ratio_min: profile.pre_t1_failure_soft_failure_ratio_min ?? 2.0,
+    // Lane B (empirical quantile cut)
+    pre_t1_failure_hard_min_minutes: profile.pre_t1_failure_hard_min_minutes ?? 5,
+    pre_t1_failure_hard_current_r_alpha: profile.pre_t1_failure_hard_current_r_alpha ?? 0.4,
+    pre_t1_failure_curves_key: profile.pre_t1_failure_curves_key ?? profile.family,
+    pre_t1_failure_min_n_per_bucket: profile.pre_t1_failure_min_n_per_bucket ?? 20,
+    // Lane C (emergency shape cut)
+    pre_t1_failure_emergency_min_minutes: profile.pre_t1_failure_emergency_min_minutes ?? 3,
+    pre_t1_failure_emergency_mae_r_floor: profile.pre_t1_failure_emergency_mae_r_floor ?? 0.20,
+    pre_t1_failure_emergency_failure_ratio_min:
+      profile.pre_t1_failure_emergency_failure_ratio_min ?? 4.0,
+    pre_t1_failure_emergency_peak_r_max: profile.pre_t1_failure_emergency_peak_r_max ?? 0.10,
+    pre_t1_failure_emergency_decay_rate_min:
+      profile.pre_t1_failure_emergency_decay_rate_min ?? 0,
+    // Expectancy hook (v2)
+    pre_t1_failure_cost_r: profile.pre_t1_failure_cost_r ?? 0.05,
+
+    // ── lob_mbo_scalp family (Phase 6) ──────────────────────────────
+    // Null-passthrough for non-scalper families. Scalper resolution
+    // applies the plan defaults and runs the
+    // validateScalperManagementProfile() check so a misconfigured
+    // `time_stop_seconds < scalper_hard_cap_seconds` fails LOUDLY at
+    // profile resolution rather than silently at exit time.
+    time_stop_seconds:
+      profile.family === 'lob_mbo_scalp'
+        ? profile.time_stop_seconds ?? 10
+        : profile.time_stop_seconds ?? null,
+    scalper_hard_cap_seconds:
+      profile.family === 'lob_mbo_scalp'
+        ? profile.scalper_hard_cap_seconds ?? 5
+        : profile.scalper_hard_cap_seconds ?? null,
+    scalper_no_progress_seconds:
+      profile.family === 'lob_mbo_scalp'
+        ? profile.scalper_no_progress_seconds ?? 2
+        : profile.scalper_no_progress_seconds ?? null,
+    scalper_micro_stop_min_ticks:
+      profile.family === 'lob_mbo_scalp'
+        ? profile.scalper_micro_stop_min_ticks ?? 2
+        : profile.scalper_micro_stop_min_ticks ?? null,
+    scalper_micro_stop_max_ticks:
+      profile.family === 'lob_mbo_scalp'
+        ? profile.scalper_micro_stop_max_ticks ?? 6
+        : profile.scalper_micro_stop_max_ticks ?? null,
   };
+}
+
+/**
+ * Validate a lob_mbo_scalp management profile at config load time.
+ *
+ * Fails LOUDLY (throws) on misconfiguration so operators see the
+ * problem at startup, never at exit time on a live position. Rules
+ * (per plan Phase 6):
+ *
+ *   1. `time_stop_seconds` (extended cap) MUST be >= `scalper_hard_cap_seconds`
+ *      (base cap). Putting the extended cap BELOW the base cap would
+ *      demote positions that were entered with an absorption+refill
+ *      confirmation — the exact opposite of what the flag means.
+ *   2. `scalper_no_progress_seconds` must be strictly less than the
+ *      base cap, otherwise the no-progress clause can never fire
+ *      before the hard cap does (defensive; the engine would still
+ *      behave correctly, but this catches a pointless config state).
+ *   3. `scalper_micro_stop_min_ticks <= scalper_micro_stop_max_ticks`.
+ *   4. Every field must be a positive finite integer or null.
+ *
+ * No-op for non-scalper families. Called by `getManagementProfile`
+ * before returning a scalper profile.
+ */
+export function validateScalperManagementProfile(profile: ManagementProfile): void {
+  if (profile.family !== 'lob_mbo_scalp') return;
+
+  const base = profile.scalper_hard_cap_seconds ?? null;
+  const extended = profile.time_stop_seconds ?? null;
+  const noProgress = profile.scalper_no_progress_seconds ?? null;
+  const minTicks = profile.scalper_micro_stop_min_ticks ?? null;
+  const maxTicks = profile.scalper_micro_stop_max_ticks ?? null;
+
+  const isPosFiniteNum = (x: number | null | undefined): x is number =>
+    typeof x === 'number' && Number.isFinite(x) && x > 0;
+
+  if (base !== null && !isPosFiniteNum(base)) {
+    throw new Error(`[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': scalper_hard_cap_seconds=${base} must be a positive finite number or null`);
+  }
+  if (extended !== null && !isPosFiniteNum(extended)) {
+    throw new Error(`[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': time_stop_seconds=${extended} must be a positive finite number or null`);
+  }
+  if (noProgress !== null && !isPosFiniteNum(noProgress)) {
+    throw new Error(`[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': scalper_no_progress_seconds=${noProgress} must be a positive finite number or null`);
+  }
+  if (minTicks !== null && !isPosFiniteNum(minTicks)) {
+    throw new Error(`[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': scalper_micro_stop_min_ticks=${minTicks} must be a positive finite number or null`);
+  }
+  if (maxTicks !== null && !isPosFiniteNum(maxTicks)) {
+    throw new Error(`[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': scalper_micro_stop_max_ticks=${maxTicks} must be a positive finite number or null`);
+  }
+
+  // Rule 1: extended cap ≥ base cap (when both present)
+  if (isPosFiniteNum(extended) && isPosFiniteNum(base) && extended < base) {
+    throw new Error(
+      `[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': time_stop_seconds=${extended} < scalper_hard_cap_seconds=${base}. ` +
+      `The extended cap must be >= the base cap — otherwise an absorption+refill-confirmed entry would get a SHORTER hold budget than a normal entry.`,
+    );
+  }
+
+  // Rule 2: no-progress < base (when both present)
+  if (isPosFiniteNum(noProgress) && isPosFiniteNum(base) && noProgress >= base) {
+    throw new Error(
+      `[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': scalper_no_progress_seconds=${noProgress} >= scalper_hard_cap_seconds=${base}. ` +
+      `The no-progress trigger must fire STRICTLY before the hard cap or it is unreachable.`,
+    );
+  }
+
+  // Rule 3: min_ticks ≤ max_ticks (when both present)
+  if (isPosFiniteNum(minTicks) && isPosFiniteNum(maxTicks) && minTicks > maxTicks) {
+    throw new Error(
+      `[MGMT-CONFIG] lob_mbo_scalp profile '${profile.name}': scalper_micro_stop_min_ticks=${minTicks} > scalper_micro_stop_max_ticks=${maxTicks}.`,
+    );
+  }
 }

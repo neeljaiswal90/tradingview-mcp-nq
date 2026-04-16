@@ -26,6 +26,10 @@ import type {
   ScoringWeights,
   DualDirectionDecision,
   DualDirectionResult,
+  CandidateGeneratorDiagnostic,
+  TrendFreshnessResult,
+  DirectionalFreshnessConfig,
+  SetupFamily,
 } from './types.js';
 import type { LobSnapshot } from './lob-client.js';
 import {
@@ -39,9 +43,54 @@ import {
 import type { IndicatorConfig, HtfSetupEvaluation, HtfZonesConfig } from './types.js';
 import type { ContractSpec } from './contracts.js';
 import { roundToTickAwayFromEntry, priceToTicks } from './contracts.js';
+// getSetupFamily was previously imported from management-profiles.ts but
+// never referenced. Removed to keep the import surface minimal and to
+// let management-profiles.ts safely import STRATEGY_REGISTRY from this
+// file (used to derive its FAMILY_MAP) without a circular import.
 import { buildDynamicRewardPlan, buildLegacyRewardPlan, DEFAULT_DYNAMIC_REWARD_CONFIG } from './features/dynamic-reward-plan.js';
 import type { DynamicRewardPlan, DynamicRewardConfig } from './features/dynamic-reward-plan.js';
 import { evaluateHtfForSetup, DEFAULT_HTF_ZONES_CONFIG } from './features/htf-zones.js';
+import { computeNormalizers } from './features/normalization.js';
+import { buildEntryStateVector } from './features/entry-state.js';
+import { hydrateEntryStateVectorOrderflow } from './features/orderflow-state.js';
+import { hydrateQuantRewardContract } from './features/initial-risk.js';
+import type { ExpectancyBucketTable } from './features/expectancy-engine.js';
+import { computeEntryStateVectorHash } from './features/state-vector-hash.js';
+import {
+  resolveQuantEntryConfig,
+  isQuantEntryActiveForDirection,
+} from './features/quant-entry-config.js';
+import {
+  buildQuantShadowDecision,
+  type EntryMlVerdictSource,
+} from './features/quant-shadow-decision.js';
+
+// ── Phase 3 quant trend-pullback constants ─────────────────────────────────
+//
+// These are deliberately module-local for Phase 3. Phase 7 (plan §5) moves
+// them into `env.ts` under `quant_entry` so they can be tuned per config.
+//
+// Sign convention (matches entry-state.ts Phase 1 header): for both long
+// and short, z_ema9 POSITIVE = price is on the trend side of EMA9. The
+// band below therefore applies identically to both directions — see
+// user-confirmed decision in the Phase 3 implementation thread.
+const QUANT_TP_Z_EMA9_MIN = 0.15;
+const QUANT_TP_Z_EMA9_MAX = 1.25;
+/** Pullback ratio band — Fibonacci-ish 25%–62%. */
+const QUANT_TP_PULLBACK_RATIO_MIN = 0.25;
+const QUANT_TP_PULLBACK_RATIO_MAX = 0.62;
+/** Flow confirmation threshold (soft gate — null-safe). Starts wide per plan §5. */
+const QUANT_TP_FLOW_CONFIRMATION_MIN = 0.20;
+/** Entry band half-width in sigma units (replaces hardcoded ±5 offset). */
+const QUANT_TP_ENTRY_HALF_BAND_SIGMA = 0.1;
+/**
+ * Volatility-based initial stop multiplier. Phase 4 will extend this with
+ * the "tighter of structure and volatility" rule and refit k_sl from
+ * historical MAE; Phase 3 ships this bootstrap value to keep the exit
+ * criterion "no hardcoded ema21±20 constants" satisfied today.
+ */
+const QUANT_TP_K_SL = 1.05;
+import { ema as computeEma, atr as computeAtr, supertrendDirection } from './features/indicators.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -60,6 +109,363 @@ function barDir(b: OhlcvBar): 'up' | 'down' | 'doji' {
   if (range === 0) return 'doji';
   if (body / range < 0.15) return 'doji';
   return b.close >= b.open ? 'up' : 'down';
+}
+
+export type GeneratorEvaluation = {
+  setupType: SetupType;
+  setupFamily: SetupFamily;
+  candidate: CandidateSetup | null;
+  rejectionReasonPrimary: string | null;
+  rejectionReasonAll: string[];
+};
+
+type ReversalBundleResult = {
+  passed: boolean;
+  reason: string;
+  barsSinceFlip: number | null;
+  structureDeteriorationPassed: boolean;
+  emaFormationPassed: boolean;
+  regimeFilterPassed: boolean;
+};
+
+const completedBarsCache = new WeakMap<MarketSnapshot, Partial<Record<'1m' | '5m' | '15m' | '1h', OhlcvBar[]>>>();
+const reversalBundleCache = new WeakMap<MarketSnapshot, ReversalBundleResult>();
+
+function getCompletedBars(
+  snap: MarketSnapshot,
+  timeframe: '1m' | '5m' | '15m' | '1h',
+): OhlcvBar[] {
+  const cached = completedBarsCache.get(snap)?.[timeframe];
+  if (cached) return cached;
+
+  const bars =
+    timeframe === '1m' ? snap.bars_1m
+      : timeframe === '5m' ? snap.bars_5m
+        : timeframe === '15m' ? snap.bars_15m
+          : snap.bars_1h;
+  const timeframeSeconds =
+    timeframe === '1m' ? 60
+      : timeframe === '5m' ? 300
+        : timeframe === '15m' ? 900
+          : 3600;
+
+  let completed = bars;
+  const lastBar = last(bars);
+  if (lastBar && snap.timestamp_unix < lastBar.time + timeframeSeconds) {
+    completed = bars.slice(0, -1);
+  }
+
+  const entry = completedBarsCache.get(snap) ?? {};
+  entry[timeframe] = completed;
+  completedBarsCache.set(snap, entry);
+  return completed;
+}
+
+function getSessionLabel(snap: MarketSnapshot): 'ETH' | 'RTH' | null {
+  if (snap.session?.is_eth) return 'ETH';
+  if (snap.session?.is_rth) return 'RTH';
+  return null;
+}
+
+function getDirectionalFreshnessConfig(config: IndicatorConfig): DirectionalFreshnessConfig {
+  return {
+    enabled: true,
+    long_vwap_mode: 'hard',
+    short_vwap_mode: 'hard',
+    short_above_vwap_allowance_session_atr: 0.35,
+    short_above_vwap_penalty: 0.4,
+    require_5m_structure: true,
+    require_supertrend_or_ema21_exception: true,
+    short_above_vwap_penalty_midpoint_atr: 0.20,
+    short_above_vwap_penalty_slope_atr: 0.08,
+    ...(config.directional_freshness ?? {}),
+  };
+}
+
+/**
+ * Shaped directional-freshness penalty for shorts allowed above VWAP.
+ *
+ *     π_fresh(z) = −λ · σ((z − a0) / b0)
+ *
+ * where z is the session-ATR VWAP distance (positive = above VWAP), λ is the
+ * `short_above_vwap_penalty` config field, a0 is the midpoint and b0 is the
+ * slope width. The result is clamped into [−λ, 0]. Replaces the earlier
+ * flat penalty so borderline and near-VWAP setups get different discounts.
+ */
+export function computeShapedFreshnessPenalty(
+  vwapDistanceSessionAtr: number,
+  freshnessConfig: DirectionalFreshnessConfig,
+): number {
+  const lambda = Math.abs(freshnessConfig.short_above_vwap_penalty);
+  if (lambda === 0) return 0;
+  const a0 = freshnessConfig.short_above_vwap_penalty_midpoint_atr ?? 0.20;
+  const b0Raw = freshnessConfig.short_above_vwap_penalty_slope_atr ?? 0.08;
+  // Guard against zero/negative slope widths from misconfigured defaults.
+  const b0 = b0Raw > 1e-6 ? b0Raw : 0.08;
+  const u = (vwapDistanceSessionAtr - a0) / b0;
+  const sigmoid = 1 / (1 + Math.exp(-u));
+  const penalty = -lambda * sigmoid;
+  // Safety clamp — sigmoid already lives in [0, 1], so penalty ∈ [−λ, 0].
+  if (penalty < -lambda) return -lambda;
+  if (penalty > 0) return 0;
+  return penalty;
+}
+
+/**
+ * Shaped reversal-transition bonus for the post-flip first pullback setup.
+ *
+ *     B_flip(b) = β · exp(−(b − b*)² / (2 σ²))
+ *
+ * where `b` is `bars_since_flip`, `b*` is the peak-bar sweet spot and σ is
+ * the Gaussian width (both from scoring_weights). Returns `β` (full bonus)
+ * when `bars_since_flip` is missing, preserving the pre-shaped behaviour so
+ * that setups which don't track flip timing are unaffected.
+ */
+export function computeShapedReversalBonus(
+  barsSinceFlip: number | null,
+  weights: ScoringWeights,
+): number {
+  const beta = weights.reversal_transition_bonus;
+  if (beta <= 0) return 0;
+  if (barsSinceFlip === null || barsSinceFlip === undefined) return beta;
+  const bStar = weights.reversal_bonus_peak_bars_since_flip ?? 7;
+  const sigmaRaw = weights.reversal_bonus_sigma_bars ?? 3;
+  const sigma = sigmaRaw > 1e-6 ? sigmaRaw : 3;
+  const d = barsSinceFlip - bStar;
+  const gaussian = Math.exp(-(d * d) / (2 * sigma * sigma));
+  const bonus = beta * gaussian;
+  if (bonus < 0) return 0;
+  if (bonus > beta) return beta;
+  return bonus;
+}
+
+function buildGeneratorRejection(
+  setupType: SetupType,
+  setupFamily: SetupFamily,
+  ...reasons: Array<string | null | undefined>
+): GeneratorEvaluation {
+  const cleaned = reasons.filter((reason): reason is string => typeof reason === 'string' && reason.length > 0);
+  return {
+    setupType,
+    setupFamily,
+    candidate: null,
+    rejectionReasonPrimary: cleaned[0] ?? 'conditions_not_met',
+    rejectionReasonAll: cleaned.length > 0 ? cleaned : ['conditions_not_met'],
+  };
+}
+
+function attachGeneratorDiagnostic(
+  setup: CandidateSetup,
+  setupType: SetupType,
+  setupFamily: SetupFamily,
+): CandidateSetup {
+  return {
+    ...setup,
+    generator_diagnostic: {
+      setup_type: setupType,
+      setup_family: setupFamily,
+      accepted: true,
+      rejection_reason_primary: null,
+      rejection_reason_all: [],
+    },
+  };
+}
+
+function withSetupCandidate(
+  setupType: SetupType,
+  setupFamily: SetupFamily,
+  setup: CandidateSetup,
+): GeneratorEvaluation {
+  return {
+    setupType,
+    setupFamily,
+    candidate: attachGeneratorDiagnostic(setup, setupType, setupFamily),
+    rejectionReasonPrimary: null,
+    rejectionReasonAll: [],
+  };
+}
+
+function getVwapDistanceSessionAtr(snap: MarketSnapshot, price: number): number | null {
+  const vwap = snap.indicators_1m.vwap;
+  if (vwap === null || vwap <= 0) return null;
+  const norms = computeNormalizers(snap);
+  if (norms === null) return null;
+  const sessionAtr = norms.session_atr;
+  if (!sessionAtr || sessionAtr <= 0) return null;
+  return Math.round((Math.abs(price - vwap) / sessionAtr) * 100) / 100;
+}
+
+function buildOneMinuteDerivedSeries(snap: MarketSnapshot): Array<{
+  bar: OhlcvBar;
+  ema9: number | null;
+  ema21: number | null;
+  atr14: number | null;
+  stDirection: 'up' | 'down' | null;
+}> {
+  const completed = getCompletedBars(snap, '1m');
+  return completed.map((bar, idx) => {
+    const window = completed.slice(0, idx + 1);
+    const closes = window.map(candidate => candidate.close);
+    const ema9 = computeEma(closes, 9);
+    const ema21 = computeEma(closes, 21);
+    const atr14 = computeAtr(window as any, 14);
+    return {
+      bar,
+      ema9,
+      ema21,
+      atr14,
+      stDirection: supertrendDirection(ema9, ema21),
+    };
+  });
+}
+
+function evaluateEthShortReversalCore(snap: MarketSnapshot, regime: MarketRegime): ReversalBundleResult {
+  const cached = reversalBundleCache.get(snap);
+  if (cached) return cached;
+
+  const completed1m = buildOneMinuteDerivedSeries(snap);
+  const completed5m = getCompletedBars(snap, '5m');
+
+  let barsSinceFlip: number | null = null;
+  for (let i = completed1m.length - 1; i >= 1; i--) {
+    const current = completed1m[i];
+    const previous = completed1m[i - 1];
+    if (current?.stDirection === 'down' && previous?.stDirection === 'up') {
+      barsSinceFlip = completed1m.length - 1 - i;
+      break;
+    }
+  }
+
+  const flipPassed = barsSinceFlip !== null && barsSinceFlip <= 15;
+  const structurePassed = completed5m.length >= 6
+    ? Math.max(...completed5m.slice(-3).map(bar => bar.high)) <= Math.max(...completed5m.slice(-6, -3).map(bar => bar.high))
+    : false;
+  const regimePassed = regime !== 'trending_up' && regime !== 'breakout_attempt';
+
+  let emaFormationPassed = false;
+  if (flipPassed && barsSinceFlip !== null) {
+    const startIndex = Math.max(0, completed1m.length - 1 - barsSinceFlip);
+    const postFlipSeries = completed1m.slice(startIndex);
+    const current = postFlipSeries[postFlipSeries.length - 1];
+    const priorCandidates = postFlipSeries.slice(Math.max(0, postFlipSeries.length - 3), Math.max(0, postFlipSeries.length - 1));
+    const relationHolds = (point: typeof current): boolean =>
+      point !== undefined
+      && point.bar.close <= (point.ema9 ?? Number.NEGATIVE_INFINITY)
+      && point.ema9 !== null
+      && point.ema21 !== null
+      && point.atr14 !== null
+      && point.ema9 <= point.ema21 + 0.15 * point.atr14;
+
+    if (current && relationHolds(current)) {
+      if (priorCandidates.length >= 2) {
+        emaFormationPassed = priorCandidates.some(candidate => relationHolds(candidate));
+      } else {
+        emaFormationPassed = postFlipSeries.every(candidate => relationHolds(candidate));
+      }
+    }
+  }
+
+  const result: ReversalBundleResult =
+    flipPassed && structurePassed && emaFormationPassed && regimePassed
+      ? {
+        passed: true,
+        reason: 'eth_short_reversal_core_passed',
+        barsSinceFlip,
+        structureDeteriorationPassed: true,
+        emaFormationPassed: true,
+        regimeFilterPassed: true,
+      }
+      : {
+        passed: false,
+        reason:
+          !flipPassed
+            ? 'eth_short_reversal_core:flip_too_old_or_missing'
+            : !structurePassed
+              ? 'eth_short_reversal_core:5m_structure_not_broken'
+              : !emaFormationPassed
+                ? 'eth_short_reversal_core:ema_formation_not_confirmed'
+                : 'eth_short_reversal_core:regime_still_up',
+        barsSinceFlip,
+        structureDeteriorationPassed: structurePassed,
+        emaFormationPassed,
+        regimeFilterPassed: regimePassed,
+      };
+
+  reversalBundleCache.set(snap, result);
+  return result;
+}
+
+/**
+ * Resolve the SELECTION floor — the score a candidate must beat to be logged
+ * and forwarded into the dual-direction comparison. This can be below the
+ * execution floor (`dual_min_score`); a candidate between the two is marked
+ * `selection_only` and never executed.
+ *
+ * Lookup order: `session_selection_floor_overrides` (preferred) →
+ * `session_score_overrides` (legacy fallback) → `dual_min_score`.
+ */
+function resolveSelectionFloor(
+  setup: CandidateSetup,
+  snap: MarketSnapshot,
+  config: IndicatorConfig,
+): number {
+  const base = config.dual_min_score;
+  const label = getSessionLabel(snap);
+  if (!label) return base;
+  const preferred = config.session_selection_floor_overrides?.[label];
+  const preferredOverrides =
+    setup.direction === 'short' ? preferred?.short : preferred?.long;
+  const preferredFloor = preferredOverrides?.[setup.setup_type];
+  if (preferredFloor !== undefined) return preferredFloor;
+  // Legacy fallback — keeps any historical `session_score_overrides` entries
+  // honored until they are migrated to the new key.
+  const legacy = config.session_score_overrides?.[label];
+  const legacyOverrides =
+    setup.direction === 'short' ? legacy?.short : legacy?.long;
+  return legacyOverrides?.[setup.setup_type] ?? base;
+}
+
+/**
+ * Resolve the EXECUTION floor — always the global `dual_min_score`. A
+ * candidate that clears the selection floor but not the execution floor
+ * is forwarded but not executed.
+ */
+function resolveExecutionFloor(config: IndicatorConfig): number {
+  return config.dual_min_score;
+}
+
+function summarizeRejections(
+  diagnostics: CandidateGeneratorDiagnostic[],
+): {
+  rejectionsBySetup: Record<string, string[]>;
+  topRejectionReason: string | null;
+  countRejectionsThisCycle: number;
+} {
+  const rejectionsBySetup: Record<string, string[]> = {};
+  const counts = new Map<string, number>();
+
+  for (const diagnostic of diagnostics) {
+    if (diagnostic.accepted) continue;
+    rejectionsBySetup[diagnostic.setup_type] = diagnostic.rejection_reason_all;
+    for (const reason of diagnostic.rejection_reason_all) {
+      counts.set(reason, (counts.get(reason) ?? 0) + 1);
+    }
+  }
+
+  let topRejectionReason: string | null = null;
+  let topCount = -1;
+  for (const [reason, count] of counts.entries()) {
+    if (count > topCount) {
+      topCount = count;
+      topRejectionReason = reason;
+    }
+  }
+
+  return {
+    rejectionsBySetup,
+    topRejectionReason,
+    countRejectionsThisCycle: diagnostics.filter(diagnostic => !diagnostic.accepted).length,
+  };
 }
 
 // ─── Regime Classification ────────────────────────────────────────────────────
@@ -563,10 +969,25 @@ function validateSetupTargets(setup: {
 export function isTrendFresh(
   snap: MarketSnapshot,
   direction: 'long' | 'short',
-): { fresh: boolean; reason: string } {
+  config?: IndicatorConfig,
+  setupType?: SetupType,
+): TrendFreshnessResult {
   const isLong = direction === 'long';
-  const bars5m = snap.bars_5m;
+  const freshnessConfig = getDirectionalFreshnessConfig(config ?? {} as IndicatorConfig);
+  const bars5m = getCompletedBars(snap, '5m');
   const ind = snap.indicators_1m;
+  const regime = classifyRegime(snap);
+  const reversalCore = !isLong ? evaluateEthShortReversalCore(snap, regime) : null;
+  const context = {
+    vwap_distance_session_atr: getVwapDistanceSessionAtr(snap, snap.price),
+    above_vwap_allowed: false,
+    reversal_bundle_name: !isLong ? 'eth_short_reversal_core' : null,
+    reversal_bundle_passed: reversalCore?.passed ?? false,
+    bars_since_flip: reversalCore?.barsSinceFlip ?? null,
+    structure_deterioration_passed: reversalCore?.structureDeteriorationPassed ?? false,
+    ema_formation_passed: reversalCore?.emaFormationPassed ?? false,
+    regime_filter_passed: reversalCore?.regimeFilterPassed ?? false,
+  };
 
   // Check 1: 5m bar structure
   // Longs: require higher lows (recent 3 bars' min low > prior 3 bars' min low)
@@ -578,13 +999,13 @@ export function isTrendFresh(
       const recentMinLow = Math.min(...recent3.map(b => b.low));
       const priorMinLow = Math.min(...prior3.map(b => b.low));
       if (recentMinLow <= priorMinLow) {
-        return { fresh: false, reason: 'stale_uptrend:lower_lows_on_5m' };
+        return { fresh: false, reason: 'stale_uptrend:lower_lows_on_5m', soft_penalty: 0, context };
       }
     } else {
       const recentMaxHigh = Math.max(...recent3.map(b => b.high));
       const priorMaxHigh = Math.max(...prior3.map(b => b.high));
       if (recentMaxHigh >= priorMaxHigh) {
-        return { fresh: false, reason: 'stale_downtrend:higher_highs_on_5m' };
+        return { fresh: false, reason: 'stale_downtrend:higher_highs_on_5m', soft_penalty: 0, context };
       }
     }
   }
@@ -593,12 +1014,12 @@ export function isTrendFresh(
   // Exception: allow if price is still on the correct side of EMA21
   if (isLong && ind.supertrend_direction === 'down') {
     if (ind.ema_21 !== null && snap.price < ind.ema_21) {
-      return { fresh: false, reason: 'stale_uptrend:supertrend_down_below_ema21' };
+      return { fresh: false, reason: 'stale_uptrend:supertrend_down_below_ema21', soft_penalty: 0, context };
     }
   }
   if (!isLong && ind.supertrend_direction === 'up') {
     if (ind.ema_21 !== null && snap.price > ind.ema_21) {
-      return { fresh: false, reason: 'stale_downtrend:supertrend_up_above_ema21' };
+      return { fresh: false, reason: 'stale_downtrend:supertrend_up_above_ema21', soft_penalty: 0, context };
     }
   }
 
@@ -608,22 +1029,63 @@ export function isTrendFresh(
   const vwap = ind.vwap;
   if (vwap !== null && vwap > 0) {
     if (isLong && snap.price < vwap) {
-      return { fresh: false, reason: 'stale_uptrend:price_below_vwap' };
+      return { fresh: false, reason: 'stale_uptrend:price_below_vwap', soft_penalty: 0, context };
     }
     if (!isLong && snap.price > vwap) {
-      return { fresh: false, reason: 'stale_downtrend:price_above_vwap' };
+      const softShortAllowed =
+        freshnessConfig.enabled
+        && freshnessConfig.short_vwap_mode === 'soft'
+        && snap.session?.is_eth === true
+        && (setupType === 'trend_pullback_short' || setupType === 'post_flip_first_pullback_short');
+
+      if (!softShortAllowed) {
+        return { fresh: false, reason: 'stale_downtrend:price_above_vwap', soft_penalty: 0, context };
+      }
+
+      const vwapDistance = context.vwap_distance_session_atr;
+      if (
+        vwapDistance === null
+        || vwapDistance > freshnessConfig.short_above_vwap_allowance_session_atr
+      ) {
+        return {
+          fresh: false,
+          reason: 'stale_downtrend:price_above_vwap_allowance_exceeded',
+          soft_penalty: 0,
+          context,
+        };
+      }
+
+      if (!reversalCore?.passed) {
+        return {
+          fresh: false,
+          reason: reversalCore?.reason ?? 'stale_downtrend:reversal_bundle_missing',
+          soft_penalty: 0,
+          context,
+        };
+      }
+
+      return {
+        fresh: true,
+        reason: 'trend_fresh_soft_vwap_short',
+        soft_penalty: computeShapedFreshnessPenalty(vwapDistance, freshnessConfig),
+        context: {
+          ...context,
+          above_vwap_allowed: true,
+          reversal_bundle_passed: true,
+        },
+      };
     }
   }
 
-  return { fresh: true, reason: 'trend_fresh' };
+  return { fresh: true, reason: 'trend_fresh', soft_penalty: 0, context };
 }
 
 /**
  * Legacy wrapper: returns boolean for backward-compatible call sites.
  * Delegates to the unified isTrendFresh().
  */
-function isUptrendFresh(snap: MarketSnapshot): boolean {
-  return isTrendFresh(snap, 'long').fresh;
+function isUptrendFresh(snap: MarketSnapshot, config?: IndicatorConfig): boolean {
+  return isTrendFresh(snap, 'long', config).fresh;
 }
 
 /**
@@ -696,7 +1158,9 @@ export function hasRoomToDownside(snap: MarketSnapshot, entryMid: number, minRoo
 
 // ─── Setup Generators ─────────────────────────────────────────────────────────
 
-function genBreakdownRetestShort(snap: MarketSnapshot): CandidateSetup | null {
+export function genBreakdownRetestShort(snap: MarketSnapshot): GeneratorEvaluation {
+  const setupType: SetupType = 'breakdown_retest_short';
+  const setupFamily: SetupFamily = 'breakout_retest';
   const price = snap.price;
   const ind = snap.indicators_1m;
   const kl = snap.key_levels;
@@ -708,14 +1172,22 @@ function genBreakdownRetestShort(snap: MarketSnapshot): CandidateSetup | null {
   // Resistance zone: just above current price
   const resistanceZoneLow = bossSell ?? chochSell;
   const resistanceZoneHigh = chochSell ?? bossSell;
-  if (!resistanceZoneLow || !resistanceZoneHigh) return null;
+  if (!resistanceZoneLow || !resistanceZoneHigh) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:resistance_zone_missing');
+  }
 
   // Price must be below the resistance zone (broken support → now resistance)
-  if (price >= resistanceZoneHigh) return null;
+  if (price >= resistanceZoneHigh) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:not_below_retest_zone');
+  }
   // Price must be within striking distance (< 100 pts below resistance)
-  if (resistanceZoneLow - price > 250) return null;
+  if (resistanceZoneLow - price > 250) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:too_far_below_retest_zone');
+  }
   // Price must be above CHoCH Buy support
-  if (chochBuy !== null && price <= chochBuy) return null;
+  if (chochBuy !== null && price <= chochBuy) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:below_choch_buy');
+  }
 
   // Entry at the lower edge of resistance zone
   const entryLow = Math.min(resistanceZoneLow, price + 10);
@@ -726,7 +1198,9 @@ function genBreakdownRetestShort(snap: MarketSnapshot): CandidateSetup | null {
   const stopAbove = (ind.smart_money_choch_sell ?? resistanceZoneHigh) + 26;
   const stop = Math.max(stopAbove, entryHigh + 20);
   const riskPts = stop - entryMid;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:non_positive_risk');
+  }
 
   // Targets — clamped to ensure they are on the favorable side of entry (below, for shorts)
   const dir: Direction = 'short';
@@ -743,15 +1217,19 @@ function genBreakdownRetestShort(snap: MarketSnapshot): CandidateSetup | null {
 
   // Structural sanity: target must be at least 1R from entry.
   // Policy-level RR gating is handled by the dynamic reward plan in applyHardGates().
-  if (rrt1 < 1.0) return null;
-  if (rrt1 <= 0 || rrt2 <= 0) return null;
+  if (rrt1 < 1.0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:rr_t1_below_structural_floor');
+  }
+  if (rrt1 <= 0 || rrt2 <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakdown_retest_short:targets_invalid');
+  }
 
   const factors: string[] = ['breakdown_retest_zone_identified', 'bos_sell_overhead'];
   if (ind.supertrend_direction === 'down') factors.push('supertrend_down_confirming');
 
   const setup = {
     direction: dir,
-    setup_type: 'breakdown_retest_short' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -765,10 +1243,12 @@ function genBreakdownRetestShort(snap: MarketSnapshot): CandidateSetup | null {
     confidence_factors: factors,
     reason: `Breakdown retest short: entry ${entryLow}–${entryHigh}, stop ${stop}, T1 ${t1} (${rrt1.toFixed(1)}R), T2 ${t2} (${rrt2.toFixed(1)}R)`,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
-function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
+export function genTrendPullbackShort(snap: MarketSnapshot, config: IndicatorConfig): GeneratorEvaluation {
+  const setupType: SetupType = 'trend_pullback_short';
+  const setupFamily: SetupFamily = 'trend_pullback';
   const price = snap.price;
   const ind = snap.indicators_1m;
 
@@ -777,28 +1257,98 @@ function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
   const ema50 = ind.ema_50;
   const stDir = ind.supertrend_direction;
 
-  // Require clear downtrend alignment
-  if (stDir !== 'down') return null;
-  if (!ema9 || !ema21 || !ema50) return null;
-  if (!(price < ema9 && ema9 < ema21 && ema21 < ema50)) return null;
+  // ── Trend state gates (preserved: supertrend + EMA stack) ─────────────
+  // SuperTrend remains as a trend-confirmation input per Phase 3 scope.
+  if (stDir !== 'down') {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_short:rejected_by_trend_state:supertrend_not_down');
+  }
+  if (!ema9 || !ema21 || !ema50) {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_short:rejected_by_trend_state:ema_stack_missing');
+  }
+  if (!(ema9 < ema21 && ema21 < ema50)) {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_short:rejected_by_trend_state:ema_stack_not_bearish');
+  }
 
-  // Symmetric freshness gate: require the downtrend to be structurally fresh
-  // (mirrors isUptrendFresh() used by genTrendPullbackLong)
-  if (!isTrendFresh(snap, 'short').fresh) return null;
+  // ── Freshness gate (PRESERVES 6964bd8 directional asymmetry) ─────────
+  // isTrendFresh on the short side still enforces the ETH VWAP-allowance
+  // soft-gate and the short reversal core bundle — do NOT inline or
+  // duplicate the logic here.
+  const freshness = isTrendFresh(snap, 'short', config, setupType);
+  if (!freshness.fresh) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      `trend_pullback_short:rejected_by_freshness:${freshness.reason}`,
+    );
+  }
 
-  // Price should be bouncing into the EMA cluster (within 50 pts of ema9)
-  const distToEma9 = ema9 - price;
-  if (distToEma9 < 0 || distToEma9 > 80) return null;
+  // ── Build the canonical entry state vector (trend_pullback_short) ────
+  const entryStateVector = buildEntryStateVector(snap, 'short', setupType, {
+    regime: classifyRegime(snap),
+  });
+  if (!entryStateVector) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      'trend_pullback_short:rejected_by_trend_state:state_vector_unavailable',
+    );
+  }
 
-  const entryLow = price;
-  const entryHigh = ema9 + 5;
-  const entryMid = (entryLow + entryHigh) / 2;
-  const stop = ema21 + 20;
+  // ── Pullback geometry: z_ema9 band ────────────────────────────────────
+  // Same sign-convention and band for long and short thanks to the
+  // Phase 1 direction-aware z-score. Replaces the hardcoded
+  // `0 < (ema9 - price) < 80pts` band with `[0.15, 1.25]` in sigma units.
+  const zEma9 = entryStateVector.z_ema9;
+  if (zEma9 === null) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      'trend_pullback_short:rejected_by_pullback_geometry:z_ema9_unavailable',
+    );
+  }
+  if (zEma9 < QUANT_TP_Z_EMA9_MIN || zEma9 > QUANT_TP_Z_EMA9_MAX) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      `trend_pullback_short:rejected_by_pullback_geometry:z_ema9_out_of_band(${zEma9})`,
+    );
+  }
+
+  // ── Pullback geometry: retracement ratio (soft if unavailable) ────────
+  const pbRatio = entryStateVector.pullback_ratio;
+  if (pbRatio !== null) {
+    if (pbRatio < QUANT_TP_PULLBACK_RATIO_MIN || pbRatio > QUANT_TP_PULLBACK_RATIO_MAX) {
+      return buildGeneratorRejection(
+        setupType, setupFamily,
+        `trend_pullback_short:rejected_by_pullback_geometry:ratio_out_of_band(${pbRatio})`,
+      );
+    }
+  }
+
+  // ── Flow confirmation (soft: null = pass) ─────────────────────────────
+  const zFlow = entryStateVector.z_ofi_blend;
+  if (zFlow !== null && zFlow < QUANT_TP_FLOW_CONFIRMATION_MIN) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      `trend_pullback_short:rejected_by_flow_confirmation:z_ofi_blend_below_threshold(${zFlow})`,
+    );
+  }
+
+  // ── Volatility-based entry band + stop (replaces ±5 and ema21±20) ────
+  const sigma = entryStateVector.sigma_pts;
+  const entryHalfBand = sigma * QUANT_TP_ENTRY_HALF_BAND_SIGMA;
+  const entryLow = price - entryHalfBand;
+  const entryHigh = price + entryHalfBand;
+  const entryMid = price;
+  const stop = entryMid + sigma * QUANT_TP_K_SL;
   const riskPts = stop - entryMid;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_short:non_positive_risk');
+  }
 
-  // ── Room-to-downside filter: reject if too close to underlying support ──
-  if (!hasRoomToDownside(snap, entryMid, 1.0)) return null;
+  // ── Room-to-downside filter (PRESERVES 8c85383 room-filter path) ─────
+  if (!hasRoomToDownside(snap, entryMid, 1.0)) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      'trend_pullback_short:rejected_by_room:insufficient_downside_room',
+    );
+  }
 
   const kl = snap.key_levels;
   const dir: Direction = 'short';
@@ -809,12 +1359,12 @@ function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
 
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
-  if (rrt1 <= 0 || rrt2 <= 0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_short:rr_t1_below_structural_floor');
+  if (rrt1 <= 0 || rrt2 <= 0) return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_short:targets_invalid');
 
   const setup = {
     direction: dir,
-    setup_type: 'trend_pullback_short' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -827,28 +1377,159 @@ function genTrendPullbackShort(snap: MarketSnapshot): CandidateSetup | null {
     confidence: 0,
     confidence_factors: ['trend_pullback', 'ema_stack_bearish', 'supertrend_down', 'fresh_downtrend_confirmed', 'downside_room_confirmed'],
     reason: `Trend pullback short into EMA cluster. Entry ${entryLow}–${entryHigh}, stop ${stop}`,
+    freshness,
+    entry_state_vector: entryStateVector,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
-function genBreakdownMomentumShort(snap: MarketSnapshot): CandidateSetup | null {
+export function genPostFlipFirstPullbackShort(snap: MarketSnapshot, config: IndicatorConfig): GeneratorEvaluation {
+  const setupType: SetupType = 'post_flip_first_pullback_short';
+  const setupFamily: SetupFamily = 'trend_pullback';
+  const ind = snap.indicators_1m;
+  const price = snap.price;
+  const atr14 = ind.atr_14;
+  const ema9 = ind.ema_9;
+  const ema21 = ind.ema_21;
+  const ema50 = ind.ema_50;
+
+  if (!config.enable_post_flip_first_pullback_short) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:disabled');
+  }
+  if (!snap.session?.is_eth) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:not_eth');
+  }
+  if (!ema9 || !ema21 || !ema50 || !atr14 || atr14 <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:ema_or_atr_missing');
+  }
+
+  const reversalCore = evaluateEthShortReversalCore(snap, classifyRegime(snap));
+  if (!reversalCore.passed) {
+    return buildGeneratorRejection(setupType, setupFamily, reversalCore.reason);
+  }
+
+  const completed1m = getCompletedBars(snap, '1m');
+  if (completed1m.length < 3 || reversalCore.barsSinceFlip === null) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:flip_series_unavailable');
+  }
+
+  const flipIndex = completed1m.length - 1 - reversalCore.barsSinceFlip;
+  const flipBar = completed1m[Math.max(0, flipIndex)];
+  const currentImpulseAtr = flipBar ? Math.max(0, (flipBar.close - price) / atr14) : null;
+  const last3 = completed1m.slice(-3);
+  const last3BarReturnAtr = last3.length === 3
+    ? Math.abs(last3[last3.length - 1]!.close - last3[0]!.open) / atr14
+    : null;
+
+  const bearishEmaForming = price <= ema9 && ema9 <= ema21 + 0.15 * atr14;
+  if (!bearishEmaForming) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:bearish_ema_stack_not_forming');
+  }
+
+  const vwapDistance = getVwapDistanceSessionAtr(snap, price);
+  const freshnessConfig = getDirectionalFreshnessConfig(config);
+  if (
+    vwapDistance !== null &&
+    vwapDistance > freshnessConfig.short_above_vwap_allowance_session_atr
+  ) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:vwap_allowance_exceeded');
+  }
+
+  const clusterHigh = Math.max(ema9, ema21);
+  const retestDistance = Math.abs(price - clusterHigh);
+  const maxRetestAtr = config.post_flip_first_pullback_short_max_retest_atr ?? 0.20;
+  if (retestDistance > maxRetestAtr * atr14) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:retest_not_seen');
+  }
+
+  if (currentImpulseAtr !== null && currentImpulseAtr > 2.8) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:impulse_too_mature');
+  }
+  if (last3BarReturnAtr !== null && last3BarReturnAtr > 1.7) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:recent_move_too_fast');
+  }
+
+  const entryLow = Math.min(price, ema9 - 5);
+  const entryHigh = Math.max(price, ema21 + 5);
+  const entryMid = (entryLow + entryHigh) / 2;
+  const recentHigh = Math.max(...completed1m.slice(-5).map(bar => bar.high));
+  const stop = Math.max(ema50 + 15, recentHigh + 5);
+  const riskPts = stop - entryMid;
+  if (riskPts <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:non_positive_risk');
+  }
+
+  if (!hasRoomToDownside(snap, entryMid, 1.0)) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:insufficient_downside_room');
+  }
+
+  const dir: Direction = 'short';
+  const kl = snap.key_levels;
+  const t1 = clampTarget(ind.smart_money_choch_buy ?? kl.choch_buy, entryMid, riskPts, 2, dir);
+  const t2 = clampTarget(kl.pivot_support[0] ?? kl.session_low ?? null, entryMid, riskPts, 4, dir);
+  const rrt1 = computeRr(t1, entryMid, riskPts, dir);
+  const rrt2 = computeRr(t2, entryMid, riskPts, dir);
+  if (rrt1 < 1.0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:rr_t1_below_structural_floor');
+  }
+  if (rrt1 <= 0 || rrt2 <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'post_flip_first_pullback_short:targets_invalid');
+  }
+
+  const freshness = isTrendFresh(snap, 'short', config, setupType);
+  if (!freshness.fresh) {
+    return buildGeneratorRejection(setupType, setupFamily, freshness.reason);
+  }
+
+  const setup = {
+    direction: dir,
+    setup_type: setupType,
+    entry_low: entryLow,
+    entry_high: entryHigh,
+    stop,
+    target_1: t1,
+    target_2: t2,
+    target_3: null,
+    risk_pts: riskPts,
+    rr_t1: rrt1,
+    rr_t2: rrt2,
+    confidence: 0,
+    confidence_factors: [
+      'post_flip_first_pullback_short',
+      'eth_session',
+      'recent_flip_down',
+      '5m_deterioration',
+      'ema_cluster_retest',
+    ],
+    reason: `ETH post-flip first pullback short. Entry ${entryLow}–${entryHigh}, stop ${stop}`,
+    freshness,
+    bars_since_flip: reversalCore.barsSinceFlip,
+  };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
+}
+
+export function genBreakdownMomentumShort(snap: MarketSnapshot): GeneratorEvaluation {
+  const setupType: SetupType = 'momentum_continuation';
+  const setupFamily: SetupFamily = 'momentum_continuation';
   const price = snap.price;
   const ind = snap.indicators_1m;
   const kl = snap.key_levels;
 
   const chochBuy = kl.choch_buy ?? ind.smart_money_choch_buy;
-  if (!chochBuy) return null;
+  if (!chochBuy) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:choch_buy_missing');
 
   // Price must have just broken through CHoCH Buy (price is below it)
-  if (price >= chochBuy) return null;
-  if (chochBuy - price < 20) return null; // Too close to break — false break zone
-  if (price < chochBuy - 100) return null; // Too far, momentum trade window passed
+  if (price >= chochBuy) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:not_below_choch_buy');
+  if (chochBuy - price < 20) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:false_break_zone');
+  if (price < chochBuy - 100) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:window_passed');
 
   // ── Momentum confirmation: require the last CLOSED 1m bar to close below
   //    the break level. This rejects wick-only false breaks.
   const bars1m = snap.bars_1m;
   const lastClosed = bars1m.length >= 2 ? bars1m[bars1m.length - 2] : undefined;
-  if (!lastClosed || lastClosed.close >= chochBuy) return null;
+  if (!lastClosed || lastClosed.close >= chochBuy) {
+    return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:last_closed_bar_not_below_break');
+  }
 
   const entryLow = price - 20;
   const entryHigh = chochBuy; // Enter on any bounce back to the broken level
@@ -859,7 +1540,7 @@ function genBreakdownMomentumShort(snap: MarketSnapshot): CandidateSetup | null 
   const atrBuffer = atr !== null ? Math.max(40, Math.min(120, atr * 0.75)) : 60;
   const stop = chochBuy + atrBuffer;
   const riskPts = stop - entryMid;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:non_positive_risk');
 
   const dir: Direction = 'short';
   const t1 = clampTarget(kl.pivot_support[0] ?? null, entryMid, riskPts, 3, dir);
@@ -870,12 +1551,12 @@ function genBreakdownMomentumShort(snap: MarketSnapshot): CandidateSetup | null 
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
-  if (rrt1 <= 0 || rrt2 <= 0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:rr_t1_below_structural_floor');
+  if (rrt1 <= 0 || rrt2 <= 0) return buildGeneratorRejection(setupType, setupFamily, 'momentum_continuation:targets_invalid');
 
   const setup = {
     direction: dir,
-    setup_type: 'momentum_continuation' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -889,10 +1570,12 @@ function genBreakdownMomentumShort(snap: MarketSnapshot): CandidateSetup | null 
     confidence_factors: ['choch_buy_broken', 'momentum_continuation', 'close_below_break_confirmed'],
     reason: `Momentum short below CHoCH Buy. Entry ${entryLow}–${entryHigh}, stop ${stop}`,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
-function genTrendPullbackLong(snap: MarketSnapshot): CandidateSetup | null {
+export function genTrendPullbackLong(snap: MarketSnapshot, config: IndicatorConfig): GeneratorEvaluation {
+  const setupType: SetupType = 'trend_pullback_long';
+  const setupFamily: SetupFamily = 'trend_pullback';
   const price = snap.price;
   const ind = snap.indicators_1m;
 
@@ -901,29 +1584,104 @@ function genTrendPullbackLong(snap: MarketSnapshot): CandidateSetup | null {
   const ema50 = ind.ema_50;
   const stDir = ind.supertrend_direction;
 
-  // Require clear uptrend alignment
-  if (stDir !== 'up') return null;
-  if (!ema9 || !ema21 || !ema50) return null;
-  if (!(price > ema9 && ema9 > ema21 && ema21 > ema50)) return null;
+  // ── Trend state gates (preserved: supertrend + EMA stack) ─────────────
+  // SuperTrend remains as a trend-confirmation input per Phase 3 scope.
+  if (stDir !== 'up') {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_long:rejected_by_trend_state:supertrend_not_up');
+  }
+  if (!ema9 || !ema21 || !ema50) {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_long:rejected_by_trend_state:ema_stack_missing');
+  }
+  if (!(ema9 > ema21 && ema21 > ema50)) {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_long:rejected_by_trend_state:ema_stack_not_bullish');
+  }
 
-  // ── Fresh uptrend filter: require actual higher-high/higher-low structure ──
-  // EMA stack alone is lagging; recent bar structure proves the move is still live.
-  if (!isUptrendFresh(snap)) return null;
+  // ── Freshness gate (preserves long-side behavior; asymmetry lives in isTrendFresh) ──
+  const freshness = isTrendFresh(snap, 'long', config, setupType);
+  if (!freshness.fresh) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      `trend_pullback_long:rejected_by_freshness:${freshness.reason}`,
+    );
+  }
 
-  // Price should be pulling back toward the EMA cluster (within 80 pts above ema9)
-  const distToEma9 = price - ema9;
-  if (distToEma9 < 0 || distToEma9 > 80) return null;
+  // ── Build the canonical entry state vector (trend-pullback_long) ─────
+  // If sigma_pts cannot be computed (missing ATR AND insufficient bars),
+  // the vector returns null and the generator rejects — state-vector
+  // gating is intentionally the primary gate now.
+  const entryStateVector = buildEntryStateVector(snap, 'long', setupType, {
+    regime: classifyRegime(snap),
+  });
+  if (!entryStateVector) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      'trend_pullback_long:rejected_by_trend_state:state_vector_unavailable',
+    );
+  }
 
-  const entryLow = ema9 - 5;
-  const entryHigh = price;
-  const entryMid = (entryLow + entryHigh) / 2;
-  const stop = ema21 - 20;
+  // ── Pullback geometry: z_ema9 band ────────────────────────────────────
+  // Replaces the hardcoded `0 < distToEma9 < 80pts` band with a
+  // sigma-normalized band [0.15, 1.25]. Same semantic (price is just
+  // above EMA9 by a small amount), scaled to realized volatility.
+  const zEma9 = entryStateVector.z_ema9;
+  if (zEma9 === null) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      'trend_pullback_long:rejected_by_pullback_geometry:z_ema9_unavailable',
+    );
+  }
+  if (zEma9 < QUANT_TP_Z_EMA9_MIN || zEma9 > QUANT_TP_Z_EMA9_MAX) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      `trend_pullback_long:rejected_by_pullback_geometry:z_ema9_out_of_band(${zEma9})`,
+    );
+  }
+
+  // ── Pullback geometry: retracement ratio (soft if unavailable) ────────
+  // detectSwings needs enough bars; early-session snapshots or fixture
+  // tests may not have them, in which case the gate passes through.
+  const pbRatio = entryStateVector.pullback_ratio;
+  if (pbRatio !== null) {
+    if (pbRatio < QUANT_TP_PULLBACK_RATIO_MIN || pbRatio > QUANT_TP_PULLBACK_RATIO_MAX) {
+      return buildGeneratorRejection(
+        setupType, setupFamily,
+        `trend_pullback_long:rejected_by_pullback_geometry:ratio_out_of_band(${pbRatio})`,
+      );
+    }
+  }
+
+  // ── Flow confirmation (soft: null = pass) ─────────────────────────────
+  // z_ofi_blend is direction-signed by orderflow-state.ts — positive
+  // means flow favors the setup direction. Null during warmup / no LOB.
+  const zFlow = entryStateVector.z_ofi_blend;
+  if (zFlow !== null && zFlow < QUANT_TP_FLOW_CONFIRMATION_MIN) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      `trend_pullback_long:rejected_by_flow_confirmation:z_ofi_blend_below_threshold(${zFlow})`,
+    );
+  }
+
+  // ── Volatility-based entry band + stop (replaces ±5 and ema21±20) ────
+  const sigma = entryStateVector.sigma_pts;
+  const entryHalfBand = sigma * QUANT_TP_ENTRY_HALF_BAND_SIGMA;
+  const entryLow = price - entryHalfBand;
+  const entryHigh = price + entryHalfBand;
+  const entryMid = price;
+  const stop = entryMid - sigma * QUANT_TP_K_SL;
   const riskPts = entryMid - stop;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) {
+    return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_long:non_positive_risk');
+  }
 
-  // ── Room-to-upside filter: reject if too close to overhead resistance ──
-  if (!hasRoomToUpside(snap, entryMid, 1.0)) return null;
+  // ── Room-to-upside filter (preserved: 8c85383 normalization path) ────
+  if (!hasRoomToUpside(snap, entryMid, 1.0)) {
+    return buildGeneratorRejection(
+      setupType, setupFamily,
+      'trend_pullback_long:rejected_by_room:insufficient_upside_room',
+    );
+  }
 
+  // ── Targets (unchanged structural math; Phase 4 replaces with cold-start σ targets) ──
   const kl = snap.key_levels;
   const dir: Direction = 'long';
   const t1 = clampTarget(ind.smart_money_choch_sell, entryMid, riskPts, 2, dir);
@@ -933,12 +1691,12 @@ function genTrendPullbackLong(snap: MarketSnapshot): CandidateSetup | null {
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
 
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
-  if (rrt1 <= 0 || rrt2 <= 0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_long:rr_t1_below_structural_floor');
+  if (rrt1 <= 0 || rrt2 <= 0) return buildGeneratorRejection(setupType, setupFamily, 'trend_pullback_long:targets_invalid');
 
   const setup = {
     direction: dir,
-    setup_type: 'trend_pullback_long' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -951,11 +1709,15 @@ function genTrendPullbackLong(snap: MarketSnapshot): CandidateSetup | null {
     confidence: 0,
     confidence_factors: ['trend_pullback', 'ema_stack_bullish', 'supertrend_up', 'fresh_uptrend_confirmed', 'upside_room_confirmed'],
     reason: `Trend pullback long into EMA cluster. Entry ${entryLow}–${entryHigh}, stop ${stop}`,
+    freshness,
+    entry_state_vector: entryStateVector,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
-function genBreakoutRetestLong(snap: MarketSnapshot): CandidateSetup | null {
+export function genBreakoutRetestLong(snap: MarketSnapshot, config: IndicatorConfig): GeneratorEvaluation {
+  const setupType: SetupType = 'breakout_retest_long';
+  const setupFamily: SetupFamily = 'breakout_retest';
   const price = snap.price;
   const ind = snap.indicators_1m;
 
@@ -964,16 +1726,21 @@ function genBreakoutRetestLong(snap: MarketSnapshot): CandidateSetup | null {
   const ema50 = ind.ema_50;
   const stDir = ind.supertrend_direction;
 
-  if (stDir !== 'up') return null;
-  if (!ema9 || !ema21 || !ema50) return null;
-  if (!(price > ema9 && ema9 > ema21 && ema21 > ema50)) return null;
+  if (stDir !== 'up') return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:supertrend_not_up');
+  if (!ema9 || !ema21 || !ema50) return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:ema_stack_missing');
+  if (!(price > ema9 && ema9 > ema21 && ema21 > ema50)) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:ema_stack_not_bullish');
+  }
 
   // ── Fresh uptrend filter ──
-  if (!isUptrendFresh(snap)) return null;
+  const freshness = isTrendFresh(snap, 'long', config, setupType);
+  if (!freshness.fresh) return buildGeneratorRejection(setupType, setupFamily, freshness.reason);
 
   // Price should be close to EMA9 (within 60pts above)
   const distAboveEma9 = price - ema9;
-  if (distAboveEma9 < 0 || distAboveEma9 > 60) return null;
+  if (distAboveEma9 < 0 || distAboveEma9 > 60) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:not_near_ema9');
+  }
 
   const kl = snap.key_levels;
   const entryLow = ema9 - 10;
@@ -981,25 +1748,27 @@ function genBreakoutRetestLong(snap: MarketSnapshot): CandidateSetup | null {
   const entryMid = (entryLow + entryHigh) / 2;
   const stop = ema21 - 25;
   const riskPts = entryMid - stop;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:non_positive_risk');
 
   // ── Room-to-upside filter ──
-  if (!hasRoomToUpside(snap, entryMid, 1.0)) return null;
+  if (!hasRoomToUpside(snap, entryMid, 1.0)) {
+    return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:insufficient_upside_room');
+  }
 
   const dir: Direction = 'long';
   const resistance = kl.pivot_resistance[0] ?? null;
-  if (!resistance) return null;
+  if (!resistance) return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:nearest_resistance_missing');
   const t1 = clampTarget(resistance, entryMid, riskPts, 2, dir);
   const t2 = clampTarget(kl.pivot_resistance[1] ?? null, entryMid, riskPts, 4, dir);
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
-  if (rrt1 <= 0 || rrt2 <= 0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:rr_t1_below_structural_floor');
+  if (rrt1 <= 0 || rrt2 <= 0) return buildGeneratorRejection(setupType, setupFamily, 'breakout_retest_long:targets_invalid');
 
   const setup = {
     direction: dir,
-    setup_type: 'breakout_retest_long' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -1012,8 +1781,9 @@ function genBreakoutRetestLong(snap: MarketSnapshot): CandidateSetup | null {
     confidence: 0,
     confidence_factors: ['ema_pullback_long', 'supertrend_up', 'fresh_uptrend_confirmed', 'upside_room_confirmed'],
     reason: `EMA pullback long. Entry ${entryLow}–${entryHigh}, stop ${stop}`,
+    freshness,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
 // ─── NQ-specific setup generators ────────────────────────────────────────────
@@ -1023,24 +1793,26 @@ function genBreakoutRetestLong(snap: MarketSnapshot): CandidateSetup | null {
  * upside and the drive has momentum (higher lows, close above OR_high on the
  * last closed 1m bar).
  */
-function genOpeningDriveContinuationLong(snap: MarketSnapshot): CandidateSetup | null {
+export function genOpeningDriveContinuationLong(snap: MarketSnapshot): GeneratorEvaluation {
+  const setupType: SetupType = 'opening_drive_continuation_long';
+  const setupFamily: SetupFamily = 'opening_drive';
   const kl = snap.key_levels;
   const session = snap.session;
-  if (!session?.is_rth) return null;
+  if (!session?.is_rth) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_long:not_rth');
   const orHigh = kl.opening_range_high;
   const orLow = kl.opening_range_low;
-  if (orHigh === null || orLow === null) return null;
-  if (snap.price <= orHigh) return null;
+  if (orHigh === null || orLow === null) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_long:opening_range_missing');
+  if (snap.price <= orHigh) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_long:not_above_or_high');
   // Require last CLOSED 1m bar to close above OR high
   const closed = snap.bars_1m.length >= 2 ? snap.bars_1m[snap.bars_1m.length - 2] : undefined;
-  if (!closed || closed.close <= orHigh) return null;
+  if (!closed || closed.close <= orHigh) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_long:last_closed_not_above_or_high');
 
   const entryLow = orHigh;
   const entryHigh = snap.price + (orHigh - orLow) * 0.1;
   const entryMid = (entryLow + entryHigh) / 2;
   const stop = orLow; // failure of the opening range
   const riskPts = entryMid - stop;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_long:non_positive_risk');
 
   const dir: Direction = 'long';
   const orRange = orHigh - orLow;
@@ -1049,11 +1821,11 @@ function genOpeningDriveContinuationLong(snap: MarketSnapshot): CandidateSetup |
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_long:rr_t1_below_structural_floor');
 
   const setup = {
     direction: dir,
-    setup_type: 'opening_drive_continuation_long' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -1067,26 +1839,28 @@ function genOpeningDriveContinuationLong(snap: MarketSnapshot): CandidateSetup |
     confidence_factors: ['opening_drive_long', 'closed_above_or_high'],
     reason: `Opening-drive long above OR_high=${orHigh}. Stop=${orLow}, T1=${t1.toFixed(2)}, T2=${t2.toFixed(2)}`,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
-function genOpeningDriveContinuationShort(snap: MarketSnapshot): CandidateSetup | null {
+export function genOpeningDriveContinuationShort(snap: MarketSnapshot): GeneratorEvaluation {
+  const setupType: SetupType = 'opening_drive_continuation_short';
+  const setupFamily: SetupFamily = 'opening_drive';
   const kl = snap.key_levels;
   const session = snap.session;
-  if (!session?.is_rth) return null;
+  if (!session?.is_rth) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_short:not_rth');
   const orHigh = kl.opening_range_high;
   const orLow = kl.opening_range_low;
-  if (orHigh === null || orLow === null) return null;
-  if (snap.price >= orLow) return null;
+  if (orHigh === null || orLow === null) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_short:opening_range_missing');
+  if (snap.price >= orLow) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_short:not_below_or_low');
   const closed = snap.bars_1m.length >= 2 ? snap.bars_1m[snap.bars_1m.length - 2] : undefined;
-  if (!closed || closed.close >= orLow) return null;
+  if (!closed || closed.close >= orLow) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_short:last_closed_not_below_or_low');
 
   const entryHigh = orLow;
   const entryLow = snap.price - (orHigh - orLow) * 0.1;
   const entryMid = (entryLow + entryHigh) / 2;
   const stop = orHigh;
   const riskPts = stop - entryMid;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_short:non_positive_risk');
 
   const dir: Direction = 'short';
   const orRange = orHigh - orLow;
@@ -1095,11 +1869,11 @@ function genOpeningDriveContinuationShort(snap: MarketSnapshot): CandidateSetup 
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'opening_drive_continuation_short:rr_t1_below_structural_floor');
 
   const setup = {
     direction: dir,
-    setup_type: 'opening_drive_continuation_short' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -1113,37 +1887,39 @@ function genOpeningDriveContinuationShort(snap: MarketSnapshot): CandidateSetup 
     confidence_factors: ['opening_drive_short', 'closed_below_or_low'],
     reason: `Opening-drive short below OR_low=${orLow}. Stop=${orHigh}, T1=${t1.toFixed(2)}, T2=${t2.toFixed(2)}`,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
 /**
  * Failed opening-range break: price broke above OR_high, then failed back
  * inside the range. Fade short with stop above the failure high.
  */
-function genFailedOrBreakShort(snap: MarketSnapshot): CandidateSetup | null {
+export function genFailedOrBreakShort(snap: MarketSnapshot): GeneratorEvaluation {
+  const setupType: SetupType = 'failed_or_break_short';
+  const setupFamily: SetupFamily = 'failed_or_break';
   const kl = snap.key_levels;
   const session = snap.session;
-  if (!session?.is_rth) return null;
+  if (!session?.is_rth) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:not_rth');
   const orHigh = kl.opening_range_high;
   const orLow = kl.opening_range_low;
-  if (orHigh === null || orLow === null) return null;
+  if (orHigh === null || orLow === null) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:opening_range_missing');
 
   // Need a recent bar that poked above OR_high but price is now back below
-  if (snap.price >= orHigh) return null;
+  if (snap.price >= orHigh) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:not_back_below_or_high');
   const recent = snap.bars_1m.slice(-6);
-  if (recent.length < 3) return null;
+  if (recent.length < 3) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:insufficient_recent_bars');
   const maxHigh = Math.max(...recent.map(b => b.high));
-  if (maxHigh <= orHigh) return null; // no failed break
+  if (maxHigh <= orHigh) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:no_failed_break_sweep');
   // last closed bar must have closed back inside
   const closed = snap.bars_1m[snap.bars_1m.length - 2];
-  if (!closed || closed.close >= orHigh) return null;
+  if (!closed || closed.close >= orHigh) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:last_closed_not_back_inside_range');
 
   const entryHigh = orHigh;
   const entryLow = snap.price;
   const entryMid = (entryLow + entryHigh) / 2;
   const stop = maxHigh; // above the failed high
   const riskPts = stop - entryMid;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:non_positive_risk');
 
   const dir: Direction = 'short';
   const t1 = (orHigh + orLow) / 2;
@@ -1151,11 +1927,11 @@ function genFailedOrBreakShort(snap: MarketSnapshot): CandidateSetup | null {
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_short:rr_t1_below_structural_floor');
 
   const setup = {
     direction: dir,
-    setup_type: 'failed_or_break_short' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -1169,30 +1945,32 @@ function genFailedOrBreakShort(snap: MarketSnapshot): CandidateSetup | null {
     confidence_factors: ['failed_or_break_short', 'reclaimed_inside_range'],
     reason: `Failed OR break short: swept ${maxHigh}, back below OR_high ${orHigh}`,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
 }
 
-function genFailedOrBreakLong(snap: MarketSnapshot): CandidateSetup | null {
+export function genFailedOrBreakLong(snap: MarketSnapshot): GeneratorEvaluation {
+  const setupType: SetupType = 'failed_or_break_long';
+  const setupFamily: SetupFamily = 'failed_or_break';
   const kl = snap.key_levels;
   const session = snap.session;
-  if (!session?.is_rth) return null;
+  if (!session?.is_rth) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:not_rth');
   const orHigh = kl.opening_range_high;
   const orLow = kl.opening_range_low;
-  if (orHigh === null || orLow === null) return null;
-  if (snap.price <= orLow) return null;
+  if (orHigh === null || orLow === null) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:opening_range_missing');
+  if (snap.price <= orLow) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:not_back_above_or_low');
   const recent = snap.bars_1m.slice(-6);
-  if (recent.length < 3) return null;
+  if (recent.length < 3) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:insufficient_recent_bars');
   const minLow = Math.min(...recent.map(b => b.low));
-  if (minLow >= orLow) return null;
+  if (minLow >= orLow) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:no_failed_breakdown_sweep');
   const closed = snap.bars_1m[snap.bars_1m.length - 2];
-  if (!closed || closed.close <= orLow) return null;
+  if (!closed || closed.close <= orLow) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:last_closed_not_back_inside_range');
 
   const entryLow = orLow;
   const entryHigh = snap.price;
   const entryMid = (entryLow + entryHigh) / 2;
   const stop = minLow;
   const riskPts = entryMid - stop;
-  if (riskPts <= 0) return null;
+  if (riskPts <= 0) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:non_positive_risk');
 
   const dir: Direction = 'long';
   const t1 = (orHigh + orLow) / 2;
@@ -1200,11 +1978,11 @@ function genFailedOrBreakLong(snap: MarketSnapshot): CandidateSetup | null {
   const rrt1 = computeRr(t1, entryMid, riskPts, dir);
   const rrt2 = computeRr(t2, entryMid, riskPts, dir);
   // Structural sanity floor (1.0R). Policy-level RR gating via dynamic reward plan.
-  if (rrt1 < 1.0) return null;
+  if (rrt1 < 1.0) return buildGeneratorRejection(setupType, setupFamily, 'failed_or_break_long:rr_t1_below_structural_floor');
 
   const setup = {
     direction: dir,
-    setup_type: 'failed_or_break_long' as SetupType,
+    setup_type: setupType,
     entry_low: entryLow,
     entry_high: entryHigh,
     stop,
@@ -1218,7 +1996,227 @@ function genFailedOrBreakLong(snap: MarketSnapshot): CandidateSetup | null {
     confidence_factors: ['failed_or_break_long', 'reclaimed_inside_range'],
     reason: `Failed OR breakdown long: swept ${minLow}, back above OR_low ${orLow}`,
   };
-  return { ...setup, ...validateSetupTargets(setup) };
+  return withSetupCandidate(setupType, setupFamily, { ...setup, ...validateSetupTargets(setup) });
+}
+
+// ─── Strategy Registry ──────────────────────────────────────────────────────
+//
+// Canonical list of strategies with metadata. The registry lives here
+// (alongside the generator functions) rather than in strategy-registry.ts
+// because generator references must be bound at module init without
+// creating a circular import. Types/helpers are in strategy-registry.ts.
+
+import type { StrategyDefinition } from './strategy-registry.js';
+import {
+  effectiveStatus,
+  listRunnableStrategies,
+} from './strategy-registry.js';
+import {
+  generateLobMboScalpLong,
+  generateLobMboScalpShort,
+} from './strategies/lob-mbo-scalp.js';
+
+export const STRATEGY_REGISTRY: ReadonlyArray<StrategyDefinition> = [
+  {
+    strategy_id: 'trend_pullback_long',
+    family: 'trend_pullback',
+    direction: 'long',
+    status: 'active',
+    entry_model: null,
+    score_profile: 'trend_continuation',
+    hard_gates: [
+      'supertrend_up', 'bullish_ema_stack', 'fresh_uptrend',
+      'within_80pts_of_ema9', 'upside_room', 'rr_gte_1',
+    ],
+    generator: (snap, config) => genTrendPullbackLong(snap, config),
+  },
+  {
+    strategy_id: 'trend_pullback_short',
+    family: 'trend_pullback',
+    direction: 'short',
+    status: 'active',
+    entry_model: null,
+    score_profile: 'trend_continuation',
+    hard_gates: [
+      'supertrend_down', 'bearish_ema_stack', 'fresh_downtrend',
+      'within_80pts_of_ema9', 'downside_room', 'rr_gte_1',
+    ],
+    generator: (snap, config) => genTrendPullbackShort(snap, config),
+  },
+  {
+    strategy_id: 'breakout_retest_long',
+    family: 'breakout_retest',
+    direction: 'long',
+    status: 'active',
+    entry_model: null,
+    score_profile: 'breakout_continuation',
+    hard_gates: [
+      'supertrend_up', 'bullish_ema_stack', 'fresh_uptrend',
+      'within_60pts_of_ema9', 'upside_room', 'pivot_resistance_exists', 'rr_gte_1',
+    ],
+    generator: (snap, config) => genBreakoutRetestLong(snap, config),
+    non_primary_baseline: true,
+  },
+  {
+    strategy_id: 'breakdown_retest_short',
+    family: 'breakout_retest',
+    direction: 'short',
+    status: 'active',
+    entry_model: null,
+    score_profile: 'breakout_continuation',
+    hard_gates: [
+      'resistance_zone_exists', 'price_below_zone', 'within_250pts',
+      'above_choch_buy', 'rr_gte_1',
+    ],
+    generator: (snap, _config) => genBreakdownRetestShort(snap),
+    non_primary_baseline: true,
+  },
+  {
+    strategy_id: 'post_flip_first_pullback_short',
+    family: 'trend_pullback',
+    direction: 'short',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'reversal_reclaim',
+    hard_gates: [
+      'eth_session_only', 'reversal_bundle_passed',
+      'bearish_ema_formation', 'vwap_dist_ok', 'retest_dist_ok',
+      'impulse_under_2_8_atr', 'downside_room',
+    ],
+    generator: (snap, config) => genPostFlipFirstPullbackShort(snap, config),
+    notes: 'ETH reversal — needs more volume before re-activation',
+  },
+  {
+    strategy_id: 'opening_drive_continuation_long',
+    family: 'opening_drive',
+    direction: 'long',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'session_structure',
+    hard_gates: [
+      'rth_session', 'or_high_exists', 'price_above_or_high',
+      'last_bar_closes_above', 'rr_gte_1',
+    ],
+    generator: (snap, _config) => genOpeningDriveContinuationLong(snap),
+    notes: 'RTH-only, insufficient sample',
+  },
+  {
+    strategy_id: 'opening_drive_continuation_short',
+    family: 'opening_drive',
+    direction: 'short',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'session_structure',
+    hard_gates: [
+      'rth_session', 'or_low_exists', 'price_below_or_low',
+      'last_bar_closes_below', 'rr_gte_1',
+    ],
+    generator: (snap, _config) => genOpeningDriveContinuationShort(snap),
+    notes: 'RTH-only, insufficient sample',
+  },
+  {
+    strategy_id: 'failed_or_break_long',
+    family: 'failed_or_break',
+    direction: 'long',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'reversal_reclaim',
+    hard_gates: [
+      'rth_session', 'or_low_exists', 'price_above_or_low',
+      'recent_sweep_below', 'last_bar_closes_above_or_low', 'rr_gte_1',
+    ],
+    generator: (snap, _config) => genFailedOrBreakLong(snap),
+    notes: 'RTH-only, insufficient sample',
+  },
+  {
+    strategy_id: 'failed_or_break_short',
+    family: 'failed_or_break',
+    direction: 'short',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'reversal_reclaim',
+    hard_gates: [
+      'rth_session', 'or_high_exists', 'price_below_or_high',
+      'recent_sweep_above', 'last_bar_closes_below_or_high', 'rr_gte_1',
+    ],
+    generator: (snap, _config) => genFailedOrBreakShort(snap),
+    notes: 'RTH-only, insufficient sample',
+  },
+  {
+    strategy_id: 'momentum_continuation',
+    family: 'momentum_continuation',
+    direction: 'short',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'breakout_continuation',
+    hard_gates: [
+      'choch_buy_exists', 'price_below_choch_buy',
+      'dist_20_100pts', 'last_bar_closes_below', 'rr_gte_1',
+    ],
+    generator: (snap, _config) => genBreakdownMomentumShort(snap),
+    notes: 'previously gated off by default via enable_momentum_continuation=false',
+  },
+  // ── lob_mbo_scalp family (Phase 3b: real generator wired, status still shadow) ──
+  //
+  // The generator lives in src/autotrade/strategies/lob-mbo-scalp.ts and
+  // runs the full deterministic + persistence gate chain against the
+  // LobSnapshot passed through from generateSignal(). Phase 4 (writer +
+  // ML) and Phase 5 (expectancy) are placeholder-rejected — every cycle
+  // returns candidate: null with a structured reject reason visible in
+  // telemetry. Registry status stays 'shadow' so isExecutable() blocks
+  // the family from live execution until Phase 8 promotion.
+  //
+  // `getSetupFamily()` in features/microstructure-score.ts still falls
+  // through to its 'trend_continuation' default for these IDs — that is
+  // harmless because the generator never returns a candidate that could
+  // be scored. A dedicated scoring branch lands in the next Phase 3
+  // task.
+  {
+    strategy_id: 'lob_mbo_scalp_long',
+    family: 'lob_mbo_scalp',
+    direction: 'long',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'scalp_high_frequency',
+    hard_gates: [
+      'scalp_quality_ok', 'spread_ok', 'persistence_ok',
+      'ev_positive', 'microstructure_score_ok',
+    ],
+    generator: (snap, config, lobSnapshot) =>
+      generateLobMboScalpLong(snap, config, lobSnapshot) as GeneratorEvaluation,
+    notes: 'Phase 3b minimal — deterministic + persistence gates live; Phase 4/5 placeholder-rejected',
+  },
+  {
+    strategy_id: 'lob_mbo_scalp_short',
+    family: 'lob_mbo_scalp',
+    direction: 'short',
+    status: 'shadow',
+    entry_model: null,
+    score_profile: 'scalp_high_frequency',
+    hard_gates: [
+      'scalp_quality_ok', 'spread_ok', 'persistence_ok',
+      'ev_positive', 'microstructure_score_ok',
+    ],
+    generator: (snap, config, lobSnapshot) =>
+      generateLobMboScalpShort(snap, config, lobSnapshot) as GeneratorEvaluation,
+    notes: 'Phase 3b minimal — deterministic + persistence gates live; Phase 4/5 placeholder-rejected',
+  },
+];
+
+/** Cached lookup. */
+const STRATEGY_BY_ID = new Map<SetupType, StrategyDefinition>(
+  STRATEGY_REGISTRY.map((s) => [s.strategy_id, s]),
+);
+
+export function getStrategyDefinition(id: SetupType): StrategyDefinition | undefined {
+  return STRATEGY_BY_ID.get(id);
+}
+
+/** Resolved effective status for a given setup id, honouring config soft overrides. */
+export function getStrategyEffectiveStatus(id: SetupType, config: IndicatorConfig): 'active' | 'shadow' | 'disabled' | 'deprecated' {
+  const def = STRATEGY_BY_ID.get(id);
+  if (!def) return 'disabled';
+  return effectiveStatus(def, config);
 }
 
 // ─── Scoring Weights ────────────────────────────────────────────────────────
@@ -1274,6 +2272,11 @@ export const DEFAULT_SCORING_WEIGHTS: Readonly<ScoringWeights> = {
   // CVD
   cvd_divergence: -0.4,
   cvd_aligned: 0.25,
+  htf_conflict_transition_relief: 0.35,
+  reversal_transition_bonus: 0.2,
+  contextual_positive_cap: 0.5,
+  reversal_bonus_peak_bars_since_flip: 7,
+  reversal_bonus_sigma_bars: 3,
 };
 
 /**
@@ -1734,6 +2737,77 @@ export function applyHardGates(
   return failures;
 }
 
+function applyContextualScoreAdjustments(
+  setup: CandidateSetup,
+  breakdown: ScoreBreakdown,
+  snap: MarketSnapshot,
+  bias: MultiTfBias,
+  regime: MarketRegime,
+  config: IndicatorConfig,
+): {
+  scorePreContext: number;
+  scorePostContext: number;
+  vwapSoftPenalty: number;
+  htfConflictRelief: number;
+  reversalTransitionBonus: number;
+  contextualPositiveCapApplied: number;
+  attributionFlags: string[];
+} {
+  const weights = resolveScoringWeights(config);
+  const scorePreContext = breakdown.total;
+  const attributionFlags: string[] = [];
+  const vwapSoftPenalty = Math.min(0, setup.freshness?.soft_penalty ?? 0);
+  if (vwapSoftPenalty !== 0) {
+    attributionFlags.push('VWAP soft survival');
+  }
+
+  const eligibleEthShortReversalSetup =
+    getSessionLabel(snap) === 'ETH'
+    && setup.direction === 'short'
+    && (setup.setup_type === 'trend_pullback_short' || setup.setup_type === 'post_flip_first_pullback_short');
+
+  let htfConflictRelief = 0;
+  if (
+    eligibleEthShortReversalSetup
+    && breakdown.htf_direction < 0
+    && bias['1m'] === 'bearish'
+    && bias['5m'] === 'bearish'
+    && bias['15m'] === 'neutral'
+    && (regime === 'trending_down' || regime === 'breakdown_attempt')
+  ) {
+    htfConflictRelief = weights.htf_conflict_transition_relief;
+    attributionFlags.push('HTF conflict relief');
+  }
+
+  let reversalTransitionBonus = 0;
+  if (eligibleEthShortReversalSetup && setup.setup_type === 'post_flip_first_pullback_short') {
+    reversalTransitionBonus = computeShapedReversalBonus(setup.bars_since_flip ?? null, weights);
+    if (reversalTransitionBonus > 0) {
+      attributionFlags.push('reversal transition bonus');
+      attributionFlags.push('post_flip_first_pullback_short');
+    }
+  }
+
+  const contextualPositiveCapApplied = Math.min(
+    htfConflictRelief + reversalTransitionBonus,
+    weights.contextual_positive_cap,
+  );
+  const scorePostContext = Math.max(
+    0,
+    Math.min(10, Math.round((scorePreContext + vwapSoftPenalty + contextualPositiveCapApplied) * 100) / 100),
+  );
+
+  return {
+    scorePreContext,
+    scorePostContext,
+    vwapSoftPenalty,
+    htfConflictRelief,
+    reversalTransitionBonus,
+    contextualPositiveCapApplied,
+    attributionFlags,
+  };
+}
+
 // ─── Dual-Direction Decision Logic ──────────────────────────────────────────
 
 /**
@@ -1745,8 +2819,16 @@ export function compareSides(
   bestShort: DirectionalCandidate | null,
   regime: MarketRegime,
   config: IndicatorConfig,
-): { decision: DualDirectionDecision; chosen: DirectionalCandidate | null; opposing: DirectionalCandidate | null; reason: string; margin: number } {
-  const minScore = config.dual_min_score;
+): {
+  decision: DualDirectionDecision;
+  chosen: DirectionalCandidate | null;
+  opposing: DirectionalCandidate | null;
+  reason: string;
+  margin: number;
+  selection_only?: boolean;
+  decision_reason_primary?: string;
+  execution_allowed_final?: boolean;
+} {
   let requiredMargin = config.dual_score_margin;
 
   // Extra margin in choppy/HVI regimes
@@ -1754,10 +2836,52 @@ export function compareSides(
     requiredMargin += config.dual_choppy_extra_margin;
   }
 
+  const executionFloor = resolveExecutionFloor(config);
+
   const longValid = bestLong?.passedHardGates === true;
   const shortValid = bestShort?.passedHardGates === true;
   const longScore = bestLong?.score ?? 0;
   const shortScore = bestShort?.score ?? 0;
+  // Selection floor (per-session/direction/setup override, can be below exec floor)
+  const longMinScore = bestLong?.min_score_threshold ?? executionFloor;
+  const shortMinScore = bestShort?.min_score_threshold ?? executionFloor;
+
+  /**
+   * Demote an `enter_*` intent to `wait_below_execution_floor` when the
+   * winning score cleared the selection floor but not the execution floor.
+   * The candidate is still returned as `chosen` so replay/logging can see
+   * which setup would have fired; the `selection_only` flag distinguishes
+   * it from a real execution.
+   */
+  function demoteIfBelowExecutionFloor(
+    intent: 'enter_long' | 'enter_short',
+    chosenSide: DirectionalCandidate,
+    opposingSide: DirectionalCandidate | null,
+    reason: string,
+    margin: number,
+  ): ReturnType<typeof compareSides> {
+    if (chosenSide.score >= executionFloor) {
+      return {
+        decision: intent,
+        chosen: chosenSide,
+        opposing: opposingSide,
+        reason,
+        margin,
+        selection_only: false,
+        execution_allowed_final: true,
+      };
+    }
+    return {
+      decision: 'wait_below_execution_floor',
+      chosen: chosenSide,
+      opposing: opposingSide,
+      reason: `${reason} — demoted: score ${chosenSide.score} < execution floor ${executionFloor}`,
+      margin,
+      selection_only: true,
+      decision_reason_primary: 'below_execution_floor',
+      execution_allowed_final: false,
+    };
+  }
 
   // No candidates at all
   if (!bestLong && !bestShort) {
@@ -1778,34 +2902,58 @@ export function compareSides(
 
   // Only one side valid
   if (longValid && !shortValid) {
-    if (longScore >= minScore) {
-      return { decision: 'enter_long', chosen: bestLong, opposing: bestShort, reason: `Long valid (${longScore}) ≥ minScore (${minScore}), short failed gates`, margin: longScore - shortScore };
+    if (longScore >= longMinScore) {
+      return demoteIfBelowExecutionFloor(
+        'enter_long',
+        bestLong!,
+        bestShort,
+        `Long valid (${longScore}) >= minScore (${longMinScore}), short failed gates`,
+        longScore - shortScore,
+      );
     }
-    return { decision: 'wait_below_min_score', chosen: null, opposing: null, reason: `Long valid but score ${longScore} < minScore ${minScore}`, margin: 0 };
+    return { decision: 'wait_below_min_score', chosen: null, opposing: null, reason: `Long valid but score ${longScore} < minScore ${longMinScore}`, margin: 0 };
   }
 
   if (shortValid && !longValid) {
-    if (shortScore >= minScore) {
-      return { decision: 'enter_short', chosen: bestShort, opposing: bestLong, reason: `Short valid (${shortScore}) ≥ minScore (${minScore}), long failed gates`, margin: shortScore - longScore };
+    if (shortScore >= shortMinScore) {
+      return demoteIfBelowExecutionFloor(
+        'enter_short',
+        bestShort!,
+        bestLong,
+        `Short valid (${shortScore}) >= minScore (${shortMinScore}), long failed gates`,
+        shortScore - longScore,
+      );
     }
-    return { decision: 'wait_below_min_score', chosen: null, opposing: null, reason: `Short valid but score ${shortScore} < minScore ${minScore}`, margin: 0 };
+    return { decision: 'wait_below_min_score', chosen: null, opposing: null, reason: `Short valid but score ${shortScore} < minScore ${shortMinScore}`, margin: 0 };
   }
 
   // Both valid — compare with margin
   const margin = Math.abs(longScore - shortScore);
   const marginFormatted = Math.round(margin * 10) / 10;
 
-  if (longScore >= minScore && longScore > shortScore && margin >= requiredMargin) {
-    return { decision: 'enter_long', chosen: bestLong, opposing: bestShort, reason: `Long wins: ${longScore} vs ${shortScore} (margin ${marginFormatted} ≥ ${requiredMargin})`, margin };
+  if (longScore >= longMinScore && longScore > shortScore && margin >= requiredMargin) {
+    return demoteIfBelowExecutionFloor(
+      'enter_long',
+      bestLong!,
+      bestShort,
+      `Long wins: ${longScore} vs ${shortScore} (margin ${marginFormatted} >= ${requiredMargin})`,
+      margin,
+    );
   }
 
-  if (shortScore >= minScore && shortScore > longScore && margin >= requiredMargin) {
-    return { decision: 'enter_short', chosen: bestShort, opposing: bestLong, reason: `Short wins: ${shortScore} vs ${longScore} (margin ${marginFormatted} ≥ ${requiredMargin})`, margin };
+  if (shortScore >= shortMinScore && shortScore > longScore && margin >= requiredMargin) {
+    return demoteIfBelowExecutionFloor(
+      'enter_short',
+      bestShort!,
+      bestLong,
+      `Short wins: ${shortScore} vs ${longScore} (margin ${marginFormatted} >= ${requiredMargin})`,
+      margin,
+    );
   }
 
   // Both valid but neither has enough margin or score
-  if (longScore < minScore && shortScore < minScore) {
-    return { decision: 'wait_both_weak', chosen: null, opposing: null, reason: `Both below minScore: long=${longScore} short=${shortScore} (min=${minScore})`, margin };
+  if (longScore < longMinScore && shortScore < shortMinScore) {
+    return { decision: 'wait_both_weak', chosen: null, opposing: null, reason: `Both below minScore: long=${longScore}/${longMinScore} short=${shortScore}/${shortMinScore}`, margin };
   }
 
   return { decision: 'wait_insufficient_margin', chosen: null, opposing: null, reason: `Margin ${marginFormatted} < required ${requiredMargin}. Long=${longScore} Short=${shortScore}`, margin };
@@ -1937,6 +3085,7 @@ export function generateSignal(
   contract?: ContractSpec,
   dynamicRewardConfig?: DynamicRewardConfig | null,
   lobSnapshot?: LobSnapshot | null,
+  expectancyTable?: ExpectancyBucketTable | null,
 ): DualDirectionResult {
   const regime = classifyRegime(snap);
   const bias = assessMultiTfBias(snap);
@@ -1971,27 +3120,38 @@ export function generateSignal(
   })();
 
   // ── Step 1: Generate all candidate setups ────────────────────────────────
-  const generators: Array<(s: MarketSnapshot) => CandidateSetup | null> = [
-    genTrendPullbackShort,
-    genTrendPullbackLong,
-    genBreakdownRetestShort,
-    genBreakoutRetestLong,
-  ];
-  if (config.enable_opening_drive) {
-    generators.push(genOpeningDriveContinuationLong, genOpeningDriveContinuationShort);
-  }
-  if (config.enable_failed_or_break) {
-    generators.push(genFailedOrBreakShort, genFailedOrBreakLong);
-  }
-  if (config.enable_momentum_continuation) {
-    generators.push(genBreakdownMomentumShort);
-  }
+  // Both active and shadow strategies run. Shadow strategies are fully
+  // scored and ranked so their candidates are comparable in the Phase 6
+  // calibration report. The final execution-eligibility gate lives in
+  // runner.ts — see src/autotrade/strategy-registry.ts for semantics.
+  const runnable = listRunnableStrategies(STRATEGY_REGISTRY, config);
+  // Note: lobSnapshot is captured from the generateSignal() scope so trend
+  // generators can safely ignore it (their 2-arg sigs are assignable to the
+  // 3-arg type) while the lob_mbo_scalp family reads it as the primary
+  // input. See strategies/lob-mbo-scalp.ts for the scalper consumer.
+  const generators: Array<(s: MarketSnapshot) => GeneratorEvaluation> =
+    runnable.map((def) => (s) => def.generator(s, config, lobSnapshot ?? null) as GeneratorEvaluation);
 
   // Track candidates alongside their pre-computed score breakdowns so we
   // never call scoreConfidenceDetailed() twice for the same candidate.
-  type ScoredCandidate = { setup: CandidateSetup; breakdown: ScoreBreakdown; layered?: LayeredScoreResult };
+  type ScoredCandidate = {
+    setup: CandidateSetup;
+    breakdown: ScoreBreakdown;
+    layered?: LayeredScoreResult;
+    htfEval?: HtfSetupEvaluation | null;
+    scorePreContext: number;
+    scorePostContext: number;
+    vwapSoftPenalty: number;
+    htfConflictRelief: number;
+    reversalTransitionBonus: number;
+    contextualPositiveCapApplied: number;
+    layeredPreContextTotal: number | null;
+    layeredPostContextTotal: number | null;
+    attributionFlags: string[];
+  };
   const longCandidates: ScoredCandidate[] = [];
   const shortCandidates: ScoredCandidate[] = [];
+  const generatorDiagnostics: CandidateGeneratorDiagnostic[] = [];
 
   // Resolve layered scoring config
   const lsConfig: LayeredScoringConfig = config.layered_scoring
@@ -2000,10 +3160,104 @@ export function generateSignal(
   const layeredActive = lsConfig.enabled || lsConfig.shadow_log;
 
   for (const gen of generators) {
-    const s = gen(snap);
+    const evaluation = gen(snap);
+    generatorDiagnostics.push({
+      setup_type: evaluation.setupType,
+      setup_family: evaluation.setupFamily,
+      accepted: evaluation.candidate !== null,
+      rejection_reason_primary: evaluation.rejectionReasonPrimary,
+      rejection_reason_all: evaluation.rejectionReasonAll,
+    });
+
+    const s = evaluation.candidate;
     if (s) {
       // Tick-round before scoring (rr may change after rounding)
       if (contract) tickRoundCandidate(s, contract);
+
+      // Phase 2 of the quant refactor: hydrate the Phase-1-built
+      // EntryStateVector with orderflow fields derived from the current
+      // LOB snapshot. Only trend_pullback_* setups carry a vector right
+      // now (Phase 1 wiring) — guarding on the vector presence keeps
+      // non-quant strategies untouched and keeps the lobSnapshot null
+      // path a pure no-op.
+      if (
+        s.entry_state_vector &&
+        (s.setup_type === 'trend_pullback_long' || s.setup_type === 'trend_pullback_short')
+      ) {
+        hydrateEntryStateVectorOrderflow(
+          s.entry_state_vector,
+          snap,
+          lobSnapshot ?? null,
+          s.direction as 'long' | 'short',
+        );
+      }
+
+      // Phase 4 + 6: populate the parallel quant reward contract
+      // (stop_quant / target_1_quant / target_2_quant / risk_pts_quant
+      // / rr_t1_quant / rr_t2_quant / bucket_source_quant) AND the
+      // Phase 6 expectancy fields (expected_r_30s_quant /
+      // win_prob_30s_quant / quality_band_quant / bucket_id_quant /
+      // bucket_sample_count_quant / quant_shadow_reject_reason).
+      // Runs AFTER tickRoundCandidate so entry mid is tick-aligned
+      // before the quant formulas consume it. Legacy fields
+      // (stop / target_* / rr_* / risk_pts) are never touched — plan
+      // §3 no-overwrite rule. The expectancy table is optional: when
+      // null the engine returns null fields and the candidate still
+      // ships with Phase 4 cold-start metadata.
+      if (
+        contract &&
+        s.entry_state_vector &&
+        (s.setup_type === 'trend_pullback_long' || s.setup_type === 'trend_pullback_short')
+      ) {
+        // Resolve the quant config once so Phase 8 thresholds (loaded
+        // from `quant_entry.expectancy.*`) flow through to the engine.
+        // When quant_entry is absent, defaults make the primary gate a
+        // no-op — Phase 8 Stage A calibrates the real threshold from
+        // shadow data before turning on `hybrid_gate`.
+        const quantCfgForHydration = resolveQuantEntryConfig(config.quant_entry);
+        hydrateQuantRewardContract(s, snap, contract, expectancyTable ?? null, quantCfgForHydration);
+      }
+
+      // ── Phase 7 Stage A telemetry ──────────────────────────────────
+      //
+      // When `quant_entry.enabled = true` (and the per-side flag is
+      // on), attach:
+      //   (a) entry_state_vector_hash — canonical reproducibility tag
+      //   (b) quant_shadow_decision   — per-gate verdicts + combined
+      //                                 AND-gate result (Phase 7 only
+      //                                 records it; runner.ts decides
+      //                                 whether to act on it based on
+      //                                 hybrid_gate in Stage B).
+      //
+      // When the flag is off, both fields stay `undefined` and the
+      // logs remain diff-free versus the post-Phase-6 baseline.
+      //
+      // entry_ml verdict is NOT yet known at this point (runner.ts
+      // runs entry_ml after generateSignal returns). Phase 7 seeds
+      // the decision with entry_ml status `no_data`; the runner
+      // rebuilds the decision after entry_ml produces its verdict.
+      const quantCfg = resolveQuantEntryConfig(config.quant_entry);
+      if (
+        quantCfg.enabled &&
+        s.entry_state_vector &&
+        (s.setup_type === 'trend_pullback_long' || s.setup_type === 'trend_pullback_short') &&
+        isQuantEntryActiveForDirection(quantCfg, s.direction as 'long' | 'short')
+      ) {
+        s.entry_state_vector_hash = computeEntryStateVectorHash(s.entry_state_vector);
+        const direction = s.direction as 'long' | 'short';
+        const entryMlStub: EntryMlVerdictSource = {
+          disabled: false,
+          confirmed: false,
+          no_data: true,
+          reason: null,
+        };
+        s.quant_shadow_decision = buildQuantShadowDecision({
+          setup: s,
+          direction,
+          quantConfig: quantCfg,
+          entryMl: entryMlStub,
+        });
+      }
 
       // Score ONCE — breakdown is stored and reused downstream
       const w = resolveScoringWeights(config);
@@ -2037,15 +3291,62 @@ export function generateSignal(
         }
       }
 
-      s.confidence = breakdown.total;
+      const htfConfig = config.htf_zones ?? DEFAULT_HTF_ZONES_CONFIG;
+      const htfEval = snap.htf_context?.study_present
+        ? evaluateHtfForSetup(snap.htf_context, s, snap, htfConfig)
+        : null;
+      if (htfEval && htfEval.score_adjustment !== 0) {
+        breakdown.total = Math.max(0, Math.min(10, breakdown.total + htfEval.score_adjustment));
+      }
+
+      const contextual = applyContextualScoreAdjustments(s, breakdown, snap, bias, regime, config);
+      breakdown.pre_context_total = contextual.scorePreContext;
+      breakdown.vwap_soft_penalty = contextual.vwapSoftPenalty;
+      breakdown.htf_conflict_relief = contextual.htfConflictRelief;
+      breakdown.reversal_transition_bonus = contextual.reversalTransitionBonus;
+      breakdown.contextual_positive_cap_applied = contextual.contextualPositiveCapApplied;
+      breakdown.total = contextual.scorePostContext;
+
+      if (contextual.vwapSoftPenalty !== 0) {
+        breakdown.factors.push(`vwap_soft_penalty(${contextual.vwapSoftPenalty})`);
+      }
+      if (contextual.htfConflictRelief !== 0) {
+        breakdown.factors.push(`htf_conflict_relief(+${contextual.htfConflictRelief})`);
+      }
+      if (contextual.reversalTransitionBonus !== 0) {
+        breakdown.factors.push(`reversal_transition_bonus(+${contextual.reversalTransitionBonus})`);
+      }
+
+      const layeredPreContextTotal = layeredResult
+        ? Math.max(0, Math.min(10, layeredResult.final_rank + (htfEval?.score_adjustment ?? 0)))
+        : null;
+      const layeredPostContextTotal = layeredPreContextTotal === null
+        ? null
+        : Math.max(0, Math.min(10, Math.round((layeredPreContextTotal + contextual.vwapSoftPenalty + contextual.contextualPositiveCapApplied) * 100) / 100));
+
+      s.confidence = contextual.scorePostContext;
       s.confidence_factors = breakdown.factors;
 
       console.log(
         `[CONFIDENCE] ${s.direction.toUpperCase()} ${s.setup_type} ` +
-        `score=${breakdown.total} factors=[${breakdown.factors.join(', ')}]`,
+        `raw=${contextual.scorePreContext} adjusted=${breakdown.total} factors=[${breakdown.factors.join(', ')}]`,
       );
 
-      const entry = { setup: s, breakdown, layered: layeredResult };
+      const entry = {
+        setup: s,
+        breakdown,
+        layered: layeredResult,
+        htfEval,
+        scorePreContext: contextual.scorePreContext,
+        scorePostContext: contextual.scorePostContext,
+        vwapSoftPenalty: contextual.vwapSoftPenalty,
+        htfConflictRelief: contextual.htfConflictRelief,
+        reversalTransitionBonus: contextual.reversalTransitionBonus,
+        contextualPositiveCapApplied: contextual.contextualPositiveCapApplied,
+        layeredPreContextTotal,
+        layeredPostContextTotal,
+        attributionFlags: contextual.attributionFlags,
+      };
       if (s.direction === 'long') {
         longCandidates.push(entry);
       } else {
@@ -2090,12 +3391,14 @@ export function generateSignal(
 
     // Reuse the pre-computed breakdown — no second scoreConfidenceDetailed() call
     const gates = applyHardGates(setup, adjustedScore, bias, regime, snap, config, rewardPlan, htfEval);
+    const minScoreThreshold = resolveSelectionFloor(setup, snap, config);
     return {
       setup,
       score: adjustedScore,
       scoreBreakdown: breakdown,
       hardGateFailures: gates,
       passedHardGates: gates.length === 0,
+      min_score_threshold: minScoreThreshold,
       rewardPlan,
       layered,
       htfEval,
@@ -2106,12 +3409,20 @@ export function generateSignal(
   const bestShort = buildDirectionalCandidate(shortCandidates[0]);
 
   // ── Step 3: Dual-direction decision ──────────────────────────────────────
-  const { decision, chosen, opposing, reason, margin } = compareSides(bestLong, bestShort, regime, config);
+  const comparison = compareSides(bestLong, bestShort, regime, config);
+  const { decision, chosen, opposing, reason, margin } = comparison;
+  const selectionOnly = comparison.selection_only === true;
+  const decisionReasonPrimary = comparison.decision_reason_primary;
+  const executionAllowedFinal = comparison.execution_allowed_final;
 
   printDualDirectionSummary(bestLong, bestShort, decision, reason, margin, longCandidates.length, shortCandidates.length);
 
   // ── Step 4: Build skip reasons for backward compat ───────────────────────
   const skipReasons: string[] = [];
+  // Selection-only candidates still populate `bestSetup` so the runner's
+  // candidate log, extension features and diagnostics all run as normal. The
+  // `below_execution_floor` skip reason below forces `tradeAllowed = false`
+  // so the candidate is logged but never executed.
   const bestSetup = chosen?.setup ?? null;
   const chosenScore = chosen?.score ?? 0;
   // confidence reflects the best available candidate score (for operator visibility),
@@ -2133,6 +3444,10 @@ export function generateSignal(
       skipReasons.push(`dual_both_weak:${reason}`);
     }
   } else {
+    if (selectionOnly) {
+      // Candidate is logged/forwarded but blocked from execution.
+      skipReasons.push(`below_execution_floor:score_${chosenScore}_<_${config.dual_min_score}`);
+    }
     // Chosen side passed hard gates, but still apply min_confidence from legacy config
     if (chosenScore < config.min_confidence) {
       skipReasons.push(`confidence_${chosenScore}_below_threshold_${config.min_confidence}`);
@@ -2159,6 +3474,9 @@ export function generateSignal(
     tradeAllowed,
     skipReasons,
     mlFeatures,
+    selection_only: selectionOnly,
+    execution_allowed_final: executionAllowedFinal,
+    decision_reason_primary: decisionReasonPrimary ?? null,
     dynamicRrUpstreamActive: drpConfig !== null,
     dynamicRrSource: drpSource,
   };

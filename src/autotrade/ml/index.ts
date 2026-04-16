@@ -4,7 +4,13 @@
 
 export { buildMlFeatures } from './feature-builder.js';
 export { evaluateMlGate } from './execution-gate.js';
-export { getMlDecision, checkMlHealth, decideAction, computeTrainingDevelopmentPhase } from './decision-engine.js';
+export {
+  getMlDecision,
+  checkMlHealth,
+  probeMlManagementHealth,
+  decideAction,
+  computeTrainingDevelopmentPhase,
+} from './decision-engine.js';
 export type {
   MlManagementConfig,
   MlFeatureVector,

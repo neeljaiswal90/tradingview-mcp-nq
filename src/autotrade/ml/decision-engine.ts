@@ -131,15 +131,36 @@ export async function getMlDecision(
  * Check if the ML service is reachable.
  */
 export async function checkMlHealth(serviceUrl: string, timeoutMs: number = 2000): Promise<boolean> {
+  const p = await probeMlManagementHealth(serviceUrl, timeoutMs);
+  return p.ok && p.model_loaded;
+}
+
+/** Full /health probe for startup gating and version checks. */
+export async function probeMlManagementHealth(
+  serviceUrl: string,
+  timeoutMs: number = 2000,
+): Promise<{ ok: boolean; model_loaded: boolean; model_version: string; status: string }> {
   try {
     const res = await fetch(`${serviceUrl}/health`, {
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!res.ok) return false;
-    const body = await res.json() as { status: string; model_loaded: boolean };
-    return body.status === 'ok' && body.model_loaded === true;
+    if (!res.ok) {
+      return { ok: false, model_loaded: false, model_version: '', status: `http_${res.status}` };
+    }
+    const body = await res.json() as {
+      status: string;
+      model_loaded: boolean;
+      model_version?: string;
+    };
+    const ok = body.status === 'ok';
+    return {
+      ok,
+      model_loaded: body.model_loaded === true,
+      model_version: typeof body.model_version === 'string' ? body.model_version : '',
+      status: body.status,
+    };
   } catch {
-    return false;
+    return { ok: false, model_loaded: false, model_version: '', status: 'fetch_error' };
   }
 }
 

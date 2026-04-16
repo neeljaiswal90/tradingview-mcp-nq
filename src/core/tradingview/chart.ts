@@ -1,6 +1,8 @@
 import { evaluate as _evaluate, evaluateAsync as _evaluateAsync } from '../session/manager.js';
 import { safeString, requireFinite } from '../cdp/evaluate.js';
 import { waitForChartReady as _waitForChartReady } from './wait.js';
+import { KNOWN_PATHS } from './known-paths.js';
+import { tvUiLock } from './tv-ui-lock.js';
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 
@@ -56,15 +58,86 @@ export async function setSymbol({ symbol, _deps }: { symbol: string; _deps?: Dep
   return { success: true, symbol, chart_ready: ready };
 }
 
-export async function setTimeframe({ timeframe, _deps }: { timeframe: string; _deps?: Deps }) {
+export async function setTimeframe({ timeframe, paneIndex, _deps }: { timeframe: string; paneIndex?: number; _deps?: Deps }) {
   const { evaluate, waitForChartReady } = _resolve(_deps);
+  const diag = process.env.COLLECT_DIAG === '1';
+
+  if (paneIndex != null) {
+    // Multi-pane: focus the target pane under the cross-process lock, then
+    // call setResolution on the (now-active) chart API wrapper.
+    return tvUiLock.runExclusive(async () => {
+      const CWC = KNOWN_PATHS.chartWidgetCollection;
+      const tFocus = diag ? Date.now() : 0;
+      // Focus pane by clicking its main div
+      await evaluate(`
+        (function() {
+          var cwc = ${CWC};
+          var all = cwc.getAll();
+          if (${paneIndex} < all.length && all[${paneIndex}]._mainDiv) {
+            all[${paneIndex}]._mainDiv.click();
+          }
+        })()
+      `);
+      await new Promise(r => setTimeout(r, 200));
+
+      // Verify focus landed on the correct pane
+      const activeIdx = await evaluate(`
+        (function() {
+          var cwc = ${CWC};
+          var all = cwc.getAll();
+          var active = window.TradingViewApi._activeChartWidgetWV.value();
+          for (var j = 0; j < all.length; j++) {
+            try { if (active._chartWidget && all[j] === active._chartWidget) return j; } catch(e) {}
+          }
+          return -1;
+        })()
+      `) as number;
+
+      if (activeIdx !== paneIndex) {
+        throw new Error(
+          `[setTimeframe] Focus verification failed: expected pane ${paneIndex}, got ${activeIdx}`,
+        );
+      }
+      const focusMs = diag ? Date.now() - tFocus : 0;
+
+      // Now set resolution on the active (verified) pane
+      const tSetRes = diag ? Date.now() : 0;
+      await evaluate(`
+        (function() {
+          var chart = ${CHART_API};
+          chart.setResolution(${safeString(timeframe)}, {});
+        })()
+      `);
+      const setResMs = diag ? Date.now() - tSetRes : 0;
+      const tWait = diag ? Date.now() : 0;
+      const ready = await waitForChartReady(null, timeframe);
+      const waitReadyMs = diag ? Date.now() - tWait : 0;
+      if (diag) {
+        console.debug(
+          `[CHART-TIMING] tf=${timeframe} pane=${paneIndex} focus=${focusMs}ms setRes=${setResMs}ms waitReady=${waitReadyMs}ms ready=${ready}`,
+        );
+      }
+      return { success: true, timeframe, paneIndex, chart_ready: ready };
+    });
+  }
+
+  // Single-pane (original path): no lock needed
+  const tSetRes = diag ? Date.now() : 0;
   await evaluate(`
     (function() {
       var chart = ${CHART_API};
       chart.setResolution(${safeString(timeframe)}, {});
     })()
   `);
+  const setResMs = diag ? Date.now() - tSetRes : 0;
+  const tWait = diag ? Date.now() : 0;
   const ready = await waitForChartReady(null, timeframe);
+  const waitReadyMs = diag ? Date.now() - tWait : 0;
+  if (diag) {
+    console.debug(
+      `[CHART-TIMING] tf=${timeframe} pane=none setRes=${setResMs}ms waitReady=${waitReadyMs}ms ready=${ready}`,
+    );
+  }
   return { success: true, timeframe, chart_ready: ready };
 }
 

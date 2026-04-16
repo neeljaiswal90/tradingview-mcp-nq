@@ -48,7 +48,7 @@ export function buildEntryFeatures(
   const session = snap.session;
   const minutesSinceOpen = session?.minutes_since_rth_open ?? null;
   const isOpeningDrive = minutesSinceOpen !== null && minutesSinceOpen <= 15 ? 1 : 0;
-  const hourUtc = new Date().getUTCHours();
+  const hourUtc = new Date(snap.timestamp_unix * 1000).getUTCHours();
 
   // LOB features
   const lob = lobSnapshot;

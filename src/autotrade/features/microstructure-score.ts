@@ -31,16 +31,26 @@ import type { LobSnapshot } from '../lob-client.js';
  * Setup families group setup types by their market thesis so the overlay
  * can apply different scoring rules.
  *
- * 'trend_continuation' — pullback entries expecting trend resumption
+ * 'trend_continuation'    — pullback entries expecting trend resumption
  * 'breakout_continuation' — momentum entries after structural break
- * 'reversal_reclaim' — failed-break / trap setups expecting mean reversion
- * 'session_structure' — opening-range driven setups
+ * 'reversal_reclaim'      — failed-break / trap setups expecting mean reversion
+ * 'session_structure'     — opening-range driven setups
+ * 'scalp_high_frequency'  — lob_mbo_scalp family (1–10s holds). Scored
+ *                           like a continuation setup by default, with
+ *                           volume profile suppressed (no meaning at
+ *                           sub-second horizons) and a slightly
+ *                           boosted-weight sweep branch reflecting the
+ *                           strategy's dependence on recent follow-through.
+ *                           Weights are NOT calibrated yet — Phase 4/5
+ *                           backtesting will tune them against labeled
+ *                           sub-second forward returns.
  */
 export type SetupFamily =
   | 'trend_continuation'
   | 'breakout_continuation'
   | 'reversal_reclaim'
-  | 'session_structure';
+  | 'session_structure'
+  | 'scalp_high_frequency';
 
 /**
  * Map a setup_type string to its family. Explicit mapping — no wildcards.
@@ -67,13 +77,32 @@ export function getSetupFamily(setupType: string): SetupFamily {
     // Session-structure: opening-range-driven breakout/continuation
     case 'opening_drive_continuation_long':
     case 'opening_drive_continuation_short':
-    case 'or_retest_continuation_long':
-    case 'or_retest_continuation_short':
       return 'session_structure';
+
+    // LOB/MBO sub-second scalper: treated like continuation for scoring
+    // but with suppressed volume profile in the component scorer.
+    case 'lob_mbo_scalp_long':
+    case 'lob_mbo_scalp_short':
+      return 'scalp_high_frequency';
 
     default:
       return 'trend_continuation';
   }
+}
+
+/**
+ * Tests + internal helpers use this to check whether a family should
+ * receive continuation-style scoring in the component scorers. Keeping
+ * the predicate in one place means the three existing continuation
+ * disjunctions and any future family addition stay in lockstep.
+ */
+export function isContinuationFamily(family: SetupFamily): boolean {
+  return (
+    family === 'trend_continuation' ||
+    family === 'breakout_continuation' ||
+    family === 'session_structure' ||
+    family === 'scalp_high_frequency'
+  );
 }
 
 // ── Score Result ─────────────────────────────────────────────────────────────
@@ -272,7 +301,7 @@ export function scoreDirectionalFlow(
   const sign = dirSign(direction);
   let score = 0;
 
-  if (family === 'trend_continuation' || family === 'breakout_continuation' || family === 'session_structure') {
+  if (isContinuationFamily(family)) {
     // Continuation: reward aligned delta, penalize opposing
     // trade_flow_imbalance_10s: 0.5 = balanced, >0.5 = buy-heavy, <0.5 = sell-heavy
     if (available(flowImb)) {
@@ -286,8 +315,10 @@ export function scoreDirectionalFlow(
       const deltaSign = delta10! > 0 ? 1 : delta10! < 0 ? -1 : 0;
       score += deltaSign * sign * 0.15;
     }
-    // Longer delta for trend confirmation
-    if (available(delta30) && available(delta10)) {
+    // Longer delta for trend confirmation (skipped for scalp_high_frequency:
+    // 30-second momentum building is meaningless at a 1–5 second hold).
+    if (family !== 'scalp_high_frequency'
+        && available(delta30) && available(delta10)) {
       // Short-term delta stronger than long-term = momentum building
       const momentumBuilding = Math.abs(safe(delta10)) > Math.abs(safe(delta30)) * 0.6;
       if (momentumBuilding && Math.sign(safe(delta10)) === sign) {
@@ -388,7 +419,7 @@ function scoreAbsorption(
 
   let score = 0;
 
-  if (family === 'trend_continuation' || family === 'breakout_continuation' || family === 'session_structure') {
+  if (isContinuationFamily(family)) {
     // Continuation: high absorption against our direction means a defended level
     // is blocking our move — negative signal.
     // For longs: ask-side absorption (sellers absorbed) is good, bid-side absorption is bad
@@ -530,11 +561,15 @@ function scoreSweepBehavior(
   const sweepAligned = (direction === 'long' && lastSweepSide === 'buy')
     || (direction === 'short' && lastSweepSide === 'sell');
 
-  if (family === 'trend_continuation' || family === 'breakout_continuation' || family === 'session_structure') {
+  if (isContinuationFamily(family)) {
     // Continuation: aligned sweep = aggressive follow-through = positive
     if (sweepAligned) {
       score += 0.15;
       if (available(sweepVol) && sweepVol! > 100) score += 0.10; // large sweep volume
+      // Scalper: very recent aligned sweep is an exceptionally strong
+      // short-horizon signal — add a small extra bonus (still inside the
+      // ±0.3 cap applied by the clamp below).
+      if (family === 'scalp_high_frequency') score += 0.05;
     } else {
       // Opposing sweep during our setup = headwind
       score -= 0.15;
@@ -569,8 +604,16 @@ function scoreSweepBehavior(
 export function scoreVolumeProfile(
   snap: LobSnapshot,
   direction: 'long' | 'short',
-  _family: SetupFamily,
+  family: SetupFamily,
 ): ComponentResult {
+  // Suppressed for the scalper family: VPOC / value-area acceptance has
+  // no meaningful signal at a 1–5 second hold horizon and would just
+  // add noise to the overlay. Returning hasData=false keeps the data
+  // quality count honest (the scalper gets 5/6 components, not 6/6).
+  if (family === 'scalp_high_frequency') {
+    return { score: 0, hasData: false, reason: null };
+  }
+
   const vpoc = snap.session_vpoc;
   const vah = snap.session_vah;
   const val = snap.session_val;

@@ -31,14 +31,26 @@ export type RecoveryOutcome =
   | 'corrupted_state_cleared_dev'
   | 'corrupted_state_blocked_prod';
 
+export type RecoveryProcessStatus = 'alive' | 'dead' | 'alive_cycle_stalled';
+
 export interface RecoveryReport {
   outcome: RecoveryOutcome;
+  process_status: RecoveryProcessStatus;
   blocking_reason_code: string | null;
   operator_message: string;
   previous_session_id: string | null;
   previous_shutdown_clean: boolean;
   heartbeat_stale: boolean;
   heartbeat_age_ms: number | null;
+  cycle_stalled: boolean;
+  cycle_stall_age_ms: number | null;
+  last_cycle_started_at: string | null;
+  last_cycle_completed_at: string | null;
+  last_snapshot_ts: string | null;
+  last_signal_decision_at: string | null;
+  last_cycle_number: number | null;
+  warmup_complete: boolean | null;
+  warmup_features_valid: boolean | null;
   open_trade_detected: boolean;
   open_trade_id: string | null;
   open_trade_side: string | null;
@@ -184,6 +196,7 @@ export function buildRecoveryReport(
   restartMode: RestartMode,
   executionMode: ExecutionMode,
   heartbeatStaleMs: number,
+  cycleStallThresholdMs: number | null = null,
 ): RecoveryReport {
   const now = new Date().toISOString();
   const { runtime, openTrade, journalOrphan, staleTmpFiles, runtimeCorrupt, tradeStateCorrupt } = artifacts;
@@ -199,6 +212,22 @@ export function buildRecoveryReport(
     heartbeatAgeMs = Date.now() - new Date(runtime.last_heartbeat_at).getTime();
     heartbeatStale = heartbeatAgeMs > heartbeatStaleMs;
   }
+
+  let cycleStallAgeMs: number | null = null;
+  if (runtime?.last_cycle_completed_at) {
+    cycleStallAgeMs = Date.now() - new Date(runtime.last_cycle_completed_at).getTime();
+  }
+  const cycleStalled =
+    !heartbeatStale &&
+    cycleStallThresholdMs !== null &&
+    cycleStallAgeMs !== null &&
+    cycleStallAgeMs > cycleStallThresholdMs;
+  const processStatus: RecoveryProcessStatus =
+    runtime === null || heartbeatStale
+      ? 'dead'
+      : cycleStalled
+        ? 'alive_cycle_stalled'
+        : 'alive';
 
   // Determine problem type (precedence: corruption > dirty > stale)
   const isCorrupt = runtimeCorrupt || tradeStateCorrupt;
@@ -281,12 +310,22 @@ export function buildRecoveryReport(
 
   return {
     outcome,
+    process_status: processStatus,
     blocking_reason_code: blockingReasonCode,
     operator_message: operatorMessage,
     previous_session_id: runtime?.session_id ?? null,
     previous_shutdown_clean: runtime?.shutdown_clean ?? false,
     heartbeat_stale: heartbeatStale,
     heartbeat_age_ms: heartbeatAgeMs,
+    cycle_stalled: cycleStalled,
+    cycle_stall_age_ms: cycleStallAgeMs,
+    last_cycle_started_at: runtime?.last_cycle_started_at ?? null,
+    last_cycle_completed_at: runtime?.last_cycle_completed_at ?? null,
+    last_snapshot_ts: runtime?.last_snapshot_ts ?? null,
+    last_signal_decision_at: runtime?.last_signal_decision_at ?? null,
+    last_cycle_number: runtime?.last_cycle_number ?? null,
+    warmup_complete: runtime?.warmup_complete ?? null,
+    warmup_features_valid: runtime?.warmup_features_valid ?? null,
     open_trade_detected: hasOpenTrade,
     open_trade_id: evidence.trade_id,
     open_trade_side: evidence.last_known_position?.side ?? null,

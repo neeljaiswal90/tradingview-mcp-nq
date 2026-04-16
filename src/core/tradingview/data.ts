@@ -1,6 +1,6 @@
 import { evaluate } from '../session/manager.js';
 import { safeString } from '../cdp/evaluate.js';
-import { KNOWN_PATHS } from './known-paths.js';
+import { KNOWN_PATHS, resolvePanePaths } from './known-paths.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
@@ -18,10 +18,11 @@ interface RawGraphicsStudy {
   items: RawGraphicsItem[];
 }
 
-function buildGraphicsJS(collectionName: string, mapKey: string, filter: string): string {
+function buildGraphicsJS(collectionName: string, mapKey: string, filter: string, paneIndex?: number): string {
+  const paths = resolvePanePaths(paneIndex);
   return `
     (function() {
-      var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+      var chart = ${paths.chartWidget};
       var model = chart.model();
       var sources = model.model().dataSources();
       var results = [];
@@ -69,13 +70,14 @@ function buildGraphicsJS(collectionName: string, mapKey: string, filter: string)
   `;
 }
 
-export async function getOhlcv({ count, summary }: { count?: number; summary?: boolean } = {}) {
+export async function getOhlcv({ count, summary, paneIndex }: { count?: number; summary?: boolean; paneIndex?: number } = {}) {
   const limit = Math.min(count || 100, MAX_OHLCV_BARS);
+  const paths = resolvePanePaths(paneIndex);
   let data: Record<string, unknown> | null;
   try {
     data = await evaluate(`
       (function() {
-        var bars = ${BARS_PATH};
+        var bars = ${paths.bars};
         if (!bars || typeof bars.lastIndex !== 'function') return null;
         var result = [];
         var end = bars.lastIndex();
@@ -116,11 +118,27 @@ export async function getOhlcv({ count, summary }: { count?: number; summary?: b
   return { success: true, bar_count: (data.bars as unknown[]).length, total_available: data.total_bars, source: data.source, bars: data.bars };
 }
 
-export async function getIndicator({ entity_id }: { entity_id: string }) {
+export async function getIndicator({ entity_id, paneIndex }: { entity_id: string; paneIndex?: number }) {
+  // getStudyById is only available on the chart API wrapper, not on raw _chartWidget.
+  // For pane-indexed access, we use getAllStudies on the widget model instead.
+  const paths = resolvePanePaths(paneIndex);
   const data = await evaluate(`
     (function() {
-      var api = ${CHART_API};
-      var study = api.getStudyById(${safeString(entity_id)});
+      var chart = ${paths.chartWidget};
+      var model = chart.model();
+      var sources = model.model().dataSources();
+      var study = null;
+      for (var i = 0; i < sources.length; i++) {
+        if (sources[i].id && sources[i].id() === ${safeString(entity_id)}) { study = sources[i]; break; }
+      }
+      if (!study) {
+        // Fallback: try the chart API wrapper if available (single-pane mode)
+        try {
+          var api = ${CHART_API};
+          study = api.getStudyById(${safeString(entity_id)});
+        } catch(e) {}
+      }
+      if (!study) return { error: 'Study not found: ' + ${safeString(entity_id)} };
       if (!study) return { error: 'Study not found: ' + ${safeString(entity_id)} };
       var result = { name: null, inputs: null, visible: null };
       try { result.visible = study.isVisible(); } catch(e) {}
@@ -142,11 +160,12 @@ export async function getIndicator({ entity_id }: { entity_id: string }) {
   return { success: true, entity_id, visible: data?.visible, inputs };
 }
 
-export async function getStrategyResults() {
+export async function getStrategyResults({ paneIndex }: { paneIndex?: number } = {}) {
+  const paths = resolvePanePaths(paneIndex);
   const results = await evaluate(`
     (function() {
       try {
-        var chart = ${CHART_API}._chartWidget;
+        var chart = ${paths.chartWidget};
         var sources = chart.model().model().dataSources();
         var strat = null;
         for (var i = 0; i < sources.length; i++) {
@@ -175,12 +194,13 @@ export async function getStrategyResults() {
   return { success: true, metric_count: Object.keys(metrics).length, source: results?.source, metrics, error: results?.error };
 }
 
-export async function getTrades({ max_trades }: { max_trades?: number } = {}) {
+export async function getTrades({ max_trades, paneIndex }: { max_trades?: number; paneIndex?: number } = {}) {
   const limit = Math.min(max_trades || 20, MAX_TRADES);
+  const paths = resolvePanePaths(paneIndex);
   const trades = await evaluate(`
     (function() {
       try {
-        var chart = ${CHART_API}._chartWidget;
+        var chart = ${paths.chartWidget};
         var sources = chart.model().model().dataSources();
         var strat = null;
         for (var i = 0; i < sources.length; i++) {
@@ -213,11 +233,12 @@ export async function getTrades({ max_trades }: { max_trades?: number } = {}) {
   return { success: true, trade_count: tradeList.length, source: trades?.source, trades: tradeList, error: trades?.error };
 }
 
-export async function getEquity() {
+export async function getEquity({ paneIndex }: { paneIndex?: number } = {}) {
+  const paths = resolvePanePaths(paneIndex);
   const equity = await evaluate(`
     (function() {
       try {
-        var chart = ${CHART_API}._chartWidget;
+        var chart = ${paths.chartWidget};
         var sources = chart.model().model().dataSources();
         var strat = null;
         for (var i = 0; i < sources.length; i++) {
@@ -255,16 +276,19 @@ export async function getEquity() {
   return { success: true, data_points: eqData.length, source: equity?.source, data: eqData, equity_summary: equity?.equity_summary, note: equity?.note, error: equity?.error };
 }
 
-export async function getQuote({ symbol }: { symbol?: string } = {}) {
+export async function getQuote({ symbol, paneIndex }: { symbol?: string; paneIndex?: number } = {}) {
+  const paths = resolvePanePaths(paneIndex);
   const data = await evaluate(`
     (function() {
-      var api = ${CHART_API};
       var sym = ${safeString(symbol || '')};
-      if (!sym) { try { sym = api.symbol(); } catch(e) {} }
-      if (!sym) { try { sym = api.symbolExt().symbol; } catch(e) {} }
+      if (!sym) { try { sym = ${paths.symbol}; } catch(e) {} }
       var ext = {};
-      try { ext = api.symbolExt() || {}; } catch(e) {}
-      var bars = ${BARS_PATH};
+      try {
+        var ms = ${paths.mainSeries};
+        var si = ms.symbolInfo ? ms.symbolInfo() : null;
+        if (si) { ext.description = si.description; ext.exchange = si.exchange; ext.type = si.type; }
+      } catch(e) {}
+      var bars = ${paths.bars};
       var quote = { symbol: sym };
       if (bars && typeof bars.lastIndex === 'function') {
         var last = bars.valueAt(bars.lastIndex());
@@ -336,10 +360,11 @@ export async function getDepth() {
   return { success: true, bid_levels: bids.length, ask_levels: asks.length, spread: data.spread, bids, asks, raw_values: data.raw_values, note: data.note };
 }
 
-export async function getStudyValues() {
+export async function getStudyValues({ paneIndex }: { paneIndex?: number } = {}) {
+  const paths = resolvePanePaths(paneIndex);
   const data = await evaluate(`
     (function() {
-      var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+      var chart = ${paths.chartWidget};
       var model = chart.model();
       var sources = model.model().dataSources();
       var results = [];
@@ -372,9 +397,9 @@ export async function getStudyValues() {
   return { success: true, study_count: data?.length ?? 0, studies: data ?? [] };
 }
 
-export async function getPineLines({ study_filter, verbose }: { study_filter?: string; verbose?: boolean } = {}) {
+export async function getPineLines({ study_filter, verbose, paneIndex }: { study_filter?: string; verbose?: boolean; paneIndex?: number } = {}) {
   const filter = study_filter || '';
-  const raw = await evaluate(buildGraphicsJS('dwglines', 'lines', filter)) as RawGraphicsStudy[] | null;
+  const raw = await evaluate(buildGraphicsJS('dwglines', 'lines', filter, paneIndex)) as RawGraphicsStudy[] | null;
   if (!raw || raw.length === 0) return { success: true, study_count: 0, studies: [] };
 
   const studies = raw.map(s => {
@@ -396,9 +421,9 @@ export async function getPineLines({ study_filter, verbose }: { study_filter?: s
   return { success: true, study_count: studies.length, studies };
 }
 
-export async function getPineLabels({ study_filter, max_labels, verbose }: { study_filter?: string; max_labels?: number; verbose?: boolean } = {}) {
+export async function getPineLabels({ study_filter, max_labels, verbose, paneIndex }: { study_filter?: string; max_labels?: number; verbose?: boolean; paneIndex?: number } = {}) {
   const filter = study_filter || '';
-  const raw = await evaluate(buildGraphicsJS('dwglabels', 'labels', filter)) as RawGraphicsStudy[] | null;
+  const raw = await evaluate(buildGraphicsJS('dwglabels', 'labels', filter, paneIndex)) as RawGraphicsStudy[] | null;
   if (!raw || raw.length === 0) return { success: true, study_count: 0, studies: [] };
 
   const limit = max_labels || 50;
@@ -416,9 +441,9 @@ export async function getPineLabels({ study_filter, max_labels, verbose }: { stu
   return { success: true, study_count: studies.length, studies };
 }
 
-export async function getPineTables({ study_filter }: { study_filter?: string } = {}) {
+export async function getPineTables({ study_filter, paneIndex }: { study_filter?: string; paneIndex?: number } = {}) {
   const filter = study_filter || '';
-  const raw = await evaluate(buildGraphicsJS('dwgtablecells', 'tableCells', filter)) as RawGraphicsStudy[] | null;
+  const raw = await evaluate(buildGraphicsJS('dwgtablecells', 'tableCells', filter, paneIndex)) as RawGraphicsStudy[] | null;
   if (!raw || raw.length === 0) return { success: true, study_count: 0, studies: [] };
 
   const studies = raw.map(s => {
@@ -446,9 +471,9 @@ export async function getPineTables({ study_filter }: { study_filter?: string } 
   return { success: true, study_count: studies.length, studies };
 }
 
-export async function getPineBoxes({ study_filter, verbose }: { study_filter?: string; verbose?: boolean } = {}) {
+export async function getPineBoxes({ study_filter, verbose, paneIndex }: { study_filter?: string; verbose?: boolean; paneIndex?: number } = {}) {
   const filter = study_filter || '';
-  const raw = await evaluate(buildGraphicsJS('dwgboxes', 'boxes', filter)) as RawGraphicsStudy[] | null;
+  const raw = await evaluate(buildGraphicsJS('dwgboxes', 'boxes', filter, paneIndex)) as RawGraphicsStudy[] | null;
   if (!raw || raw.length === 0) return { success: true, study_count: 0, studies: [] };
 
   const studies = raw.map(s => {

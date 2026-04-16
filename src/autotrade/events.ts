@@ -62,7 +62,7 @@ export class EventCalendar {
     );
   }
 
-  static load(configDir: string = './config'): EventCalendar {
+  static load(configDir: string = './config', opts?: { historical?: boolean }): EventCalendar {
     const path = join(configDir, 'events.json');
     if (!existsSync(path)) {
       return new EventCalendar(DEFAULT_CONFIG);
@@ -76,7 +76,18 @@ export class EventCalendar {
         events: Array.isArray(parsed.events) ? parsed.events : [],
       });
     } catch (err) {
-      console.warn('[EVENTS] Failed to load events.json, using empty calendar:', err);
+      // ENOENT is handled above via existsSync; any error here is a read/parse failure.
+      // In non-historical mode, refuse to run without event protection.
+      if (!opts?.historical) {
+        const isEnoent = (err as NodeJS.ErrnoException).code === 'ENOENT';
+        if (!isEnoent) {
+          throw new Error(
+            `[EVENTS] FATAL: Failed to parse events.json — refusing to run without event protection. ` +
+            `Fix config/events.json or use historical mode. Original error: ${err}`,
+          );
+        }
+      }
+      console.warn('[EVENTS] Failed to load events.json in historical mode, using empty calendar:', err);
       return new EventCalendar(DEFAULT_CONFIG);
     }
   }

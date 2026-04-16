@@ -224,8 +224,11 @@ export class IndicatorConfigManager {
         if (profile.trail_atr_post_t1 < 0 || profile.trail_atr_post_t1 > 3) {
           errors.push(`${pfx}.trail_atr_post_t1: ${profile.trail_atr_post_t1} outside [0, 3]`);
         }
-        if (profile.time_stop_minutes < 5 || profile.time_stop_minutes > 120) {
-          errors.push(`${pfx}.time_stop_minutes: ${profile.time_stop_minutes} outside [5, 120]`);
+        // Scalper profile delegates time-based exits to ScalperExitEngine and
+        // intentionally allows 0 as an inert placeholder for this field.
+        const minTimeStopMinutes = family === 'lob_mbo_scalp' ? 0 : 5;
+        if (profile.time_stop_minutes < minTimeStopMinutes || profile.time_stop_minutes > 120) {
+          errors.push(`${pfx}.time_stop_minutes: ${profile.time_stop_minutes} outside [${minTimeStopMinutes}, 120]`);
         }
       }
     }

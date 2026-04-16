@@ -45,6 +45,7 @@ import type { CandidateSetup, MarketRegime, MarketSnapshot, SetupFamily, Indicat
 import type { ExtensionFeatures } from './extension.js';
 import type { MicrostructureScoreResult } from './microstructure-score.js';
 import { getSetupFamily, getManagementProfile, resolveProfile } from '../management-profiles.js';
+import { getContractSpec } from '../contracts.js';
 
 // ── Result Type ──────────────────────────────────────────────────────────────
 
@@ -215,9 +216,6 @@ interface PtOffsets {
   pt2_offset_pts: number;
 }
 
-/** NQ/MNQ tick size used for ContractSpec stub when only PT offsets are needed. */
-const NQ_TICK_SIZE = 0.25;
-
 function resolvePtOffsets(
   setupType: string,
   regime: MarketRegime,
@@ -225,13 +223,14 @@ function resolvePtOffsets(
   config: IndicatorConfig,
 ): PtOffsets {
   // Use the same profile lookup + ATR resolution as live management.
-  // The ContractSpec stub only needs tick_size for PT offset clamping.
+  // Resolve the live MNQ contract spec (the default live contract for micros)
+  // from the registry rather than embedding a hand-built NQ stub, so shadow
+  // mode and live mode resolve PT offsets against the same tick size and
+  // point value. If the migration ever targets a different default, update
+  // pickDefaultSymbol() in contracts.ts — this code path follows that.
   const profile = getManagementProfile(setupType as import('../types.js').SetupType, regime, config);
-  const resolved = resolveProfile(profile, atr, {
-    root: 'NQ', display: 'NQ', tv_symbol: 'CME_MINI:NQ1!', app_symbol: 'NQ1!',
-    venue: 'CME_MINI', point_value: 20, tick_size: NQ_TICK_SIZE,
-    tick_value: 5, price_decimals: 2, is_micro: false,
-  } as import('../contracts.js').ContractSpec);
+  const contract = getContractSpec('MNQ');
+  const resolved = resolveProfile(profile, atr, contract);
   return {
     pt1_offset_pts: round2(resolved.pt1_offset_pts),
     pt2_offset_pts: round2(resolved.pt2_offset_pts),
@@ -337,6 +336,71 @@ export function buildDynamicRewardPlan(
     quality_band,
     setup_family: family,
   };
+}
+
+// ── Quant cold-start targets (Phase 4 of the trend-pullback refactor) ─────
+//
+// Per plan §5 Phase 4 HARD RULE: Phase 4 ships with cold-start targets ONLY.
+// Bucket-conditioned empirical targets are a Phase 6 payload. Attempting to
+// feed empirical bucket values into target_*_quant before Phase 6 is
+// contraband — it will contaminate the Stage A comparison distribution.
+//
+// Formulas (plan §10 cold-start, authoritative):
+//   target_1_quant = entry ± 0.7 · sigma_t
+//   target_2_quant = entry ± 1.4 · sigma_t
+//   bucket_source_quant = 'cold_start'
+//
+// Tick-rounded via ContractSpec.tickSize per plan §3.1. Subsequent
+// risk/RR computations must happen AFTER these rounded values land so
+// replay reproduces live behavior exactly.
+
+/** Cold-start multiplier for target_1 in sigma units. */
+export const QUANT_COLD_START_TP1_K = 0.7;
+/** Cold-start multiplier for target_2 in sigma units. */
+export const QUANT_COLD_START_TP2_K = 1.4;
+
+export interface QuantColdStartTargets {
+  target_1_quant: number;
+  target_2_quant: number;
+  bucket_source_quant: 'cold_start';
+}
+
+/**
+ * Compute the cold-start quant targets for a trend_pullback candidate.
+ *
+ * @param entry      Entry price (tick-aligned or raw — output is rounded).
+ * @param sigmaPts   Blended volatility scale from entry-state.ts.
+ * @param direction  Setup direction.
+ * @param tickSize   ContractSpec.tick_size for rounding.
+ */
+export function computeQuantColdStartTargets(
+  entry: number,
+  sigmaPts: number,
+  direction: 'long' | 'short',
+  tickSize: number,
+): QuantColdStartTargets {
+  if (!(sigmaPts > 0)) {
+    throw new Error('computeQuantColdStartTargets: sigmaPts must be > 0');
+  }
+  if (!(tickSize > 0)) {
+    throw new Error('computeQuantColdStartTargets: tickSize must be > 0');
+  }
+  const sign = direction === 'long' ? 1 : -1;
+  const t1Raw = entry + sign * QUANT_COLD_START_TP1_K * sigmaPts;
+  const t2Raw = entry + sign * QUANT_COLD_START_TP2_K * sigmaPts;
+  return {
+    target_1_quant: roundPriceToTick(t1Raw, tickSize),
+    target_2_quant: roundPriceToTick(t2Raw, tickSize),
+    bucket_source_quant: 'cold_start',
+  };
+}
+
+function roundPriceToTick(price: number, tickSize: number): number {
+  if (!(tickSize > 0)) return price;
+  const ticks = Math.round(price / tickSize);
+  // Clean floating-point residue with 4-decimal rounding — matches the
+  // tick-rounding helper used by estimateInitialStop().
+  return Math.round(ticks * tickSize * 10000) / 10000;
 }
 
 /**

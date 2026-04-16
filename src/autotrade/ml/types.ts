@@ -72,6 +72,13 @@ export interface MlManagementConfig {
   exclude_rows_with_future_ml_exit: boolean;
   /** Minimum seconds between sampled decision rows in the same trade. */
   decision_stride_seconds: number;
+
+  /**
+   * **ML management only** — feeds `resolveMlPolicy()` / `execution_enabled` for the
+   * management-ML lane. Does **not** disable entry orders, rules/management exits,
+   * hard-risk `placeExit`, or target-position broker paths.
+   */
+  broker_execution_enabled?: boolean;
 }
 
 export const DEFAULT_ML_CONFIG: MlManagementConfig = {

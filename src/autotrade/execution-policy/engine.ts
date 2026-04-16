@@ -158,7 +158,7 @@ export class ExecutionPolicyEngine {
       });
 
       // Microstructure quality for scale-in: need fresh depth data
-      const depthOk = micro.data_quality === 'full_depth' || micro.data_quality === 'full_bbo';
+      const depthOk = micro.data_quality === 'full_depth' || micro.data_quality === 'bbo_only';
       checks.push({
         name: 'scale_in_data_quality',
         passed: depthOk,

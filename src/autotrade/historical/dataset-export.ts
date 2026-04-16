@@ -12,6 +12,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { filterScalperRows } from '../../shared/scalper-exclusion.js';
 
 function readJsonl(path: string): Array<Record<string, unknown>> {
   if (!existsSync(path)) return [];
@@ -68,6 +69,29 @@ const SIGNAL_COLUMNS = [
   'htf_distance_res_atr', 'htf_distance_sup_atr',
   'htf_first_obstacle_rr', 'htf_location_quality',
   'htf_veto_reason', 'htf_breakout_accepted',
+  // Phase 4 parallel quant reward contract
+  'stop_quant', 'target_1_quant', 'target_2_quant',
+  'risk_pts_quant', 'rr_t1_quant', 'rr_t2_quant',
+  'bucket_source_quant',
+  // Phase 6 expectancy fields
+  'expected_r_30s_quant', 'win_prob_30s_quant', 'quality_band_quant',
+  'bucket_id_quant', 'bucket_sample_count_quant',
+  'quant_shadow_reject_reason',
+  // Phase 1 frozen entry state vector (JSON-serialized)
+  'entry_state_vector_json', 'entry_state_vector_schema_version',
+  // Phase 7 telemetry
+  'entry_state_vector_hash',
+  'quant_shadow_combined_verdict', 'quant_shadow_combined_reason',
+  'quant_shadow_expectancy_verdict', 'quant_shadow_expectancy_reason',
+  'quant_shadow_entry_ml_verdict', 'quant_shadow_entry_ml_reason',
+  'quant_shadow_gate_active',
+  'quant_shadow_flag_enabled', 'quant_shadow_flag_hybrid_gate',
+  // Phase 5 forward-return labels (written by the backfill labeler)
+  'fwd_return_10s_pts', 'fwd_return_30s_pts', 'fwd_return_60s_pts',
+  'mfe_10s_pts', 'mfe_30s_pts', 'mfe_60s_pts',
+  'mae_10s_pts', 'mae_30s_pts', 'mae_60s_pts',
+  'did_tp1_before_sl', 'time_to_tp1_ms',
+  'fwd_label_source', 'fwd_label_horizon_coverage',
 ];
 
 const TRADE_COLUMNS = [
@@ -90,12 +114,21 @@ const TRADE_COLUMNS = [
 ];
 
 export function exportSignalDataset(signalsJsonlPath: string, outCsv: string, filterSession?: string): number {
-  const rows = readJsonl(signalsJsonlPath)
+  // Contamination firewall: drop lob_mbo_scalp rows and any metadata rows
+  // before the exporter touches them. The scalper has its own export path
+  // in src/autotrade/historical/lob-mbo-scalp-dataset-export.ts (Phase 7).
+  // This filter keeps the legacy trend CSV free of scalper contamination.
+  const rows = filterScalperRows(readJsonl(signalsJsonlPath))
     .filter(r => !filterSession || r['session_id'] === filterSession);
   const flat: Array<Record<string, unknown>> = rows.map(r => {
     const cs = (r['candidate_setup'] ?? {}) as Record<string, unknown>;
     const bias = (r['higher_timeframe_bias'] ?? {}) as Record<string, unknown>;
     const mlf = (r['ml_features'] ?? {}) as Record<string, unknown>;
+    const esv = (cs['entry_state_vector'] ?? null) as Record<string, unknown> | null;
+    // Forward-return labels may be written onto the signal row either at
+    // the top level (by the Phase 5 backfill labeler) or not at all (raw
+    // live logs). Fall through to null gracefully.
+    const fwd = (r['forward_return_labels'] ?? {}) as Record<string, unknown>;
     return {
       ...r,
       setup_type: cs['setup_type'] ?? null,
@@ -130,6 +163,77 @@ export function exportSignalDataset(signalsJsonlPath: string, outCsv: string, fi
       htf_location_quality: mlf['htf_location_quality'] ?? null,
       htf_veto_reason: mlf['htf_veto_reason'] ?? null,
       htf_breakout_accepted: mlf['htf_breakout_accepted'] ?? null,
+      // Phase 4 parallel quant reward contract (populated by
+      // generateSignal() via hydrateQuantRewardContract when the setup
+      // is trend_pullback_long/short and a ContractSpec is available).
+      stop_quant: cs['stop_quant'] ?? null,
+      target_1_quant: cs['target_1_quant'] ?? null,
+      target_2_quant: cs['target_2_quant'] ?? null,
+      risk_pts_quant: cs['risk_pts_quant'] ?? null,
+      rr_t1_quant: cs['rr_t1_quant'] ?? null,
+      rr_t2_quant: cs['rr_t2_quant'] ?? null,
+      bucket_source_quant: cs['bucket_source_quant'] ?? null,
+      // Phase 6 expectancy fields
+      expected_r_30s_quant: cs['expected_r_30s_quant'] ?? null,
+      win_prob_30s_quant: cs['win_prob_30s_quant'] ?? null,
+      quality_band_quant: cs['quality_band_quant'] ?? null,
+      bucket_id_quant: cs['bucket_id_quant'] ?? null,
+      bucket_sample_count_quant: cs['bucket_sample_count_quant'] ?? null,
+      quant_shadow_reject_reason: cs['quant_shadow_reject_reason'] ?? null,
+      // Phase 1 frozen entry state vector — serialized as JSON so the
+      // full object travels through CSV without flattening every field.
+      entry_state_vector_json: esv ? JSON.stringify(esv) : null,
+      entry_state_vector_schema_version: esv ? (esv['schema_version'] ?? null) : null,
+      // Phase 7 telemetry. `quant_shadow_decision` is a nested object;
+      // we flatten the interesting fields into dedicated columns so
+      // standard CSV consumers can filter/group on per-gate verdicts.
+      entry_state_vector_hash: cs['entry_state_vector_hash'] ?? null,
+      ...(() => {
+        const qsd = (cs['quant_shadow_decision'] ?? null) as Record<string, unknown> | null;
+        if (!qsd) {
+          return {
+            quant_shadow_combined_verdict: null,
+            quant_shadow_combined_reason: null,
+            quant_shadow_expectancy_verdict: null,
+            quant_shadow_expectancy_reason: null,
+            quant_shadow_entry_ml_verdict: null,
+            quant_shadow_entry_ml_reason: null,
+            quant_shadow_gate_active: null,
+            quant_shadow_flag_enabled: null,
+            quant_shadow_flag_hybrid_gate: null,
+          };
+        }
+        const expectancy = (qsd['expectancy'] ?? {}) as Record<string, unknown>;
+        const entryMl = (qsd['entry_ml'] ?? {}) as Record<string, unknown>;
+        const flags = (qsd['flags'] ?? {}) as Record<string, unknown>;
+        return {
+          quant_shadow_combined_verdict: qsd['combined_verdict'] ?? null,
+          quant_shadow_combined_reason: qsd['combined_reason'] ?? null,
+          quant_shadow_expectancy_verdict: expectancy['verdict'] ?? null,
+          quant_shadow_expectancy_reason: expectancy['reason'] ?? null,
+          quant_shadow_entry_ml_verdict: entryMl['verdict'] ?? null,
+          quant_shadow_entry_ml_reason: entryMl['reason'] ?? null,
+          quant_shadow_gate_active: qsd['gate_active'] ?? null,
+          quant_shadow_flag_enabled: flags['enabled'] ?? null,
+          quant_shadow_flag_hybrid_gate: flags['hybrid_gate'] ?? null,
+        };
+      })(),
+      // Phase 5 forward-return labels. These are populated by the
+      // scripts/backfill-forward-labels.mjs backfill CLI; raw signal
+      // rows from the live runner will have nulls here.
+      fwd_return_10s_pts: fwd['fwd_return_10s_pts'] ?? null,
+      fwd_return_30s_pts: fwd['fwd_return_30s_pts'] ?? null,
+      fwd_return_60s_pts: fwd['fwd_return_60s_pts'] ?? null,
+      mfe_10s_pts: fwd['mfe_10s_pts'] ?? null,
+      mfe_30s_pts: fwd['mfe_30s_pts'] ?? null,
+      mfe_60s_pts: fwd['mfe_60s_pts'] ?? null,
+      mae_10s_pts: fwd['mae_10s_pts'] ?? null,
+      mae_30s_pts: fwd['mae_30s_pts'] ?? null,
+      mae_60s_pts: fwd['mae_60s_pts'] ?? null,
+      did_tp1_before_sl: fwd['did_tp1_before_sl'] ?? null,
+      time_to_tp1_ms: fwd['time_to_tp1_ms'] ?? null,
+      fwd_label_source: fwd['source'] ?? null,
+      fwd_label_horizon_coverage: fwd['horizon_coverage_sec'] ?? null,
     };
   });
   writeCsv(outCsv, flat, SIGNAL_COLUMNS);
@@ -137,7 +241,11 @@ export function exportSignalDataset(signalsJsonlPath: string, outCsv: string, fi
 }
 
 export function exportTradeDataset(tradesJsonlPath: string, outCsv: string, filterSession?: string): number {
-  const rows = readJsonl(tradesJsonlPath)
+  // Contamination firewall: drop lob_mbo_scalp rows. trades.jsonl carries
+  // setup_type at the top level and can include scalper trades once the
+  // family is promoted out of shadow — this filter guarantees the legacy
+  // trend trade CSV stays trend-only regardless of execution mode.
+  const rows = filterScalperRows(readJsonl(tradesJsonlPath))
     .filter(r => !filterSession || r['session_id'] === filterSession);
   writeCsv(outCsv, rows, TRADE_COLUMNS);
   return rows.length;

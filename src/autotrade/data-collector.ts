@@ -20,6 +20,7 @@
 
 import * as chart from '../core/tradingview/chart.js';
 import * as data from '../core/tradingview/data.js';
+import * as pane from '../core/tradingview/pane.js';
 import type {
   OhlcvBar,
   IndicatorSnapshot,
@@ -32,6 +33,8 @@ import { classifySession, buildOpeningRange, computePriorLevels } from './sessio
 import type { SessionContext } from './session.js';
 import { computeIndicators } from './features/indicators.js';
 import { buildHtfContext, emptyHtfContext, DEFAULT_HTF_ZONES_CONFIG } from './features/htf-zones.js';
+import { tryGetContractSpec } from './contracts.js';
+import type { ContractRoot } from './contracts.js';
 
 // ─── Raw type helpers ────────────────────────────────────────────────────────
 
@@ -337,6 +340,14 @@ const HTF_CACHE_TTL: Record<string, number> = {
 
 // ─── Collection Timing ──────────────────────────────────────────────────────
 
+/** Per-timeframe sub-phase split on the miss path. Populated only under COLLECT_DIAG=1. */
+export interface HtfMissDetail {
+  /** chart.setTimeframe duration incl. internal waitForChartReady */
+  stf_ms: number;
+  /** data.getOhlcv duration */
+  goh_ms: number;
+}
+
 export interface CollectionTiming {
   total_ms: number;
   phase_1m_ms: number;
@@ -347,6 +358,12 @@ export interface CollectionTiming {
   phase_enrich_ms: number;
   htf_cache_hits: string[];
   htf_cache_misses: string[];
+  /** Sub-phase miss diagnostics. Only populated when COLLECT_DIAG=1 and at least one HTF missed. */
+  miss_detail?: {
+    tf_5m?: HtfMissDetail;
+    tf_15m?: HtfMissDetail;
+    tf_1h?: HtfMissDetail;
+  };
 }
 
 // ─── Lite Snapshot (in-position context refresh) ────────────────────────────
@@ -412,11 +429,39 @@ export class DataCollector {
   private _lastTiming: CollectionTiming | null = null;
   get lastTiming(): CollectionTiming | null { return this._lastTiming; }
 
-  constructor(opts: { bars1m?: number; bars5m?: number; bars15m?: number; bars1h?: number } = {}) {
+  /**
+   * Pane index for multi-pane TradingView layouts.
+   * When set, all data reads target `cwc.getAll()[paneIndex]` directly
+   * (no focus needed). Timeframe switches go through the TvUiLock.
+   * When undefined (default), uses the active chart (single-pane mode).
+   */
+  paneIndex?: number;
+
+  /**
+   * Expected contract root (e.g. 'NQ') for post-read symbol validation.
+   * Set alongside paneIndex; used to detect stale pane assignments.
+   */
+  expectedRoot?: ContractRoot;
+
+  /** Callback invoked when pane re-discovery is needed (symbol mismatch). */
+  onPaneMismatch?: () => Promise<number | undefined>;
+
+  constructor(opts: {
+    bars1m?: number;
+    bars5m?: number;
+    bars15m?: number;
+    bars1h?: number;
+    paneIndex?: number;
+    expectedRoot?: ContractRoot;
+    onPaneMismatch?: () => Promise<number | undefined>;
+  } = {}) {
     this.barCount1m = opts.bars1m ?? 60;
     this.barCount5m = opts.bars5m ?? 30;
     this.barCount15m = opts.bars15m ?? 20;
     this.barCount1h = opts.bars1h ?? 12;
+    this.paneIndex = opts.paneIndex;
+    this.expectedRoot = opts.expectedRoot;
+    this.onPaneMismatch = opts.onPaneMismatch;
   }
 
   async collect(symbol: string): Promise<MarketSnapshot> {
@@ -426,25 +471,50 @@ export class DataCollector {
 
     const cacheHits: string[] = [];
     const cacheMisses: string[] = [];
+    const diag = process.env.COLLECT_DIAG === '1';
+    const missDetail: {
+      tf_5m?: HtfMissDetail;
+      tf_15m?: HtfMissDetail;
+      tf_1h?: HtfMissDetail;
+    } = {};
 
     // ── Step 1: Ensure 1m (always fresh — this is the primary TF) ───────
     const t1 = Date.now();
-    await chart.setTimeframe({ timeframe: '1' });
+    const pi = this.paneIndex;
+    await chart.setTimeframe({ timeframe: '1', paneIndex: pi });
     this.lastKnownTimeframe = '1';
     await sleep(TF_SWITCH_SLEEP_MS);
 
     const htfConfig: HtfZonesConfig = (this as any).htfZonesConfig ?? DEFAULT_HTF_ZONES_CONFIG;
 
     const [quote1m, raw1mBars, raw1mStudies, rawLines, rawLabels, rawHtfLabels] = await Promise.all([
-      data.getQuote({}).catch(() => null),
-      data.getOhlcv({ count: this.barCount1m }).catch(() => null),
-      data.getStudyValues().catch(() => null),
-      data.getPineLines({}).catch(() => null),
-      data.getPineLabels({ study_filter: 'RIPS' }).catch(() => null),
+      data.getQuote({ paneIndex: pi }).catch(() => null),
+      data.getOhlcv({ count: this.barCount1m, paneIndex: pi }).catch(() => null),
+      data.getStudyValues({ paneIndex: pi }).catch(() => null),
+      data.getPineLines({ paneIndex: pi }).catch(() => null),
+      data.getPineLabels({ study_filter: 'RIPS', paneIndex: pi }).catch(() => null),
       htfConfig.enabled
-        ? data.getPineLabels({ study_filter: htfConfig.study_filter, max_labels: htfConfig.max_labels }).catch(() => null)
+        ? data.getPineLabels({ study_filter: htfConfig.study_filter, max_labels: htfConfig.max_labels, paneIndex: pi }).catch(() => null)
         : Promise.resolve(null),
     ]);
+
+    // ── Post-read symbol validation (multi-pane self-healing) ──────────
+    if (pi != null && this.expectedRoot && quote1m) {
+      const quoteSymbol = (quote1m as Record<string, unknown>)?.symbol as string | undefined;
+      if (quoteSymbol) {
+        const quoteSpec = tryGetContractSpec(quoteSymbol);
+        if (quoteSpec && quoteSpec.root !== this.expectedRoot) {
+          console.warn(
+            `[COLLECT] Symbol mismatch: expected ${this.expectedRoot}, ` +
+            `got ${quoteSpec.root} (symbol=${quoteSymbol}). Re-discovering pane...`,
+          );
+          if (this.onPaneMismatch) {
+            const newIdx = await this.onPaneMismatch();
+            if (newIdx != null) this.paneIndex = newIdx;
+          }
+        }
+      }
+    }
 
     const bars1m = extractBars(raw1mBars as RawOhlcvResult | null);
     const price = (quote1m as Record<string, unknown> | null)?.last as number
@@ -483,10 +553,14 @@ export class DataCollector {
       bars5m = cached5m.bars;
       cacheHits.push('5m');
     } else {
-      await chart.setTimeframe({ timeframe: '5' });
+      const tStf5 = diag ? Date.now() : 0;
+      await chart.setTimeframe({ timeframe: '5', paneIndex: pi });
+      const stfMs5 = diag ? Date.now() - tStf5 : 0;
       this.lastKnownTimeframe = '5';
       await sleep(TF_SWITCH_SLEEP_MS);
-      const raw5mBars = await data.getOhlcv({ count: this.barCount5m }).catch(() => null);
+      const tGoh5 = diag ? Date.now() : 0;
+      const raw5mBars = await data.getOhlcv({ count: this.barCount5m, paneIndex: pi }).catch(() => null);
+      const gohMs5 = diag ? Date.now() - tGoh5 : 0;
       bars5m = extractBars(raw5mBars as RawOhlcvResult | null);
       this.htfCache.set('5', {
         bars: bars5m,
@@ -494,6 +568,7 @@ export class DataCollector {
         fetchedAt: Date.now(),
       });
       cacheMisses.push('5m');
+      if (diag) missDetail.tf_5m = { stf_ms: stfMs5, goh_ms: gohMs5 };
     }
     const phase5m = Date.now() - t2;
 
@@ -507,12 +582,16 @@ export class DataCollector {
       indicators15m = cached15m.indicators;
       cacheHits.push('15m');
     } else {
-      await chart.setTimeframe({ timeframe: '15' });
+      const tStf15 = diag ? Date.now() : 0;
+      await chart.setTimeframe({ timeframe: '15', paneIndex: pi });
+      const stfMs15 = diag ? Date.now() - tStf15 : 0;
       this.lastKnownTimeframe = '15';
       await sleep(TF_SWITCH_SLEEP_MS);
       // 15m: OHLCV only — indicators computed locally (no getStudyValues call)
       // tradingview_study fields are not needed at this timeframe
-      const raw15mBars = await data.getOhlcv({ count: this.barCount15m }).catch(() => null);
+      const tGoh15 = diag ? Date.now() : 0;
+      const raw15mBars = await data.getOhlcv({ count: this.barCount15m, paneIndex: pi }).catch(() => null);
+      const gohMs15 = diag ? Date.now() - tGoh15 : 0;
       bars15m = extractBars(raw15mBars as RawOhlcvResult | null);
       indicators15m = buildLocalIndicatorSnapshot(bars15m);
       this.htfCache.set('15', {
@@ -521,6 +600,7 @@ export class DataCollector {
         fetchedAt: Date.now(),
       });
       cacheMisses.push('15m');
+      if (diag) missDetail.tf_15m = { stf_ms: stfMs15, goh_ms: gohMs15 };
     }
     const phase15m = Date.now() - t3;
 
@@ -534,12 +614,16 @@ export class DataCollector {
       indicators1h = cached1h.indicators;
       cacheHits.push('1h');
     } else {
-      await chart.setTimeframe({ timeframe: '60' });
+      const tStf60 = diag ? Date.now() : 0;
+      await chart.setTimeframe({ timeframe: '60', paneIndex: pi });
+      const stfMs60 = diag ? Date.now() - tStf60 : 0;
       this.lastKnownTimeframe = '60';
       await sleep(TF_SWITCH_SLEEP_MS);
       // 1h: OHLCV only — indicators computed locally (no getStudyValues call)
       // tradingview_study fields are not needed at this timeframe
-      const raw1hBars = await data.getOhlcv({ count: this.barCount1h }).catch(() => null);
+      const tGoh60 = diag ? Date.now() : 0;
+      const raw1hBars = await data.getOhlcv({ count: this.barCount1h, paneIndex: pi }).catch(() => null);
+      const gohMs60 = diag ? Date.now() - tGoh60 : 0;
       bars1h = extractBars(raw1hBars as RawOhlcvResult | null);
       indicators1h = buildLocalIndicatorSnapshot(bars1h);
       this.htfCache.set('60', {
@@ -548,6 +632,7 @@ export class DataCollector {
         fetchedAt: Date.now(),
       });
       cacheMisses.push('1h');
+      if (diag) missDetail.tf_1h = { stf_ms: stfMs60, goh_ms: gohMs60 };
     }
     const phase1h = Date.now() - t4;
 
@@ -555,7 +640,7 @@ export class DataCollector {
     const tRestore = Date.now();
     // Only restore if we actually switched away
     if (cacheMisses.length > 0) {
-      await chart.setTimeframe({ timeframe: '1' });
+      await chart.setTimeframe({ timeframe: '1', paneIndex: pi });
       this.lastKnownTimeframe = '1';
       await sleep(RESTORE_SLEEP_MS);
     }
@@ -625,6 +710,7 @@ export class DataCollector {
       phase_enrich_ms: phaseEnrich,
       htf_cache_hits: cacheHits,
       htf_cache_misses: cacheMisses,
+      ...(diag && cacheMisses.length > 0 ? { miss_detail: missDetail } : {}),
     };
 
     return {
@@ -678,7 +764,7 @@ export class DataCollector {
   private async ensureTimeframe(tf: string): Promise<void> {
     if (this.lastKnownTimeframe === tf) return;
     try {
-      await chart.setTimeframe({ timeframe: tf });
+      await chart.setTimeframe({ timeframe: tf, paneIndex: this.paneIndex });
       await sleep(TF_SWITCH_SLEEP_MS);
       this.lastKnownTimeframe = tf;
     } catch {
@@ -703,10 +789,11 @@ export class DataCollector {
     await this.ensureTimeframe('1');
 
     // Parallel fetch: quote + bars + TV study values (1m only)
+    const pi = this.paneIndex;
     const [quote1m, raw1mBars, raw1mStudies] = await Promise.all([
-      data.getQuote({}).catch(() => null),
-      data.getOhlcv({ count: this.barCount1m }).catch(() => null),
-      data.getStudyValues().catch(() => null),
+      data.getQuote({ paneIndex: pi }).catch(() => null),
+      data.getOhlcv({ count: this.barCount1m, paneIndex: pi }).catch(() => null),
+      data.getStudyValues({ paneIndex: pi }).catch(() => null),
     ]);
 
     const bars1m = extractBars(raw1mBars as RawOhlcvResult | null);

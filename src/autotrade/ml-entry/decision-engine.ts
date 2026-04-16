@@ -8,8 +8,28 @@
 
 import type { MarketSnapshot, CandidateSetup, MultiTfBias, MarketRegime } from '../types.js';
 import type { LobSnapshot } from '../lob-client.js';
-import type { EntryMlConfig, EntryMlResponse, EntryMlDecision } from './types.js';
+import type { EntryMlConfig, EntryMlResponse, EntryMlDecision, EntryFeatureVector } from './types.js';
 import { buildEntryFeatures } from './feature-builder.js';
+
+function classifyServiceFailure(status: number, detail: string | null): EntryMlDecision['bypass_code'] {
+  const lower = (detail ?? '').toLowerCase();
+  if (lower.includes('insufficient_data')) return 'insufficient_data';
+  if (lower.includes('observational_only')) return 'observational_only';
+  if (lower.includes('contract incompatible')) return 'contract_mismatch';
+  if (lower.includes('no promoted artifact') || lower.includes('unavailable') || lower.includes('not found')) {
+    return 'model_unavailable';
+  }
+  return 'service_http_error';
+}
+
+function classifyThrownError(err: unknown): EntryMlDecision['bypass_code'] {
+  const msg = err instanceof Error ? err.message : String(err);
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'TimeoutError' || name === 'AbortError' || /timeout/i.test(msg)) {
+    return 'timeout';
+  }
+  return 'network_error';
+}
 
 /**
  * Get ML entry confirmation for a candidate setup.
@@ -32,13 +52,30 @@ export async function getEntryMlDecision(
   dualScoreMargin: number,
   config: EntryMlConfig,
   lobSnapshot?: LobSnapshot | null,
+  htfEval?: CandidateSetup['htfEval'] | null,
 ): Promise<EntryMlDecision> {
-  // Off: always confirm
-  if (config.mode === 'off') {
-    return { confirmed: true, reason: 'entry_ml_off', response: null, inference_ms: 0 };
-  }
+  const features: EntryFeatureVector = buildEntryFeatures(
+    setup,
+    snap,
+    bias,
+    regime,
+    confidence,
+    dualScoreMargin,
+    lobSnapshot,
+    htfEval,
+  );
 
-  const features = buildEntryFeatures(setup, snap, bias, regime, confidence, dualScoreMargin, lobSnapshot);
+  // Off: always confirm, but still return the exact payload for observational logging.
+  if (config.mode === 'off') {
+    return {
+      confirmed: true,
+      bypass_code: 'disabled',
+      reason: 'entry_ml_disabled',
+      response: null,
+      request_payload: features,
+      inference_ms: 0,
+    };
+  }
 
   let response: EntryMlResponse;
   const t0 = Date.now();
@@ -53,20 +90,58 @@ export async function getEntryMlDecision(
 
     if (!res.ok) {
       const elapsed = Date.now() - t0;
-      if (config.mode === 'confirm_only') {
-        return { confirmed: false, reason: `entry_ml_service_error:${res.status}`, response: null, inference_ms: elapsed };
+      let detail: string | null = null;
+      try {
+        const body = await res.json() as { detail?: string };
+        detail = body.detail ?? null;
+      } catch {
+        detail = null;
       }
-      return { confirmed: true, reason: `entry_ml_service_error_but_rank_only`, response: null, inference_ms: elapsed };
+      const bypassCode = classifyServiceFailure(res.status, detail);
+      const reason = detail ? `${bypassCode}:${detail}` : `${bypassCode}:http_${res.status}`;
+      if (config.mode === 'confirm_only') {
+        return {
+          confirmed: false,
+          bypass_code: bypassCode,
+          reason,
+          response: null,
+          request_payload: features,
+          inference_ms: elapsed,
+        };
+      }
+      return {
+        confirmed: true,
+        bypass_code: bypassCode,
+        reason,
+        response: null,
+        request_payload: features,
+        inference_ms: elapsed,
+      };
     }
 
     response = await res.json() as EntryMlResponse;
   } catch (err) {
     const elapsed = Date.now() - t0;
     const msg = err instanceof Error ? err.message : String(err);
+    const bypassCode = classifyThrownError(err);
     if (config.mode === 'confirm_only') {
-      return { confirmed: false, reason: `entry_ml_error:${msg}`, response: null, inference_ms: elapsed };
+      return {
+        confirmed: false,
+        bypass_code: bypassCode,
+        reason: `${bypassCode}:${msg}`,
+        response: null,
+        request_payload: features,
+        inference_ms: elapsed,
+      };
     }
-    return { confirmed: true, reason: `entry_ml_error_but_rank_only:${msg}`, response: null, inference_ms: elapsed };
+    return {
+      confirmed: true,
+      bypass_code: bypassCode,
+      reason: `${bypassCode}:${msg}`,
+      response: null,
+      request_payload: features,
+      inference_ms: elapsed,
+    };
   }
 
   const elapsed = Date.now() - t0;
@@ -75,8 +150,10 @@ export async function getEntryMlDecision(
   if (config.mode === 'rank_only') {
     return {
       confirmed: true,
-      reason: `rank_only:quality=${response.entry_quality_prob?.toFixed(2)??'n/a'}:r=${response.expected_r?.toFixed(2)??'n/a'}`,
+      bypass_code: 'rank_only_advisory',
+      reason: `rank_only_advisory:quality=${response.entry_quality_prob?.toFixed(2)??'n/a'}:r=${response.expected_r?.toFixed(2)??'n/a'}`,
       response,
+      request_payload: features,
       inference_ms: response.inference_ms ?? elapsed,
     };
   }
@@ -88,8 +165,10 @@ export async function getEntryMlDecision(
   if (confOk && rOk) {
     return {
       confirmed: true,
+      bypass_code: 'confirmed',
       reason: `ml_confirmed:conf=${response.confidence.toFixed(2)}:r=${response.expected_r?.toFixed(2)??'n/a'}`,
       response,
+      request_payload: features,
       inference_ms: response.inference_ms ?? elapsed,
     };
   }
@@ -100,8 +179,10 @@ export async function getEntryMlDecision(
 
   return {
     confirmed: false,
+    bypass_code: 'threshold_reject',
     reason: `ml_rejected:${reasons.join(';')}`,
     response,
+    request_payload: features,
     inference_ms: response.inference_ms ?? elapsed,
   };
 }

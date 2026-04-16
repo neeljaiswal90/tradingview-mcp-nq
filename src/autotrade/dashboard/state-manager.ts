@@ -32,10 +32,49 @@ import type {
   DashboardHtfSetupEval,
   PnlPoint,
   FreshnessMetadata,
+  DashboardFamilyMetrics,
 } from './types.js';
 import { DASHBOARD_VERSION } from './types.js';
 import type { ManagementMetrics } from '../management/types.js';
 import type { SessionInfo } from '../types.js';
+
+// ─── Phase 7 per-family telemetry constants ────────────────────────────────
+
+/**
+ * Maximum number of distinct reject reasons kept in a family's
+ * top-reject tally. Prevents an adversarial or buggy generator from
+ * growing the map without bound. When the cap is hit the tally is
+ * pruned to the top N by count.
+ */
+const FAMILY_TOP_REJECT_CAP = 32;
+
+/**
+ * Human-readable label for each known family. Unknown families
+ * (anything future-added) render with the raw key as their label
+ * until an entry is added here — the UI tolerates unknown keys.
+ */
+const FAMILY_LABELS: Record<string, string> = {
+  lob_mbo_scalp: 'LOB MBO Scalp',
+  trend_pullback: 'Trend Pullback',
+  breakout_retest: 'Breakout Retest',
+  opening_drive: 'Opening Drive',
+};
+
+/** Build a fresh (zeroed) metrics entry for a family. */
+function emptyFamilyMetrics(family: string): DashboardFamilyMetrics {
+  return {
+    family,
+    label: FAMILY_LABELS[family] ?? family,
+    shadow_decision_count: 0,
+    shadow_allowed_count: 0,
+    shadow_rejected_count: 0,
+    shadow_allowed_rate: 0,
+    top_reject_reasons: {},
+    ml_ready_count: 0,
+    expectancy_resolved_count: 0,
+    last_decision_ts_ms: null,
+  };
+}
 
 // ─── Input state containers ──────────────────────────────────────────────────
 
@@ -107,6 +146,14 @@ export class DashboardStateManager extends EventEmitter {
   private mlDecisionCount = 0;
   private mlApprovedCount = 0;
 
+  // Phase 7: per-family telemetry. One entry per setup family the
+  // runner has observed this session. Scalper candidates flow in via
+  // `recordScalperShadowDecision`; extending to other families is
+  // additive and does not require a schema bump. The top-reject
+  // tally is bounded by `FAMILY_TOP_REJECT_CAP` so a pathological
+  // shadow run can't grow the map indefinitely.
+  private familyMetrics: Map<string, DashboardFamilyMetrics> = new Map();
+
   // ── Sequence tracking ───────────────────────────────────────────────────
   /** Increments on every internal state mutation. */
   private mutationSeq = 0;
@@ -124,6 +171,9 @@ export class DashboardStateManager extends EventEmitter {
   /** Event types that are coalesced (only latest kept per publish cycle). */
   private static readonly COALESCABLE_TYPES = new Set([
     'price_tick', 'management_update', 'position_updated', 'app_update',
+    // Phase 7: family_metrics_update carries the full family snapshot
+    // so only the latest one per batch needs to go over the wire.
+    'family_metrics_update',
   ]);
 
   // Freshness tracking
@@ -275,6 +325,99 @@ export class DashboardStateManager extends EventEmitter {
     this.mlConfig = null; // Reset so next position gets fresh seed
   }
 
+  // ─── Phase 7: per-family telemetry setters ──────────────────────────────
+  //
+  // The scalper log writer is the primary producer — every
+  // `writeLobMboScalpCandidate` call forwards to `recordScalperShadowDecision`
+  // via the runner's small adapter registered in runner.ts. The method
+  // never blocks, never throws, and tolerates minimal row shapes
+  // (missing fields degrade to no-op rather than crash the dashboard).
+
+  /**
+   * Record one scalper shadow decision. Called once per candidate log
+   * row. The `row` is the JSONL shape produced by
+   * `buildScalperCandidateRecord` in `strategies/lob-mbo-scalp.ts`.
+   *
+   * Fields consulted (all optional):
+   *   - setup_family, ts_ms, reject_reason, all_gates_passed,
+   *   - expectancy_ready, ml_ready.
+   *
+   * Any missing field degrades to a zero contribution to that counter
+   * but the overall `shadow_decision_count` still increments — every
+   * call is one decision seen.
+   */
+  recordScalperShadowDecision(row: Record<string, unknown>): void {
+    const family = typeof row['setup_family'] === 'string' ? (row['setup_family'] as string) : 'lob_mbo_scalp';
+    const existing = this.familyMetrics.get(family) ?? emptyFamilyMetrics(family);
+
+    existing.shadow_decision_count += 1;
+
+    if (row['all_gates_passed'] === true) {
+      existing.shadow_allowed_count += 1;
+    } else {
+      existing.shadow_rejected_count += 1;
+      const reason = typeof row['reject_reason'] === 'string' ? (row['reject_reason'] as string) : 'unknown';
+      existing.top_reject_reasons[reason] = (existing.top_reject_reasons[reason] ?? 0) + 1;
+      // Bound the top-reject map to avoid runaway growth on adversarial inputs.
+      const entries = Object.entries(existing.top_reject_reasons);
+      if (entries.length > FAMILY_TOP_REJECT_CAP) {
+        // Keep only the most-hit reasons — drop the lowest-count entries.
+        entries.sort((a, b) => b[1] - a[1]);
+        const kept = entries.slice(0, FAMILY_TOP_REJECT_CAP);
+        existing.top_reject_reasons = Object.fromEntries(kept);
+      }
+    }
+
+    if (row['ml_ready'] === true) {
+      existing.ml_ready_count += 1;
+    }
+    if (row['expectancy_ready'] === true) {
+      existing.expectancy_resolved_count += 1;
+    }
+
+    existing.shadow_allowed_rate =
+      existing.shadow_decision_count > 0
+        ? existing.shadow_allowed_count / existing.shadow_decision_count
+        : 0;
+
+    if (typeof row['ts_ms'] === 'number' && Number.isFinite(row['ts_ms'])) {
+      existing.last_decision_ts_ms = row['ts_ms'] as number;
+    }
+
+    this.familyMetrics.set(family, existing);
+    this.recordMutation();
+    this.queueEvent({ type: 'family_metrics_update', family_metrics: this.buildFamilyMetrics() });
+  }
+
+  /** Test/introspection helper: snapshot the family metrics as a plain object. */
+  getFamilyMetrics(): Record<string, DashboardFamilyMetrics> {
+    return this.buildFamilyMetrics();
+  }
+
+  /** Test-only: clear all family metrics between cases. */
+  _resetFamilyMetricsForTests(): void {
+    this.familyMetrics.clear();
+  }
+
+  private buildFamilyMetrics(): Record<string, DashboardFamilyMetrics> {
+    const out: Record<string, DashboardFamilyMetrics> = {};
+    for (const [k, v] of this.familyMetrics.entries()) {
+      out[k] = {
+        family: v.family,
+        label: v.label,
+        shadow_decision_count: v.shadow_decision_count,
+        shadow_allowed_count: v.shadow_allowed_count,
+        shadow_rejected_count: v.shadow_rejected_count,
+        shadow_allowed_rate: v.shadow_allowed_rate,
+        top_reject_reasons: { ...v.top_reject_reasons },
+        ml_ready_count: v.ml_ready_count,
+        expectancy_resolved_count: v.expectancy_resolved_count,
+        last_decision_ts_ms: v.last_decision_ts_ms,
+      };
+    }
+    return out;
+  }
+
   incrementCycle(): void {
     this.cycleCount++;
   }
@@ -362,6 +505,9 @@ export class DashboardStateManager extends EventEmitter {
       recent_trades: this.buildRecentTrades(),
       pnl_history: this.pnlHistory,
       freshness: this.buildFreshness(),
+      // Phase 7: per-family telemetry. Always present (may be empty)
+      // so frontends never need a null check.
+      family_metrics: this.buildFamilyMetrics(),
     };
   }
 

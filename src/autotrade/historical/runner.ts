@@ -41,6 +41,7 @@ import { EventCalendar } from '../events.js';
 import { exportSignalDataset, exportTradeDataset } from './dataset-export.js';
 
 import type { Signal, TradeRecord, SessionRecord, MarketRegime, SessionState, ExitLeg } from '../types.js';
+import { computeExitReasonDetailed, isStoppedOut } from '../exit-labeling.js';
 import type { HistoricalBar } from './schema.js';
 import { classifyExchangeState, classifyStrategyBucket, getTzHour, getEtParts } from '../session.js';
 
@@ -166,7 +167,7 @@ export async function runHistoricalReplay(cfg: HistoricalConfig): Promise<Histor
   const configMgr = new IndicatorConfigManager('./config');
   const effectiveConfig = { ...configMgr.getConfig() };
   const riskManager = new RiskManager(effectiveConfig, contract);
-  const events = EventCalendar.load('./config');
+  const events = EventCalendar.load('./config', { historical: true });
   const sessionId = `HIST_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${randomUUID().slice(0, 8)}`;
   const logWriter = new LogWriter(cfg.output_dir);
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
@@ -467,26 +468,25 @@ export async function runHistoricalReplay(cfg: HistoricalConfig): Promise<Histor
           exit_reason: check.trigger === 'stop' ? 'stop_loss'
             : check.trigger === 'target_1' ? 'target_1'
             : check.trigger === 'target_2' ? 'target_2' : 'target_3',
-          /**
-           * Granular stop label (patch P3). Non-stop exits mirror exit_reason.
-           * stop_loss_initial  → stop hit before any T1 partial (initial stop).
-           * stop_loss_breakeven → stop hit after T1 partial, trailing not armed.
-           * stop_loss_trailing  → stop hit after T1 partial with trailing active.
-           */
-          exit_reason_detailed: check.trigger === 'stop'
-            ? (open.partial_exit_done === false
-                ? 'stop_loss_initial'
-                : open.trailing_active
-                  ? 'stop_loss_trailing'
-                  : 'stop_loss_breakeven')
-            : check.trigger === 'target_1' ? 'target_1'
-            : check.trigger === 'target_2' ? 'target_2' : 'target_3',
+          exit_reason_detailed: computeExitReasonDetailed(
+            check.trigger === 'stop' ? 'stop_loss'
+              : check.trigger === 'target_1' ? 'target_1'
+              : check.trigger === 'target_2' ? 'target_2' : 'target_3',
+            open.partial_exit_done,
+            open.trailing_active,
+          ),
           mfe: Math.round(open.mfe_pts * 100) / 100,
           mae: Math.round(open.mae_pts * 100) / 100,
           outcome_class: outcome,
           hit_target_1: open.partial_exit_done || check.trigger === 'target_1',
           hit_target_2: check.trigger === 'target_2' || check.trigger === 'target_3',
-          stopped_out: check.trigger === 'stop',
+          stopped_out: isStoppedOut(computeExitReasonDetailed(
+            check.trigger === 'stop' ? 'stop_loss'
+              : check.trigger === 'target_1' ? 'target_1'
+              : check.trigger === 'target_2' ? 'target_2' : 'target_3',
+            open.partial_exit_done,
+            open.trailing_active,
+          )),
           exited_on_time_stop: false,
           regime_at_entry: open.regime_at_entry,
           regime_at_exit: open.regime_at_entry,

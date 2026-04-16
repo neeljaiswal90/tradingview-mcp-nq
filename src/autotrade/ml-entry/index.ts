@@ -11,4 +11,4 @@ export type {
   EntryMlResponse,
   EntryMlDecision,
 } from './types.js';
-export { DEFAULT_ENTRY_ML_CONFIG } from './types.js';
+export { DEFAULT_ENTRY_ML_CONFIG, ENTRY_FEATURE_SCHEMA_VERSION } from './types.js';

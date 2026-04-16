@@ -22,6 +22,7 @@ import {
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
+import { APP_BUILD_SHA } from '../shared/app-version.js';
 import type { Position, ExecutionMode } from './types.js';
 import type { RestartMode } from './types.js';
 
@@ -52,8 +53,19 @@ export interface RuntimeState {
   /** Market snapshot timestamp — NOT wall clock. Answers "when was the latest market data produced." */
   last_snapshot_ts: string | null;
   last_signal_decision_at: string | null;
+  last_cycle_number: number | null;
   /** One-way latch: transitions false → true when data quality meets readiness threshold. */
   warmup_complete: boolean;
+  warmup_completed_at: string | null;
+  warmup_features_valid: boolean;
+  /** Resolved ML policy mode for audit (optional — added by runner after config merge). */
+  ml_policy_mode?: string | null;
+  /** Configured management model version string at startup. */
+  ml_model_version?: string | null;
+  /** Short config content hash (see computeConfigHash). */
+  config_sha_short?: string | null;
+  /** Git / build SHA for this binary. */
+  code_sha?: string | null;
 }
 
 /**
@@ -92,13 +104,9 @@ export interface LockFileContent {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function getAppVersion(): string {
-  try {
-    return execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
-  } catch {
-    return 'unknown';
-  }
-}
+// getAppVersion() now lives in src/shared/app-version.ts as APP_BUILD_SHA.
+// The runtime-state file keeps using the git short SHA as its "app_version"
+// field for continuity with existing runtime_state.json files.
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -156,6 +164,74 @@ function safeReadJson<T>(filePath: string, expectedSchemaVersion: number): T | n
   }
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeIsoString(value: unknown, fallback: string | null = null): string | null {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return fallback;
+  }
+  const time = Date.parse(value);
+  return Number.isNaN(time) ? fallback : value;
+}
+
+function normalizeNullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+function normalizeNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function normalizeMode(value: unknown): ExecutionMode {
+  return value === 'live' || value === 'signal_only' ? value : 'paper';
+}
+
+function normalizeRestartMode(value: unknown): RestartMode {
+  return value === 'prod' ? 'prod' : 'dev';
+}
+
+function normalizeRuntimeStateRecord(raw: unknown, appVersion: string): RuntimeState | null {
+  if (!isPlainRecord(raw)) return null;
+  const schemaVersion = raw['schema_version'];
+  if (schemaVersion !== RUNTIME_STATE_SCHEMA_VERSION) {
+    return null;
+  }
+
+  const writtenAt = normalizeIsoString(raw['written_at'], new Date().toISOString());
+  const startedAt = normalizeIsoString(raw['started_at'], writtenAt);
+  const lastHeartbeatAt = normalizeIsoString(raw['last_heartbeat_at'], writtenAt);
+  const sessionId = typeof raw['session_id'] === 'string' && raw['session_id'].trim().length > 0
+    ? raw['session_id']
+    : 'unknown_session';
+
+  return {
+    schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+    app_version: typeof raw['app_version'] === 'string' && raw['app_version'].trim().length > 0
+      ? raw['app_version']
+      : appVersion,
+    written_at: writtenAt ?? new Date().toISOString(),
+    session_id: sessionId,
+    started_at: startedAt ?? new Date().toISOString(),
+    last_heartbeat_at: lastHeartbeatAt ?? new Date().toISOString(),
+    shutdown_clean: raw['shutdown_clean'] === true,
+    shutdown_reason: normalizeNullableString(raw['shutdown_reason']),
+    open_position_known: raw['open_position_known'] === true,
+    open_trade_id: normalizeNullableString(raw['open_trade_id']),
+    mode: normalizeMode(raw['mode']),
+    restart_mode: normalizeRestartMode(raw['restart_mode']),
+    last_cycle_started_at: normalizeIsoString(raw['last_cycle_started_at']),
+    last_cycle_completed_at: normalizeIsoString(raw['last_cycle_completed_at']),
+    last_snapshot_ts: normalizeNullableString(raw['last_snapshot_ts']),
+    last_signal_decision_at: normalizeIsoString(raw['last_signal_decision_at']),
+    last_cycle_number: normalizeNullableNumber(raw['last_cycle_number']),
+    warmup_complete: raw['warmup_complete'] === true,
+    warmup_completed_at: normalizeIsoString(raw['warmup_completed_at']),
+    warmup_features_valid: raw['warmup_features_valid'] === true,
+  };
+}
+
 // ── RuntimeStateManager ───────────────────────────────────────────────────
 
 export class RuntimeStateManager {
@@ -166,6 +242,7 @@ export class RuntimeStateManager {
   private readonly recoveryReportPath: string;
   private readonly heartbeatIntervalMs: number;
   private readonly heartbeatStaleMs: number;
+  private readonly hardeningEnabled: boolean;
 
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private state: RuntimeState | null = null;
@@ -175,7 +252,7 @@ export class RuntimeStateManager {
 
   constructor(
     logDir: string,
-    opts: { heartbeatIntervalMs?: number; heartbeatStaleMs?: number } = {},
+    opts: { heartbeatIntervalMs?: number; heartbeatStaleMs?: number; hardeningEnabled?: boolean } = {},
   ) {
     this.logDir = logDir;
     this.lockPath = join(logDir, 'runner.lock');
@@ -184,8 +261,9 @@ export class RuntimeStateManager {
     this.recoveryReportPath = join(logDir, 'recovery_report.json');
     this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 10_000;
     this.heartbeatStaleMs = opts.heartbeatStaleMs ?? 40_000;
+    this.hardeningEnabled = opts.hardeningEnabled ?? (process.env['AUTOTRADE_RUNTIME_STATE_HARDENING'] === '1');
     this.instanceId = randomUUID();
-    this.appVersion = getAppVersion();
+    this.appVersion = APP_BUILD_SHA;
   }
 
   // ── Lock ──────────────────────────────────────────────────────────────
@@ -299,31 +377,93 @@ export class RuntimeStateManager {
   // ── Runtime state ────────────────────────────────────────────────────
 
   readPrevious(): RuntimeState | null {
-    // Accept both v1 (pre-cycle-activity) and v2 (current) schema versions.
-    // v1 files are missing cycle activity fields — backfill with defaults.
-    if (!existsSync(this.runtimeStatePath)) return null;
+    if (!this.hardeningEnabled) {
+      // Accept both v1 (pre-cycle-activity) and v2 (current) schema versions.
+      // v1 files are missing cycle activity fields — backfill with defaults.
+      if (!existsSync(this.runtimeStatePath)) return null;
+      try {
+        const raw = readFileSync(this.runtimeStatePath, 'utf8').trim();
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        const sv = parsed.schema_version;
+        if (sv !== 1 && sv !== RUNTIME_STATE_SCHEMA_VERSION) {
+          console.warn(`[RUNTIME-STATE] Schema mismatch in runtime_state.json: expected v1 or v${RUNTIME_STATE_SCHEMA_VERSION}, got v${sv}. Treating as unreadable.`);
+          return null;
+        }
+        // Backfill v2 fields if reading a v1 file
+        if (sv === 1) {
+          parsed.last_cycle_started_at = parsed.last_cycle_started_at ?? null;
+          parsed.last_cycle_completed_at = parsed.last_cycle_completed_at ?? null;
+          parsed.last_snapshot_ts = parsed.last_snapshot_ts ?? null;
+          parsed.last_signal_decision_at = parsed.last_signal_decision_at ?? null;
+          parsed.last_cycle_number = parsed.last_cycle_number ?? null;
+          parsed.warmup_complete = parsed.warmup_complete ?? false;
+          parsed.warmup_completed_at = parsed.warmup_completed_at ?? null;
+          parsed.warmup_features_valid = parsed.warmup_features_valid ?? false;
+        }
+        return parsed as RuntimeState;
+      } catch (err) {
+        console.warn(`[RUNTIME-STATE] Failed to read runtime_state.json: ${err instanceof Error ? err.message : err}. Treating as unreadable.`);
+        return null;
+      }
+    }
+    if (!existsSync(this.runtimeStatePath)) {
+      return null;
+    }
+
     try {
       const raw = readFileSync(this.runtimeStatePath, 'utf8').trim();
       if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      const sv = parsed.schema_version;
-      if (sv !== 1 && sv !== RUNTIME_STATE_SCHEMA_VERSION) {
-        console.warn(`[RUNTIME-STATE] Schema mismatch in runtime_state.json: expected v1 or v${RUNTIME_STATE_SCHEMA_VERSION}, got v${sv}. Treating as unreadable.`);
-        return null;
+      const parsed = JSON.parse(raw) as unknown;
+      const normalized = normalizeRuntimeStateRecord(parsed, this.appVersion);
+      if (normalized) {
+        console.warn('[RUNTIME-STATE] Recovered partial runtime_state.json using fallback defaults.');
+        return normalized;
       }
-      // Backfill v2 fields if reading a v1 file
-      if (sv === 1) {
-        parsed.last_cycle_started_at = parsed.last_cycle_started_at ?? null;
-        parsed.last_cycle_completed_at = parsed.last_cycle_completed_at ?? null;
-        parsed.last_snapshot_ts = parsed.last_snapshot_ts ?? null;
-        parsed.last_signal_decision_at = parsed.last_signal_decision_at ?? null;
-        parsed.warmup_complete = parsed.warmup_complete ?? false;
-      }
-      return parsed as RuntimeState;
     } catch (err) {
-      console.warn(`[RUNTIME-STATE] Failed to read runtime_state.json: ${err instanceof Error ? err.message : err}. Treating as unreadable.`);
-      return null;
+      console.warn(
+        `[RUNTIME-STATE] Hardening fallback could not recover ${this.runtimeStatePath}: ${
+          err instanceof Error ? err.message : err
+        }`,
+      );
     }
+
+    return null;
+  }
+
+  private persistState(): void {
+    if (!this.state) return;
+    this.state.written_at = new Date().toISOString();
+    atomicWriteJson(this.runtimeStatePath, this.state);
+  }
+
+  private patchState(patch: Partial<RuntimeState>): void {
+    if (!this.state) return;
+    this.state = {
+      ...this.state,
+      ...patch,
+      written_at: new Date().toISOString(),
+    };
+    try {
+      atomicWriteJson(this.runtimeStatePath, this.state);
+    } catch (err) {
+      console.error('[RUNTIME-STATE] State update write failed:', err);
+    }
+  }
+
+  /** Stamp ML governance fields for single-file provenance answers. */
+  patchMlGovernance(patch: {
+    ml_policy_mode: string;
+    ml_model_version: string | null;
+    config_sha_short: string;
+    code_sha: string;
+  }): void {
+    this.patchState({
+      ml_policy_mode: patch.ml_policy_mode,
+      ml_model_version: patch.ml_model_version,
+      config_sha_short: patch.config_sha_short,
+      code_sha: patch.code_sha,
+    });
   }
 
   initialize(sessionId: string, mode: ExecutionMode, restartMode: RestartMode): void {
@@ -345,7 +485,10 @@ export class RuntimeStateManager {
       last_cycle_completed_at: null,
       last_snapshot_ts: null,
       last_signal_decision_at: null,
+      last_cycle_number: null,
       warmup_complete: false,
+      warmup_completed_at: null,
+      warmup_features_valid: false,
     };
     atomicWriteJson(this.runtimeStatePath, this.state);
   }
@@ -357,9 +500,8 @@ export class RuntimeStateManager {
     this.heartbeatTimer = setInterval(() => {
       if (!this.state) return;
       this.state.last_heartbeat_at = new Date().toISOString();
-      this.state.written_at = new Date().toISOString();
       try {
-        atomicWriteJson(this.runtimeStatePath, this.state);
+        this.persistState();
       } catch (err) {
         console.error('[RUNTIME-STATE] Heartbeat write failed:', err);
       }
@@ -378,15 +520,46 @@ export class RuntimeStateManager {
   // ── Position tracking ───────────────────────────────────────────────
 
   updatePositionKnown(tradeId: string | null): void {
-    if (!this.state) return;
-    this.state.open_position_known = tradeId !== null;
-    this.state.open_trade_id = tradeId;
-    this.state.written_at = new Date().toISOString();
-    try {
-      atomicWriteJson(this.runtimeStatePath, this.state);
-    } catch (err) {
-      console.error('[RUNTIME-STATE] Position update write failed:', err);
-    }
+    this.patchState({
+      open_position_known: tradeId !== null,
+      open_trade_id: tradeId,
+    });
+  }
+
+  markSnapshotAcquired(snapshotTimestamp: string | null, cycleNumber?: number): void {
+    this.patchState({
+      last_snapshot_ts: snapshotTimestamp,
+      last_cycle_number: cycleNumber ?? this.state?.last_cycle_number ?? null,
+    });
+  }
+
+  markSignalDecision(cycleNumber?: number): void {
+    this.patchState({
+      last_signal_decision_at: new Date().toISOString(),
+      last_cycle_number: cycleNumber ?? this.state?.last_cycle_number ?? null,
+    });
+  }
+
+  markCycleCompleted(cycleNumber?: number): void {
+    this.patchState({
+      last_cycle_completed_at: new Date().toISOString(),
+      last_cycle_number: cycleNumber ?? this.state?.last_cycle_number ?? null,
+    });
+  }
+
+  setWarmupStatus(opts: {
+    warmup_complete: boolean;
+    warmup_features_valid: boolean;
+    warmup_completed_at?: string | null;
+  }): void {
+    this.patchState({
+      warmup_complete: opts.warmup_complete,
+      warmup_features_valid: opts.warmup_features_valid,
+      warmup_completed_at:
+        opts.warmup_complete
+          ? (opts.warmup_completed_at ?? new Date().toISOString())
+          : (opts.warmup_completed_at ?? null),
+    });
   }
 
   writeOpenTradeState(position: Position | null): void {
@@ -434,10 +607,14 @@ export class RuntimeStateManager {
     this.state.last_signal_decision_at = new Date().toISOString();
   }
 
-  /** One-way latch: once warmup is complete, it never reverts. */
+  /** One-way latch: once warmup is complete, it never reverts. Persisted to disk. */
   markWarmupComplete(): void {
     if (!this.state) return;
-    this.state.warmup_complete = true;
+    if (this.state.warmup_complete) return; // already latched
+    this.patchState({
+      warmup_complete: true,
+      warmup_completed_at: new Date().toISOString(),
+    });
   }
 
   isWarmupComplete(): boolean {
@@ -455,8 +632,7 @@ export class RuntimeStateManager {
     if (!this.state) return;
     this.state.shutdown_clean = true;
     this.state.shutdown_reason = reason;
-    this.state.written_at = new Date().toISOString();
-    atomicWriteJson(this.runtimeStatePath, this.state);
+    this.persistState();
   }
 
   // ── Recovery report ─────────────────────────────────────────────────
@@ -482,4 +658,240 @@ export class RuntimeStateManager {
   getLogDir(): string {
     return this.logDir;
   }
+}
+
+// ─── Orderflow Runtime State ─────────────────────────────────────────────────
+//
+// Phase 2 of the quant trend-pullback refactor (plan §4.1 row for
+// `runtime-state.ts` and §4.3 `orderflow` config subsection).
+//
+// This is a tightly-scoped, in-memory-only container for rolling LOB
+// derived features (OFI contributions, z-score history). It is NOT
+// persisted to disk — it rebuilds from scratch on every process launch
+// and session rollover. It lives in this file so every generator call
+// site has one obvious place to reach for rolling orderflow state.
+//
+// Scope rules (enforced by convention, not types):
+//   - ONLY orderflow rolling buffers live here. This is not a generic
+//     "dump anything runtime-ish" bag. Adding a new field requires
+//     editing fizzy-skipping-wind.md first.
+//   - Every buffer entry is keyed by (instrument, session_id) and carries
+//     an explicit `last_snap_ts_ms` so callers can detect gaps / resets.
+//   - History arrays are capped to `ORDERFLOW_HISTORY_MAX_SAMPLES` so
+//     memory usage is bounded even if a session runs unusually long.
+
+/** Max number of per-window OFI samples retained for z-score stats. */
+export const ORDERFLOW_HISTORY_MAX_SAMPLES = 300;
+
+/** One snapshot-delta OFI contribution, timestamped. */
+export interface OrderflowContribution {
+  ts_ms: number;
+  /** OFI contribution for this snapshot step (snapshot-delta). */
+  e: number;
+}
+
+/** Per-(instrument, session) rolling buffer for the orderflow engine. */
+export interface OrderflowRollingBuffer {
+  instrument: string;
+  session_id: string;
+  /** ms timestamp of the most recent snapshot fed into this buffer. */
+  last_snap_ts_ms: number | null;
+  last_best_bid: number | null;
+  last_best_ask: number | null;
+  last_bid_size: number | null;
+  last_ask_size: number | null;
+  /** Ordered-ascending window contributions, all within the last 30s. */
+  contributions: OrderflowContribution[];
+  /** Historical window totals, used to compute rolling mean/std for z. */
+  ofi_10s_history: number[];
+  ofi_30s_history: number[];
+  /**
+   * True when the z-score history has reached the warmup threshold
+   * (ORDERFLOW_Z_WARMUP_SAMPLES). Set by the orderflow engine after
+   * enough snapshots have been processed, or by the startup restoration
+   * path when replaying historical LOB snapshots.
+   */
+  orderflow_buffer_ready: boolean;
+  /** Source of the buffer's initial state: 'cold' (default), 'restored' (from logs). */
+  orderflow_buffer_init_source: 'cold' | 'restored';
+}
+
+const orderflowRuntimeState = new Map<string, OrderflowRollingBuffer>();
+
+function orderflowKey(instrument: string, sessionId: string): string {
+  return `${instrument}::${sessionId}`;
+}
+
+/**
+ * Fetch (or lazily create) the orderflow rolling buffer for a given
+ * (instrument, session_id) pair. The buffer is mutated in place by
+ * features/orderflow-state.ts. Callers should not hold on to the
+ * returned reference across session boundaries.
+ */
+export function getOrderflowBuffer(
+  instrument: string,
+  sessionId: string,
+): OrderflowRollingBuffer {
+  const key = orderflowKey(instrument, sessionId);
+  let buf = orderflowRuntimeState.get(key);
+  if (!buf) {
+    buf = {
+      instrument,
+      session_id: sessionId,
+      last_snap_ts_ms: null,
+      last_best_bid: null,
+      last_best_ask: null,
+      last_bid_size: null,
+      last_ask_size: null,
+      contributions: [],
+      ofi_10s_history: [],
+      ofi_30s_history: [],
+      orderflow_buffer_ready: false,
+      orderflow_buffer_init_source: 'cold',
+    };
+    orderflowRuntimeState.set(key, buf);
+  }
+  return buf;
+}
+
+/**
+ * Drop every orderflow buffer — primarily for tests and hot-reload
+ * scenarios. Production code should never need to call this.
+ */
+export function resetOrderflowRuntimeState(): void {
+  orderflowRuntimeState.clear();
+}
+
+// ── Orderflow buffer persistence ──────────────────────────────────────────
+//
+// Phase 4: persist the rolling buffer on clean shutdown so the next startup
+// can restore z-score state instantly, without replaying LOB snapshots from
+// disk (which only helps if the snapshot log is recent enough).
+
+export interface PersistedOrderflowBuffer {
+  instrument: string;
+  session_id: string;
+  last_snap_ts_ms: number | null;
+  last_best_bid: number | null;
+  last_best_ask: number | null;
+  last_bid_size: number | null;
+  last_ask_size: number | null;
+  contributions: { ts_ms: number; e: number }[];
+  ofi_10s_history: number[];
+  ofi_30s_history: number[];
+  orderflow_buffer_ready: boolean;
+  persisted_at: string;
+}
+
+export interface PersistedOrderflowState {
+  schema_version: 1;
+  buffers: PersistedOrderflowBuffer[];
+}
+
+/**
+ * Serialize all active orderflow buffers to a JSON-compatible object.
+ * Called at clean shutdown.
+ */
+export function serializeOrderflowBuffers(): PersistedOrderflowState {
+  const buffers: PersistedOrderflowBuffer[] = [];
+  const now = new Date().toISOString();
+  for (const buf of orderflowRuntimeState.values()) {
+    buffers.push({
+      instrument: buf.instrument,
+      session_id: buf.session_id,
+      last_snap_ts_ms: buf.last_snap_ts_ms,
+      last_best_bid: buf.last_best_bid,
+      last_best_ask: buf.last_best_ask,
+      last_bid_size: buf.last_bid_size,
+      last_ask_size: buf.last_ask_size,
+      contributions: buf.contributions.slice(),
+      ofi_10s_history: buf.ofi_10s_history.slice(),
+      ofi_30s_history: buf.ofi_30s_history.slice(),
+      orderflow_buffer_ready: buf.orderflow_buffer_ready,
+      persisted_at: now,
+    });
+  }
+  return { schema_version: 1, buffers };
+}
+
+/**
+ * Restore orderflow buffers from a previously persisted state. Only
+ * restores buffers that don't already exist in the runtime state
+ * (i.e., won't overwrite a buffer that was already populated by
+ * LOB snapshot replay).
+ *
+ * Returns the number of buffers actually restored.
+ */
+export function restoreOrderflowBuffersFromPersisted(
+  state: PersistedOrderflowState,
+  maxAgeMs: number = 3_600_000,
+): number {
+  if (state.schema_version !== 1) return 0;
+  const now = Date.now();
+  let restored = 0;
+
+  for (const pb of state.buffers) {
+    const persistedTs = new Date(pb.persisted_at).getTime();
+    if (now - persistedTs > maxAgeMs) continue;
+
+    const key = orderflowKey(pb.instrument, pb.session_id);
+    if (orderflowRuntimeState.has(key)) {
+      const existing = orderflowRuntimeState.get(key)!;
+      if (existing.ofi_10s_history.length > 0) continue;
+    }
+
+    const buf: OrderflowRollingBuffer = {
+      instrument: pb.instrument,
+      session_id: pb.session_id,
+      last_snap_ts_ms: pb.last_snap_ts_ms,
+      last_best_bid: pb.last_best_bid,
+      last_best_ask: pb.last_best_ask,
+      last_bid_size: pb.last_bid_size,
+      last_ask_size: pb.last_ask_size,
+      contributions: pb.contributions.slice(),
+      ofi_10s_history: pb.ofi_10s_history.slice(),
+      ofi_30s_history: pb.ofi_30s_history.slice(),
+      orderflow_buffer_ready: pb.orderflow_buffer_ready,
+      orderflow_buffer_init_source: 'restored',
+    };
+    orderflowRuntimeState.set(key, buf);
+    restored++;
+  }
+  return restored;
+}
+
+/**
+ * Save orderflow buffer state to disk. Called during clean shutdown.
+ */
+export function persistOrderflowBuffersToDisk(runtimeDir: string): void {
+  const state = serializeOrderflowBuffers();
+  if (state.buffers.length === 0) return;
+  const filePath = join(runtimeDir, 'orderflow_buffer_state.json');
+  const tmpPath = filePath + '.tmp';
+  writeFileSync(tmpPath, JSON.stringify(state, null, 2), 'utf8');
+  renameSync(tmpPath, filePath);
+}
+
+/**
+ * Load persisted orderflow buffer state from disk and restore into
+ * runtime state. Returns the number of buffers restored.
+ */
+export function loadAndRestoreOrderflowBuffers(
+  runtimeDir: string,
+  maxAgeMs: number = 3_600_000,
+): number {
+  const filePath = join(runtimeDir, 'orderflow_buffer_state.json');
+  if (!existsSync(filePath)) return 0;
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    const state = JSON.parse(raw) as PersistedOrderflowState;
+    return restoreOrderflowBuffersFromPersisted(state, maxAgeMs);
+  } catch {
+    return 0;
+  }
+}
+
+/** List current orderflow buffer keys (for diagnostics and tests). */
+export function listOrderflowBufferKeys(): string[] {
+  return Array.from(orderflowRuntimeState.keys());
 }

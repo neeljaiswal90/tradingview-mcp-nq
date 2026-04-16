@@ -18,6 +18,15 @@ import type {
 import type { OrderResult } from './execution.js';
 import type { ContractSpec } from './contracts.js';
 import { roundToTick, ticksToPrice } from './contracts.js';
+import {
+  computeFailureExitState,
+  evaluateFailureExit,
+  type FailureExitCurves,
+  type FailureExitState,
+  type FailureExitLaneTrigger,
+} from './failure-exit/index.js';
+import { computeExitReasonDetailed, isStoppedOut } from './exit-labeling.js';
+import { getSetupFamily } from './management-profiles.js';
 
 // ── Risk-only evaluation types (Phase 1: pure evaluation for hard-risk lane) ──
 
@@ -121,6 +130,13 @@ export class PositionManager {
   private readonly venue: string;
   private onManagementEvent?: (event: ManagementEvent) => void;
   private onPositionChange?: (position: Position | null) => void;
+  /**
+   * Empirical winner-distribution curves keyed by family (or custom key via
+   * ResolvedManagementParams.pre_t1_failure_curves_key). Null/empty map
+   * makes Lane B of the Dead-Trade Guard a no-op; Lanes A and C still work.
+   * Loaded once at startup from config/failure_exit_curves.json by the runner.
+   */
+  private failureCurves: Map<string, FailureExitCurves> | null = null;
 
   constructor(contract: ContractSpec, instrumentSymbol: string) {
     this.contract = contract;
@@ -131,6 +147,14 @@ export class PositionManager {
   /** Register a handler for structured management events (PT1, trail ratchets, etc.). */
   setManagementEventHandler(handler: (event: ManagementEvent) => void): void {
     this.onManagementEvent = handler;
+  }
+
+  /**
+   * Install the empirical failure-exit curves map. Called once at runner
+   * startup. If never called (or called with null), Lane B is a no-op.
+   */
+  setFailureCurves(curves: Map<string, FailureExitCurves> | null): void {
+    this.failureCurves = curves;
   }
 
   /** Register a handler for position state changes (for crash recovery persistence). */
@@ -192,6 +216,44 @@ export class PositionManager {
     try {
       this.onManagementEvent?.(event);
     } catch { /* management event logging must never break trading */ }
+  }
+
+  /**
+   * Build a failure-exit management event decorated with the full state
+   * snapshot (lane, reason, derived features, interpolated curve values).
+   * Used for failure_review_soft / failure_exit / failure_exit_shadow events.
+   */
+  private buildFailureExitEvent(
+    pos: Position,
+    eventType: ManagementEventType,
+    currentPrice: number,
+    state: FailureExitState,
+    trigger: FailureExitLaneTrigger,
+  ): ManagementEvent {
+    const base = this.buildMgmtEvent(
+      pos,
+      eventType,
+      currentPrice,
+      pos.stop_current,
+      pos.stop_current,
+      pos.quantity_remaining,
+      pos.quantity_remaining,
+    );
+    return {
+      ...base,
+      failure_lane: trigger.lane,
+      failure_reason: trigger.reason,
+      hold_minutes_at_event: Math.round(state.tMin * 100) / 100,
+      current_r_at_event: Math.round(state.currentR * 1000) / 1000,
+      peak_r_at_event: Math.round(state.peakR * 1000) / 1000,
+      mae_r_at_event: Math.round(state.maeR * 1000) / 1000,
+      failure_ratio_at_event: Math.round(state.failureRatio * 1000) / 1000,
+      progress_rate_at_event: Math.round(state.progressRate * 1000) / 1000,
+      recovery_gap_at_event: Math.round(state.recoveryGap * 1000) / 1000,
+      decay_rate_at_event: Math.round(state.decayRate * 1000) / 1000,
+      q20_peak_at_event: trigger.q20_peak ?? null,
+      q80_mae_at_event: trigger.q80_mae ?? null,
+    };
   }
 
   hasOpenPosition(): boolean {
@@ -301,6 +363,18 @@ export class PositionManager {
       const peakR = riskPtsForPeakR > 0 ? favorableMove / riskPtsForPeakR : 0;
       if (peakR > (pos.peak_r_before_first_partial ?? 0)) {
         pos.peak_r_before_first_partial = peakR;
+        // Stamp the peak update time so decayRate in the failure-exit state
+        // vector can measure R/min since peak. Single source of truth for
+        // tPeakMin used by computeFailureExitState().
+        const peakMinutes = (Date.now() - pos.entry_time_unix) / 60_000;
+        pos.t_peak_r_minutes = peakMinutes;
+        if (pos.time_to_peak_r_before_first_partial_minutes === null) {
+          pos.time_to_peak_r_before_first_partial_minutes = peakMinutes;
+        }
+      }
+      // First positive-R stamp (time-to-break-even-ish metric)
+      if (pos.time_to_first_positive_r_minutes === null && peakR > 0) {
+        pos.time_to_first_positive_r_minutes = (Date.now() - pos.entry_time_unix) / 60_000;
       }
     }
 
@@ -439,6 +513,162 @@ export class PositionManager {
       }
     }
 
+    // ── Pre-T1 failure-to-launch exit (Dead-Trade Guard) ─────────────────
+    // Runs only when still pre-PT1/pre-partial AND the feature is enabled on
+    // this trade's resolved management params. Shadow mode logs events but
+    // does NOT flatten. Live mode flattens on the first unfired non-soft lane
+    // in deterministic precedence order (emergency > hard > soft).
+    //
+    // Placement rationale: hard stop + all profit-taking (PT1/PT2/T1) already
+    // ran above, so by this point the trade is still open AND has not made
+    // meaningful progress. Time stop still runs below as the outer backstop.
+    if (!pos.partial_exit_done && !pos.pt1_done && mgmt.pre_t1_failure_exit_enabled) {
+      const state = computeFailureExitState(
+        pos,
+        favorableMove,
+        Date.now(),
+        mgmt.pre_t1_failure_lambda_net,
+        mgmt.pre_t1_failure_decay_min_gap_minutes,
+      );
+      // Stash derived state for journaling even if no lane fires.
+      pos.last_progress_rate_r_per_min = state.progressRate;
+      pos.last_drawdown_rate_r_per_min = state.drawdownRate;
+      pos.last_failure_ratio = state.failureRatio;
+      pos.last_net_progress = state.netProgress;
+      pos.last_efficiency = state.efficiency;
+      pos.last_recovery_gap = state.recoveryGap;
+      pos.last_decay_rate_r_per_min = state.decayRate;
+      pos.mae_r_before_first_partial = state.maeR;
+
+      const curveKey = mgmt.pre_t1_failure_curves_key || mgmt.family;
+      const curve = this.failureCurves?.get(curveKey) ?? null;
+      const decision = evaluateFailureExit(state, mgmt, curve);
+
+      if (decision.triggered.length > 0) {
+        if (mgmt.pre_t1_failure_shadow_mode) {
+          // SHADOW: record every unfired latch so the replay analyzer can see
+          // which lane triggered first across many trades. Do NOT return —
+          // fall through to time stop. Iterate in precedence order so
+          // emergency wins same-cycle ties for the reason/time fields.
+          for (const trig of decision.triggered) {
+            if (trig.lane === 'soft' && !pos.failure_review_soft_emitted) {
+              pos.failure_review_soft_emitted = true;
+              this.emitMgmtEvent(
+                this.buildFailureExitEvent(pos, 'failure_review_soft', currentPrice, state, trig),
+              );
+            } else if (trig.lane === 'hard' && !pos.failure_exit_hard_fired) {
+              pos.failure_exit_hard_fired = true;
+              pos.failure_exit_shadow_only = true;
+              if (pos.failure_exit_reason === null) {
+                pos.failure_exit_reason = trig.reason;
+                pos.failure_exit_trigger_time_minutes = state.tMin;
+              }
+              this.emitMgmtEvent(
+                this.buildFailureExitEvent(pos, 'failure_exit_shadow', currentPrice, state, trig),
+              );
+            } else if (trig.lane === 'emergency' && !pos.failure_exit_emergency_fired) {
+              pos.failure_exit_emergency_fired = true;
+              pos.failure_exit_shadow_only = true;
+              if (pos.failure_exit_reason === null) {
+                pos.failure_exit_reason = trig.reason;
+                pos.failure_exit_trigger_time_minutes = state.tMin;
+              }
+              this.emitMgmtEvent(
+                this.buildFailureExitEvent(pos, 'failure_exit_shadow', currentPrice, state, trig),
+              );
+            }
+          }
+          // falls through to time-stop
+        } else {
+          // LIVE: scan in precedence order (already sorted by evaluator).
+          // Soft never flattens — it only logs. The first unfired hard OR
+          // emergency wins and flattens the trade.
+          for (const trig of decision.triggered) {
+            if (trig.lane === 'soft') {
+              if (!pos.failure_review_soft_emitted) {
+                pos.failure_review_soft_emitted = true;
+                this.emitMgmtEvent(
+                  this.buildFailureExitEvent(pos, 'failure_review_soft', currentPrice, state, trig),
+                );
+              }
+              continue;
+            }
+            if (trig.lane === 'hard' && !pos.failure_exit_hard_fired) {
+              pos.failure_exit_hard_fired = true;
+              pos.failure_exit_active_lane = 'hard';
+              pos.failure_exit_reason = trig.reason;
+              pos.failure_exit_trigger_time_minutes = state.tMin;
+              this.emitMgmtEvent(
+                this.buildFailureExitEvent(pos, 'failure_exit', currentPrice, state, trig),
+              );
+              console.log(
+                `[FAILURE_EXIT] ${pos.side.toUpperCase()} lane=hard t=${state.tMin.toFixed(1)}min ` +
+                `peakR=${state.peakR.toFixed(2)} currentR=${state.currentR.toFixed(2)} ` +
+                `maeR=${state.maeR.toFixed(2)} reason="${trig.reason}"`,
+              );
+              return {
+                shouldExit: true,
+                reason: 'failure_to_launch',
+                exitPrice: currentPrice,
+                plannedExitPrice: currentPrice,
+                isPartial: false,
+                partialQuantity: 0,
+              };
+            }
+            if (trig.lane === 'emergency' && !pos.failure_exit_emergency_fired) {
+              pos.failure_exit_emergency_fired = true;
+              pos.failure_exit_active_lane = 'emergency';
+              pos.failure_exit_reason = trig.reason;
+              pos.failure_exit_trigger_time_minutes = state.tMin;
+              this.emitMgmtEvent(
+                this.buildFailureExitEvent(pos, 'failure_exit', currentPrice, state, trig),
+              );
+              console.log(
+                `[FAILURE_EXIT] ${pos.side.toUpperCase()} lane=emergency t=${state.tMin.toFixed(1)}min ` +
+                `peakR=${state.peakR.toFixed(2)} maeR=${state.maeR.toFixed(2)} ` +
+                `failureRatio=${state.failureRatio.toFixed(2)} reason="${trig.reason}"`,
+              );
+              return {
+                shouldExit: true,
+                reason: 'failure_to_launch',
+                exitPrice: currentPrice,
+                plannedExitPrice: currentPrice,
+                isPartial: false,
+                partialQuantity: 0,
+              };
+            }
+          }
+        }
+      }
+    }
+
+    // ── Scalper family early-return (Phase 6) ─────────────────────────────
+    //
+    // The lob_mbo_scalp family owns ALL of its time-based exits via the
+    // Phase 6 ScalperExitEngine (src/autotrade/management/scalper-exit-engine.ts).
+    // The legacy minute-granular time_stop / pre_t1_failure_* paths are
+    // BOTH inappropriate for 1-5 second scalp holds and would create
+    // two competing owners for the same decision. Instead, we short-
+    // circuit here: the runner's scalper exit loop is the single
+    // source of truth for every scalper time cap, no-progress exit,
+    // reversal, and microstructure stop.
+    //
+    // This MUST be the ONLY scalper-aware block in this file — if
+    // another time-based check is added below, it must also be
+    // guarded with the same early-return or it will silently bypass
+    // the ScalperExitEngine. See plan Phase 6 "Critical ownership
+    // rule: ScalperExitEngine is the single source of truth".
+    if (getSetupFamily(pos.setup_type) === 'lob_mbo_scalp') {
+      return {
+        shouldExit: false,
+        reason: null,
+        exitPrice: currentPrice,
+        plannedExitPrice: currentPrice,
+        isPartial: false,
+        partialQuantity: 0,
+      };
+    }
+
     // ── Time stop ─────────────────────────────────────────────────────────
     const holdMinutes = (Date.now() - pos.entry_time_unix) / 60_000;
     if (holdMinutes >= pos.time_stop_minutes) {
@@ -554,6 +784,10 @@ export class PositionManager {
     pos.pt1_done = true;
     pos.pt1_qty_exited = quantity;
     pos.pt1_realized_pnl = leg.pnl_usd;
+    if (pos.first_partial_fill_price == null) {
+      pos.first_partial_fill_price = fillPrice;
+    }
+    pos.effective_target_1 = pos.target_1;
 
     // Capture MFE/MAE state at PT1 for follow-through analysis
     pos.mfe_at_pt1_trigger = pos.max_favorable_excursion;
@@ -735,12 +969,16 @@ export class PositionManager {
       r_multiple: rMultiple,
       hold_time_seconds: holdSeconds,
       exit_reason: reason,
+      exit_reason_detailed: computeExitReasonDetailed(reason, pos.partial_exit_done, pos.trailing_active),
       mfe: Math.round(pos.max_favorable_excursion * 100) / 100,
       mae: Math.round(pos.max_adverse_excursion * 100) / 100,
       outcome_class: outcome,
-      hit_target_1: pos.partial_exit_done,
+      hit_target_1: pos.pt1_done || pos.partial_exit_done,
+      planned_target_1: pos.planned_target_1 ?? pos.target_1,
+      effective_target_1: pos.effective_target_1 ?? null,
+      first_partial_fill_price: pos.first_partial_fill_price ?? null,
       hit_target_2: reason === 'target_2' || reason === 'target_3',
-      stopped_out: reason === 'stop_loss',
+      stopped_out: isStoppedOut(computeExitReasonDetailed(reason, pos.partial_exit_done, pos.trailing_active)),
       exited_on_time_stop: reason === 'time_stop',
       regime_at_entry: pos.market_regime_at_entry,
       regime_at_exit: regimeAtExit,
@@ -794,6 +1032,24 @@ export class PositionManager {
       })() : null,
       peak_unrealized_r_before_first_partial: Math.round((pos.peak_r_before_first_partial ?? 0) * 100) / 100,
       management_variant: pos.management_variant ?? null,
+      // ── Dead-Trade Guard telemetry (last-seen derived state + latches) ─
+      time_to_first_positive_r_minutes: pos.time_to_first_positive_r_minutes,
+      time_to_peak_r_before_first_partial_minutes: pos.time_to_peak_r_before_first_partial_minutes,
+      mae_r_before_first_partial: Math.round(pos.mae_r_before_first_partial * 1000) / 1000,
+      last_progress_rate_r_per_min: Math.round(pos.last_progress_rate_r_per_min * 1000) / 1000,
+      last_drawdown_rate_r_per_min: Math.round(pos.last_drawdown_rate_r_per_min * 1000) / 1000,
+      last_failure_ratio: Math.round(pos.last_failure_ratio * 1000) / 1000,
+      last_net_progress: Math.round(pos.last_net_progress * 1000) / 1000,
+      last_efficiency: Math.round(pos.last_efficiency * 1000) / 1000,
+      last_recovery_gap: Math.round(pos.last_recovery_gap * 1000) / 1000,
+      last_decay_rate_r_per_min: Math.round(pos.last_decay_rate_r_per_min * 1000) / 1000,
+      failure_review_soft_emitted: pos.failure_review_soft_emitted,
+      failure_exit_hard_fired: pos.failure_exit_hard_fired,
+      failure_exit_emergency_fired: pos.failure_exit_emergency_fired,
+      failure_exit_active_lane: pos.failure_exit_active_lane,
+      failure_exit_reason: pos.failure_exit_reason,
+      failure_exit_trigger_time_minutes: pos.failure_exit_trigger_time_minutes,
+      failure_exit_shadow_only: pos.failure_exit_shadow_only,
     };
 
     // Emit final_runner_exit management event before clearing position
@@ -889,7 +1145,11 @@ export class PositionManager {
     managementParams?: ResolvedManagementParams,
     atrAtEntry?: number | null,
   ): Position {
-    // Fallback management params for backwards compatibility (all zeros/defaults)
+    // Fallback management params for backwards compatibility (all zeros/defaults).
+    // The Dead-Trade Guard feature is OFF in the fallback — tests and legacy
+    // flows that build Positions without explicit management params get
+    // unchanged behavior. Live trades always pass explicit managementParams
+    // resolved via management-profiles.resolveProfile().
     const mgmt: ResolvedManagementParams = managementParams ?? {
       profile_name: 'legacy_default',
       family: 'default',
@@ -907,6 +1167,24 @@ export class PositionManager {
       time_stop_minutes: timeStopMinutes,
       time_stop_max_r_pre_t1: 0.25,
       time_stop_max_r_post_t1: 1.0,
+      // Dead-Trade Guard — OFF in fallback
+      pre_t1_failure_exit_enabled: false,
+      pre_t1_failure_shadow_mode: true,
+      pre_t1_failure_decay_min_gap_minutes: 0.5,
+      pre_t1_failure_lambda_net: 1.0,
+      pre_t1_failure_soft_min_minutes: 4,
+      pre_t1_failure_soft_progress_rate_max: 0.05,
+      pre_t1_failure_soft_failure_ratio_min: 2.0,
+      pre_t1_failure_hard_min_minutes: 5,
+      pre_t1_failure_hard_current_r_alpha: 0.4,
+      pre_t1_failure_curves_key: 'default',
+      pre_t1_failure_min_n_per_bucket: 20,
+      pre_t1_failure_emergency_min_minutes: 3,
+      pre_t1_failure_emergency_mae_r_floor: 0.20,
+      pre_t1_failure_emergency_failure_ratio_min: 4.0,
+      pre_t1_failure_emergency_peak_r_max: 0.10,
+      pre_t1_failure_emergency_decay_rate_min: 0,
+      pre_t1_failure_cost_r: 0.05,
     };
 
     console.log(
@@ -927,6 +1205,9 @@ export class PositionManager {
       stop_initial: setup.stop,
       stop_current: setup.stop,
       target_1: setup.target_1,
+      planned_target_1: setup.target_1,
+      effective_target_1: null,
+      first_partial_fill_price: null,
       target_2: setup.target_2,
       target_3: setup.target_3,
       quantity,
@@ -967,6 +1248,25 @@ export class PositionManager {
       mfe_at_pt1_trigger: 0,
       mae_at_pt1_trigger: 0,
       peak_r_before_first_partial: 0,
+      // Dead-Trade Guard telemetry + latches — all zeroed at entry.
+      time_to_first_positive_r_minutes: null,
+      t_peak_r_minutes: null,
+      time_to_peak_r_before_first_partial_minutes: null,
+      mae_r_before_first_partial: 0,
+      last_progress_rate_r_per_min: 0,
+      last_drawdown_rate_r_per_min: 0,
+      last_failure_ratio: 0,
+      last_net_progress: 0,
+      last_efficiency: 0,
+      last_recovery_gap: 0,
+      last_decay_rate_r_per_min: 0,
+      failure_review_soft_emitted: false,
+      failure_exit_hard_fired: false,
+      failure_exit_emergency_fired: false,
+      failure_exit_active_lane: 'none',
+      failure_exit_reason: null,
+      failure_exit_trigger_time_minutes: null,
+      failure_exit_shadow_only: false,
     };
   }
 

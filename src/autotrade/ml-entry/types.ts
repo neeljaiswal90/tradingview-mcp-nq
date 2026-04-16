@@ -26,8 +26,8 @@ export const DEFAULT_ENTRY_ML_CONFIG: EntryMlConfig = {
   mode: 'off',
   service_url: 'http://127.0.0.1:5001',
   timeout_ms: 2000,
-  min_confirmation_confidence: 0.55,
-  min_expected_r: 0.0,
+  min_confirmation_confidence: 0.58,
+  min_expected_r: 0.10,
 };
 
 // ─── Feature Vector ──────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ export interface EntryFeatureVector {
 }
 
 /** Entry feature schema version — bump when adding/removing/renaming features. Retrain required. */
-export const ENTRY_FEATURE_SCHEMA_VERSION = 'v2_htf_zones';
+export const ENTRY_FEATURE_SCHEMA_VERSION = 'entry_v3_htf_zones';
 
 // ─── Service Response ────────────────────────────────────────────────────────
 
@@ -127,10 +127,25 @@ export interface EntryMlResponse {
 export interface EntryMlDecision {
   /** Whether ML confirms the entry. */
   confirmed: boolean;
+  /** Normalized runtime outcome for diagnostics and post-trade analysis. */
+  bypass_code:
+    | 'disabled'
+    | 'insufficient_data'
+    | 'observational_only'
+    | 'model_unavailable'
+    | 'contract_mismatch'
+    | 'timeout'
+    | 'service_http_error'
+    | 'network_error'
+    | 'rank_only_advisory'
+    | 'threshold_reject'
+    | 'confirmed';
   /** Why (for logging). */
   reason: string;
   /** Raw response from service. */
   response: EntryMlResponse | null;
+  /** Exact request payload sent to the service when ML is active. */
+  request_payload: EntryFeatureVector | null;
   /** Inference latency in ms. */
   inference_ms: number;
 }

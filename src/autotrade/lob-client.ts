@@ -27,6 +27,57 @@ export interface LobHealthResult {
   uptime_sec: number;
 }
 
+/**
+ * Wire-shape mirror of python-market-data-service/lob_features/schema.py::ScalpState.
+ *
+ * All fields are optional/nullable — several microstructure signals (afi_*,
+ * hazard_*, abs_*, refill_*) are deferred to a later sidecar extension and
+ * intentionally remain None during Phase 1–3. Every consumer MUST tolerate
+ * a missing nested block and null-valued subfields.
+ *
+ * The camelCase domain object is `ScalperStateVector` in
+ * src/autotrade/features/scalper-state.ts — this wire contract stays in
+ * snake_case and never escapes the client boundary.
+ */
+export interface ScalpState {
+  // Multi-level book snapshot (k=5)
+  bid_px: number[] | null;
+  ask_px: number[] | null;
+  bid_sz: number[] | null;
+  ask_sz: number[] | null;
+  // Microprice + edge
+  microprice: number | null;
+  microprice_edge_ticks: number | null;
+  // Multi-level weighted queue imbalance
+  qi_1: number | null;
+  qi_3: number | null;
+  qi_5: number | null;
+  // Cont-style event-level OFI (raw + z-scored)
+  ofi_250ms: number | null;
+  ofi_1s: number | null;
+  ofi_3s: number | null;
+  z_ofi_250ms: number | null;
+  z_ofi_1s: number | null;
+  z_ofi_3s: number | null;
+  // Aggressive flow imbalance (deferred — Phase 1 microstructure.py remainder)
+  afi_250ms: number | null;
+  afi_1s: number | null;
+  afi_3s: number | null;
+  // Queue hazard per side (deferred)
+  hazard_bid_1s: number | null;
+  hazard_ask_1s: number | null;
+  // Absorption per side (deferred)
+  abs_bid_1s: number | null;
+  abs_ask_1s: number | null;
+  // Refill / iceberg proxy per side (deferred)
+  refill_bid_1s: number | null;
+  refill_ask_1s: number | null;
+  // Micro-volatility (1s EWMA std of mid-tick differences)
+  sigma_1s_ticks: number | null;
+  // Spread in ticks (from top-of-book)
+  spread_ticks: number | null;
+}
+
 export interface LobSnapshot {
   timestamp_ms: number;
   bbo_age_ms: number;
@@ -97,6 +148,10 @@ export interface LobSnapshot {
   // Correlation
   trade_id: string | null;
   signal_id: string | null;
+  // Scalper microstructure state (lob_mbo_scalp family only).
+  // Null when the sidecar has not requested scalp_state inclusion or when
+  // the depth book is empty at compute time. Consumers MUST tolerate null.
+  scalp_state?: ScalpState | null;
 }
 
 /** Lightweight BBO-only response from /lob/bbo — no feature computation. */
@@ -114,10 +169,15 @@ export interface LobBbo {
 }
 
 export class LobClient {
+  private contextErrorCount_ = 0;
+
   constructor(
     private readonly baseUrl: string,
     private readonly timeoutMs: number = 1000,
   ) {}
+
+  /** Number of failed context management calls (trade/signal start/end). */
+  get contextErrors(): number { return this.contextErrorCount_; }
 
   async getHealth(): Promise<LobHealthResult> {
     const res = await fetch(`${this.baseUrl}/lob/health`, {
@@ -164,7 +224,7 @@ export class LobClient {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch {
-      // Non-fatal: sidecar may not be running
+      this.contextErrorCount_++;
     }
   }
 
@@ -177,7 +237,7 @@ export class LobClient {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch {
-      // Non-fatal
+      this.contextErrorCount_++;
     }
   }
 
@@ -190,7 +250,7 @@ export class LobClient {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch {
-      // Non-fatal
+      this.contextErrorCount_++;
     }
   }
 
@@ -203,7 +263,7 @@ export class LobClient {
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch {
-      // Non-fatal
+      this.contextErrorCount_++;
     }
   }
 }

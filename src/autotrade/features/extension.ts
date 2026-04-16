@@ -10,7 +10,7 @@
  *   3. Add scoring penalties for borderline extension
  */
 
-import type { OhlcvBar, MarketSnapshot, KeyLevels } from '../types.js';
+import type { OhlcvBar, MarketSnapshot, KeyLevels, SetupType } from '../types.js';
 import { computeNormalizers, normalizeMicro, normalizeSession, DEFAULT_NORMALIZATION_CONFIG } from './normalization.js';
 import type { NormalizationConfig, NormalizationResult } from './normalization.js';
 
@@ -74,6 +74,33 @@ export interface EntryExtensionFilterConfig {
   require_reset_after_extension: boolean;
   max_consecutive_push_bars: number;
   max_last_3_bar_return_atr: number;
+  /**
+   * Absolute ceiling on current impulse — always enforced as a hard veto
+   * regardless of how permissive a session/setup override is. Protects
+   * against accidental override misconfiguration.
+   */
+  hard_extreme_max_current_impulse_atr?: number;
+  overrides?: {
+    ETH?: {
+      short?: Partial<Record<SetupType, Partial<EntryExtensionFilterOverride>>>;
+      long?: Partial<Record<SetupType, Partial<EntryExtensionFilterOverride>>>;
+    };
+    RTH?: {
+      short?: Partial<Record<SetupType, Partial<EntryExtensionFilterOverride>>>;
+      long?: Partial<Record<SetupType, Partial<EntryExtensionFilterOverride>>>;
+    };
+  };
+}
+
+export interface EntryExtensionFilterOverride {
+  max_dist_from_vwap_atr_long?: number;
+  max_dist_from_vwap_atr_short?: number;
+  max_current_impulse_atr?: number;
+  min_upside_room_atr?: number;
+  min_downside_room_atr?: number;
+  require_reset_after_extension?: boolean;
+  max_consecutive_push_bars?: number;
+  max_last_3_bar_return_atr?: number;
 }
 
 export const DEFAULT_EXTENSION_FILTER_CONFIG: EntryExtensionFilterConfig = {
@@ -86,7 +113,41 @@ export const DEFAULT_EXTENSION_FILTER_CONFIG: EntryExtensionFilterConfig = {
   require_reset_after_extension: true,
   max_consecutive_push_bars: 6,
   max_last_3_bar_return_atr: 1.5,
+  hard_extreme_max_current_impulse_atr: 4.5,
+  overrides: {},
 };
+
+/**
+ * Apply session/direction/setup overrides on top of the base extension config
+ * to produce the effective config for a single candidate. The `overrides` map
+ * lets ETH short setups (for instance) run looser impulse/push limits than the
+ * global default without affecting other sessions.
+ *
+ * The hard_extreme ceiling is always preserved from the base config — callers
+ * cannot override it away via a more permissive setup override.
+ */
+export function resolveExtensionConfig(
+  base: EntryExtensionFilterConfig,
+  session: 'ETH' | 'RTH' | null,
+  direction: 'long' | 'short',
+  setupType: string,
+): EntryExtensionFilterConfig {
+  if (!session || !base.overrides) return base;
+  const sessionOverride = base.overrides[session];
+  if (!sessionOverride) return base;
+  const directionOverrides =
+    direction === 'short' ? sessionOverride.short : sessionOverride.long;
+  if (!directionOverrides) return base;
+  const setupOverride = directionOverrides[setupType as SetupType];
+  if (!setupOverride) return base;
+  return {
+    ...base,
+    ...setupOverride,
+    // hard_extreme is never overridable — always take the base value
+    hard_extreme_max_current_impulse_atr: base.hard_extreme_max_current_impulse_atr,
+    overrides: base.overrides,
+  };
+}
 
 // ─── Veto Result ─────────────────────────────────────────────────────────────
 
@@ -259,6 +320,20 @@ export function evaluateExtensionVeto(
   const trendPullback = isTrendPullbackSetup(setupType);
   const hard: string[] = [];
   const soft: string[] = [];
+
+  // ── 0. Hard-extreme impulse ceiling ─────────────────────────────────────────
+  // Absolute upper bound enforced regardless of any session/setup override.
+  // This protects against accidental override misconfiguration allowing an
+  // obviously-late chase trade through.
+  if (
+    config.hard_extreme_max_current_impulse_atr !== undefined &&
+    features.current_impulse_atr !== null &&
+    features.current_impulse_atr > config.hard_extreme_max_current_impulse_atr
+  ) {
+    hard.push(
+      `impulse_hard_extreme:${features.current_impulse_atr.toFixed(1)}ATR>${config.hard_extreme_max_current_impulse_atr}`,
+    );
+  }
 
   // ── 1. VWAP distance ────────────────────────────────────────────────────────
   // Uses SESSION-SCALED normalization (dist_from_vwap_session) so that a

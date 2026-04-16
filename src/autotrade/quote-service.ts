@@ -104,12 +104,14 @@ export class TradingViewQuoteProvider implements QuoteProvider {
   constructor(
     private readonly timeoutMs: number,
     private readonly fetchImpl?: () => Promise<Record<string, unknown>>,
+    private readonly paneIndex?: number,
   ) {}
 
   async fetchQuote(): Promise<QuoteResult | null> {
     try {
+      const pi = this.paneIndex;
       const fetchFn = this.fetchImpl
-        ?? ((): Promise<Record<string, unknown>> => tvData.getQuote({}) as Promise<Record<string, unknown>>);
+        ?? ((): Promise<Record<string, unknown>> => tvData.getQuote({ paneIndex: pi }) as Promise<Record<string, unknown>>);
 
       const raw = await Promise.race([
         fetchFn(),
@@ -165,6 +167,18 @@ export class QuoteService {
     this.providers.push(provider);
     this.providers.sort((a, b) => a.priority - b.priority);
     console.log(`[QUOTE] Provider registered: ${provider.name} (priority=${provider.priority})`);
+  }
+
+  /**
+   * Set pane index on the TradingView provider after construction.
+   * Used when pane discovery happens later in the startup sequence.
+   */
+  setPaneIndex(paneIndex: number): void {
+    for (const p of this.providers) {
+      if (p instanceof TradingViewQuoteProvider) {
+        (p as any).paneIndex = paneIndex;
+      }
+    }
   }
 
   /**

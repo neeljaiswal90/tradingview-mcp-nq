@@ -121,7 +121,6 @@ export function evaluateMlGate(
       minConfidence = config.min_confidence_exit;
       break;
     case 'EXIT_PARTIAL':
-    case 'SCALE_OUT':
       minConfidence = config.min_confidence_partial;
       break;
     case 'MOVE_STOP':
@@ -182,7 +181,7 @@ export function evaluateMlGate(
 
   // ── Gate 8b: Minimum hold time before REDUCE ──────────────────────
   if (
-    (action === 'EXIT_PARTIAL' || action === 'SCALE_OUT') &&
+    (action === 'EXIT_PARTIAL') &&
     config.min_hold_seconds_before_ml_reduce > 0 &&
     position
   ) {

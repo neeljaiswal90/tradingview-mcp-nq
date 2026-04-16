@@ -5,8 +5,10 @@
  * rest of the autotrade stack can reason in ticks, points, dollars, and
  * integer contract counts instead of leaking BTC/spot assumptions.
  *
- * Currently supports NQ (E-mini Nasdaq-100) and MNQ (Micro E-mini Nasdaq-100).
- * Extendable to ES / MES / RTY / MRTY / YM / MYM if needed.
+ * Live trading: MNQ (Micro E-mini Nasdaq-100), MES (Micro E-mini S&P 500).
+ * Historical / replay only: NQ, ES — retained in the registry so replay,
+ * backtest, and log-parsing tools keep working, but gated off live routing
+ * via `live_trading_allowed: false`.
  */
 
 export type ContractRoot = 'NQ' | 'MNQ' | 'ES' | 'MES';
@@ -32,6 +34,28 @@ export interface ContractSpec {
   price_decimals: number;
   /** Whether this contract is a "micro" (1/10) product. */
   is_micro: boolean;
+  /**
+   * Round-trip fees in USD (commission + exchange). Consumed by the
+   * Phase 6 expectancy engine via `c_R = (fees + slippage) / stopPts`
+   * per plan §3.1/§10-11. Null means "unknown, fail closed" and the
+   * expectancy engine emits `rejected_by_missing_cost_config`. Phase 7
+   * moves these defaults into env.ts.
+   */
+  fees_per_round_trip_usd?: number | null;
+  /**
+   * Conservative slippage estimate in POINTS for each side of the
+   * trade (round-trip total = 2 × this). Null means "unknown, fail
+   * closed".
+   */
+  slippage_pts_per_side?: number | null;
+  /**
+   * Whether the entry gate is allowed to submit orders on this contract
+   * in paper/live mode. Historical/replay contracts (NQ, ES) are kept in
+   * the registry for log parsing and backtests but set to `false` so
+   * risk.ts and the runner refuse to submit live orders against them.
+   * Defaults to `false` if omitted — safest possible default.
+   */
+  live_trading_allowed?: boolean;
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -48,6 +72,14 @@ const SPECS: Record<string, ContractSpec> = {
     tick_value: 5.0, // 20 * 0.25
     price_decimals: 2,
     is_micro: false,
+    // Phase 6 cost defaults (plan §3.1). Phase 7 moves these to env.ts.
+    // NQ: ~$4.50 round-trip broker commission; 0.5 pts slippage per side
+    // is a conservative estimate matching the fill-model slippage already
+    // applied elsewhere in the runner.
+    fees_per_round_trip_usd: 4.5,
+    slippage_pts_per_side: 0.5,
+    // Historical / replay only — live routing disabled after NQ→MNQ migration.
+    live_trading_allowed: false,
   },
   MNQ: {
     root: 'MNQ',
@@ -60,6 +92,12 @@ const SPECS: Record<string, ContractSpec> = {
     tick_value: 0.5, // 2 * 0.25
     price_decimals: 2,
     is_micro: true,
+    fees_per_round_trip_usd: 1.5,
+    // Raised from 0.5 → 0.75 as the Phase 1 sizing-engine slippage buffer
+    // for micros. Top-of-book on MNQ can be thinner than on NQ so a slightly
+    // wider buffer is appropriate when computing realistic per-contract risk.
+    slippage_pts_per_side: 0.75,
+    live_trading_allowed: true,
   },
   ES: {
     root: 'ES',
@@ -72,6 +110,10 @@ const SPECS: Record<string, ContractSpec> = {
     tick_value: 12.5,
     price_decimals: 2,
     is_micro: false,
+    fees_per_round_trip_usd: 4.5,
+    slippage_pts_per_side: 0.5,
+    // Historical / replay only — live routing disabled after ES→MES migration.
+    live_trading_allowed: false,
   },
   MES: {
     root: 'MES',
@@ -84,6 +126,9 @@ const SPECS: Record<string, ContractSpec> = {
     tick_value: 1.25,
     price_decimals: 2,
     is_micro: true,
+    fees_per_round_trip_usd: 1.5,
+    slippage_pts_per_side: 0.75,
+    live_trading_allowed: true,
   },
 };
 
@@ -121,8 +166,33 @@ export function tryGetContractSpec(symbol: string): ContractSpec | null {
   }
 }
 
-export function listSupportedRoots(): ContractRoot[] {
-  return Object.keys(SPECS) as ContractRoot[];
+/**
+ * List supported contract roots.
+ *
+ * @param opts.liveOnly - When true, return only roots where
+ *                       `live_trading_allowed === true`. Used by the entry
+ *                       gate and runner startup. Default false (used by
+ *                       replay/backtest tools that legitimately need NQ/ES).
+ */
+export function listSupportedRoots(opts: { liveOnly?: boolean } = {}): ContractRoot[] {
+  const all = Object.keys(SPECS) as ContractRoot[];
+  if (!opts.liveOnly) return all;
+  return all.filter(r => SPECS[r]?.live_trading_allowed === true);
+}
+
+/**
+ * Throws if the given contract is not allowed for live/paper trading.
+ * Called from the runner startup path and the entry gate.
+ */
+export function assertLiveTradingAllowed(contract: ContractSpec): void {
+  if (contract.live_trading_allowed !== true) {
+    throw new Error(
+      `Contract ${contract.root} (${contract.app_symbol}) is not allowed ` +
+      `for live or paper trading (live_trading_allowed=${contract.live_trading_allowed}). ` +
+      `This contract is retained for replay/backtest only. ` +
+      `Set SYMBOL to a live-enabled contract (e.g., MNQ1!, MES1!).`,
+    );
+  }
 }
 
 // ─── Tick / Point Math ───────────────────────────────────────────────────────
