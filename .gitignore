@@ -6,6 +6,7 @@ node_modules/.vite/
 *.tsbuildinfo
 dashboard/tsconfig.tsbuildinfo
 artifacts/
+build-info.json
 
 .env
 .mcp.json

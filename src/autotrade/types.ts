@@ -1990,10 +1990,25 @@ export interface IndicatorConfig {
    * expectancy bucket rules, LOB degradation thresholds, orderflow
    * windows). When absent, `DEFAULT_QUANT_ENTRY_CONFIG` is used — which
    * disables all Phase 7 new-telemetry paths AND leaves every Phase 1-6
-   * code constant at its current value, so the system remains a pure
-   * no-op relative to the post-Phase-6 baseline.
-   */
+  * code constant at its current value, so the system remains a pure
+  * no-op relative to the post-Phase-6 baseline.
+  */
   quant_entry?: import('./features/quant-entry-config.js').QuantEntryConfig;
+  /**
+   * Multi-instrument orchestration config. Explicitly separates supported
+   * instruments, live-enabled policy, and per-instrument runtime wiring.
+   */
+  multi_instrument?: import('./instrument-config.js').MultiInstrumentConfig;
+  /**
+   * Deprecated compatibility alias for one integration cycle.
+   * Replaced by multi_instrument.enabled.
+   */
+  runner_v2_enabled?: boolean;
+  /**
+   * Deprecated compatibility alias for one integration cycle.
+   * Replaced by explicit per-instrument role='shadow'.
+   */
+  runner_v2_shadow_only?: boolean;
   // ── V2 Multi-Lane Engine ─────────────────────────────────────────────────
   /** Canonical runtime control: 'shadow' | 'paper' | 'live'. Default: 'paper'. */
   execution_mode?: 'shadow' | 'paper' | 'live';

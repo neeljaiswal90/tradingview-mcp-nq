@@ -41,6 +41,7 @@ except ImportError:
 
 @dataclass
 class ShadowRecord:
+    source: str
     direction: str
     setup_type: str
     old_score: float
@@ -83,6 +84,7 @@ def parse_shadow_line(line: str) -> Optional[ShadowRecord]:
     if not m:
         return None
     return ShadowRecord(
+        source='legacy_console',
         direction=m.group(1).lower(),
         setup_type=m.group(2),
         old_score=float(m.group(3)),
@@ -102,19 +104,97 @@ def parse_shadow_line(line: str) -> Optional[ShadowRecord]:
     )
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _derive_setup_family(strategy_id: str) -> str:
+    if strategy_id.startswith('trend_pullback'):
+        return 'trend_pullback'
+    if strategy_id.startswith('opening_drive'):
+        return 'opening_drive'
+    if strategy_id.startswith('failed_or_break'):
+        return 'failed_or_break'
+    if strategy_id.startswith('or_retest'):
+        return 'or_retest'
+    if strategy_id.startswith('lob_mbo_scalp'):
+        return 'lob_mbo_scalp'
+    return strategy_id
+
+
+def parse_candidate_score_row(payload: dict) -> Optional[ShadowRecord]:
+    layered_shadow_score = payload.get('layered_shadow_score')
+    if layered_shadow_score is None:
+        return None
+
+    setup_type = str(payload.get('strategy_id') or payload.get('setup_type') or 'unknown')
+    direction = str(payload.get('direction') or 'none').lower()
+    score_v2_components = payload.get('score_v2_components')
+    flow_component = None
+    if isinstance(score_v2_components, dict):
+        flow_component = score_v2_components.get('cluster.flow')
+
+    return ShadowRecord(
+        source='candidate_scores_v2',
+        direction=direction,
+        setup_type=setup_type,
+        old_score=_safe_float(payload.get('raw_flat_score')),
+        new_rank=_safe_float(layered_shadow_score),
+        structure=_safe_float(payload.get('structure_score')),
+        flow=_safe_float(flow_component, _safe_float(payload.get('timing_score'))),
+        flow_quality='jsonl',
+        lagging=_safe_float(payload.get('payoff_score')),
+        setup_family=_derive_setup_family(setup_type),
+        structure_weight=0.0,
+        flow_weight=0.0,
+        missing_flow=flow_component in (None, 0, 0.0),
+        flow_features=[],
+        flow_degradation=[],
+        hard_valid_old=bool(payload.get('hard_gate_pass', True)),
+        hard_valid_new=bool(payload.get('hard_gate_pass', True)),
+    )
+
+
 def read_records(path: str) -> list[ShadowRecord]:
-    records = []
     target = Path(path)
-    files = []
+    candidate_files = []
+    fallback_files = []
     if target.is_dir():
-        files = sorted(target.glob('**/*.log')) + sorted(target.glob('**/*.jsonl'))
+        candidate_files = sorted(target.glob('**/candidate_scores_v2.jsonl'))
+        fallback_files = sorted(target.glob('**/*.log')) + sorted(target.glob('**/*.jsonl'))
     elif target.is_file():
-        files = [target]
+        if target.name == 'candidate_scores_v2.jsonl':
+          candidate_files = [target]
+        fallback_files = [target]
     else:
         print(f"Path not found: {path}", file=sys.stderr)
-        return records
+        return []
 
-    for f in files:
+    jsonl_records = []
+    for f in candidate_files:
+        with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rec = parse_candidate_score_row(payload)
+                if rec:
+                    jsonl_records.append(rec)
+
+    if jsonl_records:
+        return jsonl_records
+
+    records = []
+    for f in fallback_files:
         with open(f, 'r', encoding='utf-8', errors='replace') as fh:
             for line in fh:
                 rec = parse_shadow_line(line)
@@ -246,6 +326,7 @@ def main():
     valid_audit = compute_audit(valid_records, "hard_valid_only")
 
     report = {
+        'source': records[0].source if records else None,
         'total_records': len(records),
         'all_candidates': all_audit,
         'hard_valid_only': valid_audit,

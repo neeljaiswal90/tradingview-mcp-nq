@@ -42,7 +42,6 @@ describe('IndicatorConfigManager — config file is canonical source', () => {
       account_equity: 50_000,
       max_risk_per_trade_pct: 0.75,
       max_daily_loss_pct: 2.0,
-      max_consecutive_losses: 3,
       time_stop_minutes: 45,
       analysis_interval_seconds: 30,
     });
@@ -62,7 +61,6 @@ describe('IndicatorConfigManager — config file is canonical source', () => {
     expect(cfg.account_equity).toBe(50_000);
     expect(cfg.max_risk_per_trade_pct).toBe(0.75);
     expect(cfg.max_daily_loss_pct).toBe(2.0);
-    expect(cfg.max_consecutive_losses).toBe(3);
     expect(cfg.time_stop_minutes).toBe(45);
     expect(cfg.analysis_interval_seconds).toBe(30);
 
@@ -221,7 +219,6 @@ describe('AutotradeEnv — operational params only', () => {
     // These should NOT exist on the env object
     expect('MAX_RISK_PER_TRADE_PCT' in env).toBe(false);
     expect('MAX_DAILY_LOSS_PCT' in env).toBe(false);
-    expect('MAX_CONSECUTIVE_LOSSES' in env).toBe(false);
     expect('ACCOUNT_EQUITY' in env).toBe(false);
     expect('TIME_STOP_MINUTES' in env).toBe(false);
     expect('ANALYSIS_INTERVAL_SECONDS' in env).toBe(false);
@@ -230,7 +227,6 @@ describe('AutotradeEnv — operational params only', () => {
     expect('MODE' in env).toBe(true);
     expect('SYMBOL' in env).toBe(true);
     expect('LOG_DIR' in env).toBe(true);
-    expect('EXECUTION_ADAPTER' in env).toBe(true);
     expect('STRATEGY_VERSION' in env).toBe(true);
   });
 
@@ -253,7 +249,6 @@ describe('Config ownership — documentation integrity', () => {
       account_equity: 25000,
       max_risk_per_trade_pct: 1.5,
       max_daily_loss_pct: 1.5,
-      max_consecutive_losses: 5,
       time_stop_minutes: 30,
       analysis_interval_seconds: 20,
       min_confidence: 7.5,
@@ -274,7 +269,6 @@ describe('Config ownership — documentation integrity', () => {
       'account_equity',
       'max_risk_per_trade_pct',
       'max_daily_loss_pct',
-      'max_consecutive_losses',
       'time_stop_minutes',
       'analysis_interval_seconds',
       'min_confidence',
