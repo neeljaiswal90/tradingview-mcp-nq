@@ -12,7 +12,7 @@
   "max_confidence": 10,
   "min_rr": 2,
   "max_risk_per_trade_pct": 1.5,
-  "max_daily_loss_pct": 4,
+  "max_daily_loss_pct": 1,
   "account_equity": 25000,
   "time_stop_minutes": 30,
   "time_stop_max_r_pre_t1": 0.25,
@@ -210,6 +210,53 @@
       "time_stop_minutes": 30,
       "time_stop_max_r_pre_t1": 0.25,
       "time_stop_max_r_post_t1": 1.0
+    },
+    "lob_mbo_scalp": {
+      "name": "lob_mbo_scalp",
+      "family": "lob_mbo_scalp",
+      "_note": "Scalper profile — time_stop_minutes is INERT for this family. position-manager.ts early-returns and delegates all time exits to ScalperExitEngine. Only scalper_hard_cap_seconds, time_stop_seconds, scalper_no_progress_seconds, and the micro-stop tick range drive exit decisions.",
+      "pt1_offset_atr": 0,
+      "pt2_offset_atr": 0,
+      "pt1_offset_pts_fallback": 0,
+      "pt2_offset_pts_fallback": 0,
+      "pt1_exit_fraction": 0,
+      "pt2_exit_fraction": 0,
+      "pt1_move_to_be": false,
+      "pt1_activate_trailing": false,
+      "trail_atr_post_t1": 0,
+      "trail_ticks_post_t1_fallback": 0,
+      "breakeven_trigger_r": 0,
+      "pre_t1_trail_trigger_r": 0,
+      "pre_t1_trail_atr": 0,
+      "pre_t1_trail_ticks_fallback": 0,
+      "time_stop_minutes": 0,
+      "time_stop_max_r_pre_t1": 0,
+      "time_stop_max_r_post_t1": 0,
+      "time_stop_seconds": 10,
+      "scalper_hard_cap_seconds": 5,
+      "scalper_no_progress_seconds": 2,
+      "scalper_micro_stop_min_ticks": 2,
+      "scalper_micro_stop_max_ticks": 6
+    }
+  },
+  "lob_mbo_scalp": {
+    "_note": "Phase 5/6 scalper shadow decision thresholds. Read by the runner and plumbed into every scalper generator call. Phase 5 refuses to run with implicit defaults — every field here is consumed by shouldAllowScalperEntry's config snapshot and logged verbatim on every shadow decision row.",
+    "theta_p": 0.55,
+    "ev_floor_ticks": 0.5,
+    "min_bucket_samples": 30,
+    "round_turn_cost_ticks": 0.5,
+    "hybrid_gate": false,
+    "rejection_sample_rate": 1,
+    "expectancy_bucket_table_path": "reports/ml/lob_mbo_scalp/expectancy_buckets.json",
+    "gate_thresholds": {
+      "_note": "Phase 2 deterministic gate thresholds. Tuned for MNQ (Micro E-mini Nasdaq-100) which routinely trades 1-3 tick spreads. For the parent NQ contract, set spreadMaxTicks: 1.",
+      "spreadMaxTicks": 2,
+      "qiMin": 0.15,
+      "edgeMinTicks": 0.10,
+      "zOfiFastMin": 0.5,
+      "zOfiSlowMin": 0.25,
+      "absorptionMin": 0.55,
+      "hazardDiffMin": 0.10
     }
   },
   "entry_extension_filters": {
@@ -241,7 +288,9 @@
     }
   },
   "ml_management": {
+    "_note_broker_execution_enabled": "ML-management lane only (not entry, not rules/hard-risk exits). Omit or true for legacy.",
     "enabled": true,
+    "broker_execution_enabled": true,
     "service_url": "http://127.0.0.1:5001",
     "timeout_ms": 3000,
     "model_type": "catboost",
@@ -272,6 +321,18 @@
     "exclude_rows_after_any_ml_action": true,
     "exclude_rows_with_future_ml_exit": false,
     "decision_stride_seconds": 2
+  },
+  "ml_policy": {
+    "_canary_guardrails": "Tiny executable canary: EXIT_ALL only, per-trade cohort, 1% sample. Rollback by setting mode=ml_shadow and execution_enabled=false.",
+    "mode": "ml_canary_execute",
+    "inference_enabled": true,
+    "execution_enabled": true,
+    "allow_actions": ["EXIT_ALL"],
+    "canary_percent": 1,
+    "model_pointer": "promoted",
+    "fallback_policy": "rules_only",
+    "readiness_max_age_hours": 24,
+    "promotion_max_lag_without_waiver_hours": 168
   },
   "entry_ml": {
     "mode": "off",
@@ -455,7 +516,51 @@
     "stop_widening_allowed": false,
     "stale_input_policy": "hold_prior_target"
   },
-  "runner_v2_enabled": true,
+  "multi_instrument": {
+    "enabled": false,
+    "default_pair": ["MNQ", "MES"],
+    "live_enabled_instruments": ["MNQ", "MES"],
+    "supported_instruments": ["MNQ", "MES", "NQ", "ES"],
+    "max_simultaneous_positions": 2,
+    "max_total_risk_pct": 3.0,
+    "correlated_exposure_policy": "best_signal_only",
+    "global_kill_switch": false,
+    "instruments": {
+      "MNQ": {
+        "enabled": true,
+        "role": "active",
+        "log_dir": "logs-mnq",
+        "lob_url": "http://127.0.0.1:5010",
+        "dashboard_port": 3900,
+        "pane_index": 0
+      },
+      "MES": {
+        "enabled": true,
+        "role": "shadow",
+        "log_dir": "logs-mes",
+        "lob_url": "http://127.0.0.1:5011",
+        "dashboard_port": 3901,
+        "pane_index": 1
+      },
+      "NQ": {
+        "enabled": false,
+        "role": "shadow",
+        "log_dir": "logs-nq",
+        "lob_url": "http://127.0.0.1:5020",
+        "dashboard_port": 3910,
+        "pane_index": 0
+      },
+      "ES": {
+        "enabled": false,
+        "role": "shadow",
+        "log_dir": "logs-es",
+        "lob_url": "http://127.0.0.1:5021",
+        "dashboard_port": 3911,
+        "pane_index": 1
+      }
+    }
+  },
+  "runner_v2_enabled": false,
   "execution_mode": "paper",
   "runner_v2_shadow_only": false,
   "lane_timing": {

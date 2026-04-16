@@ -26,10 +26,12 @@ const ML_FEATURE_SCHEMA_VERSION = 'v3_advanced_mbo';
 import * as tvHealth from '../core/tradingview/health.js';
 import * as tvChart from '../core/tradingview/chart.js';
 import * as tvPane from '../core/tradingview/pane.js';
+import { tvUiLock } from '../core/tradingview/tv-ui-lock.js';
 import { QuoteService, BookmapQuoteProvider } from './quote-service.js';
 import { LobClient } from './lob-client.js';
 
 import { loadEnv, printEnv } from './env.js';
+import type { AutotradeEnv } from './env.js';
 import { DataCollector } from './data-collector.js';
 import { generateSignal, getStrategyDefinition, getStrategyEffectiveStatus, STRATEGY_REGISTRY } from './strategy.js';
 import { buildRegistrySnapshot } from './strategy-registry.js';
@@ -69,6 +71,13 @@ import { createLaneSharedState } from './lane-state.js';
 import type { LaneSharedState } from './lane-state.js';
 import { EnginePhaseManager } from './engine-phase.js';
 import { getContractSpec, tryGetContractSpec, assertLiveTradingAllowed } from './contracts.js';
+import { MultiInstrumentOrchestrator } from './multi-instrument-orchestrator.js';
+import { resolveRunnerLaunchMode } from './runner-launch.js';
+import {
+  normalizeExecutionMode,
+  shouldAllowExecutionSideEffects,
+  shouldRequireStrictSymbolArtifacts,
+} from './execution-mode.js';
 import { EventCalendar } from './events.js';
 import { classifySession } from './session.js';
 import { DashboardStateManager, DashboardServer } from './dashboard/index.js';
@@ -182,7 +191,105 @@ async function discoverPaneIndex(contractRoot: string): Promise<number | undefin
   return match.index;
 }
 
-async function ensureChartSetup(tvSymbol: string, contractRoot: string): Promise<number | undefined> {
+function resolveConfiguredPaneIndex(): number | undefined {
+  const raw = process.env['TV_PANE_INDEX']?.trim();
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `[STARTUP] Invalid TV_PANE_INDEX="${raw}". Expected a non-negative integer.`,
+    );
+  }
+  return parsed;
+}
+
+async function resolveStartupPaneIndex(
+  contractRoot: string,
+  configuredPaneIndex: number | undefined,
+  chartCount: number,
+): Promise<number | undefined> {
+  if (chartCount <= 1) {
+    return undefined;
+  }
+
+  if (configuredPaneIndex != null) {
+    if (configuredPaneIndex >= chartCount) {
+      throw new Error(
+        `[STARTUP] Configured pane ${configuredPaneIndex} is out of range for ${chartCount}-pane layout.`,
+      );
+    }
+    console.log(
+      `[STARTUP] Multi-pane layout detected (${chartCount} panes). ` +
+      `Assigned pane ${configuredPaneIndex} for ${contractRoot} via TV_PANE_INDEX.`,
+    );
+    return configuredPaneIndex;
+  }
+
+  return discoverPaneIndex(contractRoot);
+}
+
+async function ensureChartSetup(
+  tvSymbol: string,
+  contractRoot: string,
+  configuredPaneIndex?: number,
+): Promise<number | undefined> {
+  const paneState = await tvPane.list() as {
+    chart_count: number;
+    panes: Array<{ index: number; symbol?: string; error?: string }>;
+  };
+
+  if (paneState.chart_count > 1) {
+    const paneIndex = await resolveStartupPaneIndex(
+      contractRoot,
+      configuredPaneIndex,
+      paneState.chart_count,
+    );
+    if (paneIndex == null) {
+      return undefined;
+    }
+
+    await tvUiLock.runExclusive(async () => {
+      await tvPane.focus({ index: paneIndex });
+      await sleep(200);
+
+      const refreshedPaneState = await tvPane.list() as {
+        panes: Array<{ index: number; symbol?: string; error?: string }>;
+      };
+      const matchedPane = refreshedPaneState.panes.find(p => p.index === paneIndex);
+      const currentPaneSymbol = (matchedPane?.symbol ?? '').toUpperCase();
+
+      if (!currentPaneSymbol.includes(contractRoot.toUpperCase())) {
+        console.log(`[STARTUP] Switching pane ${paneIndex} symbol to ${tvSymbol}...`);
+        await tvPane.setSymbol({ index: paneIndex, symbol: tvSymbol });
+        await sleep(500);
+      }
+
+      await tvChart.setType({ chart_type: '1' });
+      await tvChart.setTimeframe({ timeframe: '1' });
+      await sleep(300);
+      console.log(`[STARTUP] Chart configured: ${tvSymbol} / 1m / Candles (pane ${paneIndex})`);
+
+      try {
+        const state = await tvChart.getState() as Record<string, unknown>;
+        const indicators = JSON.stringify(state).toLowerCase();
+        if (!indicators.includes('average true range')) {
+          console.log(`[STARTUP] Adding ATR(14) indicator to pane ${paneIndex}...`);
+          await tvChart.manageIndicator({ action: 'add', indicator: 'Average True Range' });
+          await sleep(300);
+        }
+        if (!indicators.includes('relative strength index')) {
+          console.log(`[STARTUP] Adding RSI(14) indicator to pane ${paneIndex}...`);
+          await tvChart.manageIndicator({ action: 'add', indicator: 'Relative Strength Index' });
+          await sleep(300);
+        }
+      } catch (err) {
+        console.warn('[STARTUP] Could not auto-add indicators (non-fatal):', err);
+      }
+    });
+
+    return paneIndex;
+  }
+
   const health = await tvHealth.healthCheck() as Record<string, unknown>;
   const currentSymbol = (health['chart_symbol'] as string | undefined) ?? '';
 
@@ -192,10 +299,10 @@ async function ensureChartSetup(tvSymbol: string, contractRoot: string): Promise
     await sleep(500);
   }
 
-  await tvChart.setType({ chart_type: '1' }); // candles
-  await tvChart.setTimeframe({ timeframe: '1' }); // 1m
+  await tvChart.setType({ chart_type: '1' });
+  await tvChart.setTimeframe({ timeframe: '1' });
   await sleep(300);
-  console.log(`[STARTUP] ✅ Chart configured: ${tvSymbol} / 1m / Candles`);
+  console.log(`[STARTUP] Chart configured: ${tvSymbol} / 1m / Candles`);
 
   try {
     const state = await tvChart.getState() as Record<string, unknown>;
@@ -211,12 +318,10 @@ async function ensureChartSetup(tvSymbol: string, contractRoot: string): Promise
       await sleep(300);
     }
   } catch (err) {
-    console.warn('[STARTUP] ⚠️ Could not auto-add indicators (non-fatal):', err);
+    console.warn('[STARTUP] Could not auto-add indicators (non-fatal):', err);
   }
 
-  // ── Multi-pane discovery ─────────────────────────────────────────────
-  const paneIndex = await discoverPaneIndex(contractRoot);
-  return paneIndex;
+  return undefined;
 }
 
 async function quickHealthCheck(): Promise<boolean> {
@@ -274,9 +379,20 @@ function printCycleSummary(opts: {
   );
 }
 
-async function main(): Promise<void> {
+function resolveConfigDir(): string {
+  const configured = process.env['AUTOTRADE_CONFIG_DIR']?.trim();
+  return configured && configured.length > 0 ? configured : './config';
+}
+
+interface LegacyRunnerOptions {
+  env?: AutotradeEnv;
+  configDir?: string;
+}
+
+async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}): Promise<void> {
   const runnerProcessStartMs = Date.now();
-  const env = loadEnv();
+  const env = options.env ?? loadEnv();
+  const configDir = options.configDir ?? resolveConfigDir();
   printEnv(env);
 
   const contract = getContractSpec(env.SYMBOL);
@@ -304,6 +420,9 @@ async function main(): Promise<void> {
   const sessionId = `SESSION_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${randomUUID().slice(0, 8)}`;
 
   // ── Phase 0: Lock + Recovery Gate (before any other disk writes) ──────────
+  if (!existsSync(env.LOG_DIR)) {
+    mkdirSync(env.LOG_DIR, { recursive: true });
+  }
   const runtimeState = new RuntimeStateManager(env.LOG_DIR, {
     heartbeatIntervalMs: env.RUNTIME_HEARTBEAT_INTERVAL_MS,
     heartbeatStaleMs: env.RUNTIME_HEARTBEAT_STALE_MS,
@@ -321,7 +440,7 @@ async function main(): Promise<void> {
   // Read cycle-stall threshold early (before full config manager init) for recovery.
   let earlyBootCycleStallMs: number | null = null;
   try {
-    const rawCfg = JSON.parse(readFileSync('./config/indicator-config.json', 'utf-8'));
+    const rawCfg = JSON.parse(readFileSync(join(configDir, 'indicator-config.json'), 'utf-8'));
     earlyBootCycleStallMs = typeof rawCfg.cycle_stall_threshold_ms === 'number'
       ? rawCfg.cycle_stall_threshold_ms : null;
   } catch { /* use null — cycle stall detection disabled if config unreadable */ }
@@ -398,7 +517,7 @@ async function main(): Promise<void> {
   // 60s periodic session checkpoint — writes live session totals to sessions.jsonl
   // and performance.json so operators can monitor without waiting for shutdown.
   let perfCheckpointTimer: ReturnType<typeof setInterval> | null = null;
-  const configManager = new IndicatorConfigManager('./config');
+  const configManager = new IndicatorConfigManager(configDir);
 
   // Validate and print the canonical trading config.
   // All strategy/risk params come from indicator-config.json — env vars are
@@ -586,8 +705,15 @@ async function main(): Promise<void> {
   }
 
   // ─── Canonical execution_mode normalization ────────────────────────────────
-  const executionMode: 'shadow' | 'paper' | 'live' =
-    effectiveConfig.execution_mode ?? 'paper';
+  const executionMode = normalizeExecutionMode(effectiveConfig);
+  const executionSideEffectsAllowed = shouldAllowExecutionSideEffects(executionMode);
+
+  if (!executionSideEffectsAllowed) {
+    console.log(
+      '[EXECUTION-GATE] execution_mode=shadow -> execution intents, order placement, ' +
+      'and position mutation are disabled for this runner.',
+    );
+  }
 
   const resolvedMlPolicy = resolveMlPolicy(effectiveConfig, executionMode);
 
@@ -768,7 +894,7 @@ async function main(): Promise<void> {
   // diagnostics). paper and live MUST have symbol-scoped artifacts — the
   // runner refuses to start otherwise. This is stricter than the previous
   // behavior, which only warned.
-  const requireStrictArtifacts = env.MODE === 'paper' || env.MODE === 'live';
+  const requireStrictArtifacts = shouldRequireStrictSymbolArtifacts(env.MODE, executionMode);
   if (requireStrictArtifacts) {
     const requiredBucketPath = `data/expectancy_bucket_table_${contract.root}.json`;
     const requiredCurvesPath = `./config/failure_exit_curves_${contract.root}.json`;
@@ -958,7 +1084,7 @@ async function main(): Promise<void> {
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
   perfCheckpointTimer = setInterval(() => perfTracker.checkpointSession(), 60_000);
   perfCheckpointTimer.unref(); // Don't keep process alive for checkpoint
-  const events = EventCalendar.load('./config');
+  const events = EventCalendar.load(configDir);
   console.log(`[STARTUP] Loaded event calendar: ${events.size()} events`);
 
   // ── Artifact execution eligibility policy ──────────────────────────
@@ -1098,12 +1224,18 @@ async function main(): Promise<void> {
   await verifyConnection();
   dashboardState.setConnectionStatus('connected');
   dashboardState.setEngineRunning(true);
-  const discoveredPaneIndex = await ensureChartSetup(contract.tv_symbol, contract.root);
+  const configuredPaneIndex = resolveConfiguredPaneIndex();
+  const discoveredPaneIndex = await ensureChartSetup(
+    contract.tv_symbol,
+    contract.root,
+    configuredPaneIndex,
+  );
   if (discoveredPaneIndex != null) {
     console.log(`[STARTUP] Using pane index ${discoveredPaneIndex} for all data reads.`);
     dataCollector.paneIndex = discoveredPaneIndex;
     dataCollector.expectedRoot = contract.root;
-    dataCollector.onPaneMismatch = () => discoverPaneIndex(contract.root);
+    dataCollector.onPaneMismatch = () =>
+      ensureChartSetup(contract.tv_symbol, contract.root, configuredPaneIndex);
     quoteService.setPaneIndex(discoveredPaneIndex);
   }
 
@@ -2113,8 +2245,28 @@ async function main(): Promise<void> {
               (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') +
               `target_sizing_zero: ${sizing.reason}`;
             signal.no_trade = true;
-            console.log(`[RUNNER] 🚫 Target-position sizing produced 0 contracts — ${sizing.reason}`);
+            console.log(`[RUNNER] ?? Target-position sizing produced 0 contracts ? ${sizing.reason}`);
             phaseManager.transitionTo('FLAT', 'target_sizing_zero');
+          } else {
+          if (!executionSideEffectsAllowed) {
+            signal.reason_for_skip =
+              (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') +
+              'execution_mode_shadow';
+            signal.no_trade = true;
+            console.log(
+              `[EXECUTION-GATE] Shadow mode suppressed entry side effects for ` +
+              `${bestSetup.direction} ${bestSetup.setup_type}.`,
+            );
+            logWriter.writeCandidateSignal({
+              _event: 'execution_blocked_shadow',
+              candidate_id: signalId,
+              timestamp: new Date().toISOString(),
+              direction: bestSetup.direction,
+              setup_type: bestSetup.setup_type,
+              reason: 'execution_mode_shadow',
+              actually_executed: false,
+            });
+            phaseManager.transitionTo('FLAT', 'execution_mode_shadow');
           } else {
 
           const _entryTradeId = `TRADE_${sessionId}_${String(totalSignals).padStart(4, '0')}`;
@@ -2246,6 +2398,7 @@ async function main(): Promise<void> {
           }
           recentEventLog.push(`trade_opened:${tradeId}:${bestSetup.direction}:${bestSetup.setup_type}`);
           } // end if (_sizingApproved)
+          } // end executionSideEffectsAllowed
         } catch (entryErr) {
           console.error(`[RUNNER] ❌ Entry failed, reverting to FLAT:`, entryErr);
           phaseManager.transitionTo('FLAT', `entry_failed:${entryErr}`);
@@ -3687,6 +3840,56 @@ async function main(): Promise<void> {
   // Normal shutdown: scheduler's SIGINT/SIGTERM handler stops the loop,
   // then control falls through to gracefulShutdown here.
   await gracefulShutdown('user_stopped');
+}
+
+async function main(): Promise<void> {
+  const env = loadEnv();
+  const configDir = resolveConfigDir();
+  const configManager = new IndicatorConfigManager(configDir);
+  const launch = resolveRunnerLaunchMode(configManager.getConfig(), process.env);
+
+  for (const warning of launch.warnings) {
+    console.warn(warning);
+  }
+
+  if (launch.mode === 'legacy') {
+    await runLegacySingleInstrumentRunner({ env, configDir });
+    return;
+  }
+
+  const orchestrator = new MultiInstrumentOrchestrator({
+    baseConfig: configManager.getConfig(),
+    multiConfig: launch.multiConfig,
+    env,
+    configDir,
+  });
+
+  let shutdownStarted = false;
+  const shutdown = async (reason: string): Promise<void> => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    await orchestrator.shutdown(reason);
+  };
+
+  const onSigint = (): void => {
+    void shutdown('sigint');
+  };
+  const onSigterm = (): void => {
+    void shutdown('sigterm');
+  };
+
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
+
+  try {
+    await orchestrator.initialize();
+    await orchestrator.connectAndVerify();
+    await orchestrator.run();
+  } finally {
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+    await shutdown('orchestrator_complete');
+  }
 }
 
 /** Classify the data quality tier based on feature availability. */

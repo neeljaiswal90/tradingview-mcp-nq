@@ -9,6 +9,7 @@ import { join } from 'path';
 import type { IndicatorConfig, IndicatorChangeRecord } from './types.js';
 import type { LogWriter } from './log-writer.js';
 import { DEFAULT_POSITION_TARGET_CONFIG } from './target-position.js';
+import { DEFAULT_MULTI_INSTRUMENT_CONFIG } from './instrument-config.js';
 
 /**
  * DEFAULT_CONFIG must stay in sync with config/indicator-config.json.
@@ -110,6 +111,9 @@ const DEFAULT_CONFIG: IndicatorConfig = {
     score_bonus_reclaimed_support: 0.5,
   },
   position_target: DEFAULT_POSITION_TARGET_CONFIG,
+  multi_instrument: DEFAULT_MULTI_INSTRUMENT_CONFIG,
+  runner_v2_enabled: false,
+  runner_v2_shadow_only: false,
 };
 
 /**
