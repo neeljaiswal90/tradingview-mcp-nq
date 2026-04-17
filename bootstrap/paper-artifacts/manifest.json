@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "symbols": {
+    "MNQ": {
+      "artifacts": [
+        {
+          "source": "bootstrap/paper-artifacts/sources/MNQ/data/expectancy_bucket_table_MNQ.json",
+          "target": "data/expectancy_bucket_table_MNQ.json",
+          "sha256": "5E186A56A1B550594E3D777D2D749B19984E844AAD09BC1E4334439E17F98689",
+          "required_for": [
+            "paper",
+            "live"
+          ]
+        },
+        {
+          "source": "bootstrap/paper-artifacts/sources/MNQ/config/failure_exit_curves_MNQ.json",
+          "target": "config/failure_exit_curves_MNQ.json",
+          "sha256": "7708B7B9179FCD6D57856D08AF2F50B9A76B1942E442594483F1CF1891696F96",
+          "required_for": [
+            "paper",
+            "live"
+          ]
+        }
+      ]
+    }
+  }
+}

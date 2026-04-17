@@ -122,6 +122,15 @@ import type { CycleCusumConfig } from './cycle-cusum.js';
 import { TradeJournal } from './trade-journal.js';
 import { readRecoveryArtifacts, buildRecoveryReport, isRecoveryBlocked } from './recovery.js';
 import type { RecoveryReport } from './recovery.js';
+import {
+  findMissingPaperArtifacts,
+  formatMissingPaperArtifactsMessage,
+  getRepoRoot,
+  getSymbolExpectancyBucketTablePath,
+  getSymbolFailureExitCurvesPath,
+  resolveExpectancyBucketTablePath,
+  resolveFailureExitCurvesPath,
+} from './paper-artifacts.js';
 
 import type {
   Signal,
@@ -894,26 +903,21 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   // diagnostics). paper and live MUST have symbol-scoped artifacts — the
   // runner refuses to start otherwise. This is stricter than the previous
   // behavior, which only warned.
+  const repoRoot = getRepoRoot();
+  console.log(`[STARTUP] artifact_root=${repoRoot}`);
   const requireStrictArtifacts = shouldRequireStrictSymbolArtifacts(env.MODE, executionMode);
   if (requireStrictArtifacts) {
-    const requiredBucketPath = `data/expectancy_bucket_table_${contract.root}.json`;
-    const requiredCurvesPath = `./config/failure_exit_curves_${contract.root}.json`;
-    const missing: string[] = [];
-    if (!existsSync(requiredBucketPath)) missing.push(requiredBucketPath);
-    if (!existsSync(requiredCurvesPath)) missing.push(requiredCurvesPath);
-    if (missing.length > 0) {
-      const msg =
-        `[STARTUP] ❌ Refusing to start in ${env.MODE} mode — required symbol-scoped ` +
-        `ML artifacts are missing:\n` +
-        missing.map(p => `  - ${p}`).join('\n') + '\n' +
-        `Generic fallbacks are not acceptable for ${env.MODE} mode. Build the ` +
-        `symbol-scoped artifacts first:\n` +
-        `  node scripts/build-expectancy-bucket-table.mjs --symbol ${contract.root}\n` +
-        `  node scripts/ml/build_failure_exit_curves.mjs --symbol ${contract.root}\n` +
-        `Or run in shadow/signal_only mode until artifacts are available.`;
+    const missingArtifacts = findMissingPaperArtifacts(repoRoot, contract.root);
+    if (missingArtifacts.length > 0) {
+      const msg = formatMissingPaperArtifactsMessage(
+        env.MODE,
+        repoRoot,
+        contract.root,
+        missingArtifacts,
+      );
       console.error(msg);
       throw new Error(
-        `missing_symbol_scoped_artifacts: ${missing.join(', ')}`,
+        `missing_symbol_scoped_artifacts: ${missingArtifacts.map(pathSpec => pathSpec.relativePath).join(', ')}`,
       );
     }
   }
@@ -924,34 +928,37 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     const quantCfgStartup = resolveQuantEntryConfig(effectiveConfig.quant_entry);
     if (quantCfgStartup.enabled) {
       // Symbol-scoped bucket table path: prefer symbol-specific file, no silent cross-symbol fallback.
-      const symbolTablePath = `data/expectancy_bucket_table_${contract.root}.json`;
+      const symbolTablePath = getSymbolExpectancyBucketTablePath(repoRoot, contract.root);
       const configuredPath = quantCfgStartup.expectancy.bucket_table_path;
-      const tablePath = existsSync(symbolTablePath) ? symbolTablePath : configuredPath;
-      const expectancyFallbackUsed = tablePath !== symbolTablePath;
+      const { path: tablePath, fallbackUsed: expectancyFallbackUsed } =
+        resolveExpectancyBucketTablePath(repoRoot, contract.root, configuredPath);
       if (expectancyFallbackUsed && executionMode !== 'shadow') {
         console.warn(
-          `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath} not found. ` +
+          `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath.relativePath} not found. ` +
           `Cross-symbol fallback rejected in ${executionMode} mode — marking non-eligible. ` +
-          `Build a symbol-scoped table with: node scripts/build-expectancy-bucket-table.mjs --symbol ${contract.root}`
+          `Bootstrap a symbol-scoped table with: npm run bootstrap:paper-artifacts -- --symbol ${contract.root}`
         );
         expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'cross_symbol_fallback', reason: `generic fallback rejected in ${executionMode} mode`, source_rows: 0, fallback_used: true };
       }
       if (expectancyFallbackUsed && executionMode === 'shadow') {
         console.warn(
-          `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath} not found, using ${configuredPath}. ` +
-          `Build a symbol-scoped table to eliminate cross-symbol risk.`
+          `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath.relativePath} not found, using ${tablePath.relativePath}. ` +
+          `Bootstrap a symbol-scoped table to eliminate cross-symbol risk.`
         );
       }
 
       if (!expectancyTableStatus) {
-        const loadResult = loadExpectancyBucketTable(tablePath, executionMode !== 'shadow' ? contract.root : undefined);
+        const loadResult = loadExpectancyBucketTable(
+          tablePath.absolutePath,
+          executionMode !== 'shadow' ? contract.root : undefined,
+        );
         if (loadResult.status === 'loaded') {
           expectancyTable = loadResult.table;
           console.log(`[QUANT-ENGINE] ${loadResult.detail}`);
           console.log(
             `[QUANT-ENGINE] provenance: generated_at=${loadResult.provenance.generated_at ?? 'unknown'} ` +
             `schema=${loadResult.provenance.schema_version_on_disk ?? 'unknown'} ` +
-            `path=${loadResult.path}`
+            `path=${tablePath.relativePath}`
           );
           expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'ok', reason: 'loaded', source_rows: loadResult.provenance.source_row_count ?? 0, fallback_used: expectancyFallbackUsed };
         } else if (loadResult.status === 'insufficient_data') {
@@ -1043,31 +1050,35 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   try {
     const { loadCurves } = await import('./failure-exit/index.js');
     // Symbol-scoped failure curves: prefer symbol-specific file, no silent cross-symbol fallback.
-    const symbolCurvesPath = `./config/failure_exit_curves_${contract.root}.json`;
-    const defaultCurvesPath = './config/failure_exit_curves.json';
-    const curvesPath = existsSync(symbolCurvesPath) ? symbolCurvesPath : defaultCurvesPath;
-    const curvesFallbackUsed = curvesPath !== symbolCurvesPath;
+    const symbolCurvesPath = getSymbolFailureExitCurvesPath(repoRoot, contract.root);
+    const { path: curvesPath, fallbackUsed: curvesFallbackUsed } =
+      resolveFailureExitCurvesPath(repoRoot, contract.root);
     if (curvesFallbackUsed && executionMode !== 'shadow') {
       console.warn(
-        `[STARTUP] Symbol-specific curves ${symbolCurvesPath} not found. ` +
+        `[STARTUP] Symbol-specific curves ${symbolCurvesPath.relativePath} not found. ` +
         `Cross-symbol fallback rejected in ${executionMode} mode — Lane B disabled. ` +
-        `Build symbol-scoped curves with: node scripts/ml/build_failure_exit_curves.mjs --symbol ${contract.root}`
+        `Bootstrap symbol-scoped curves with: npm run bootstrap:paper-artifacts -- --symbol ${contract.root}`
       );
       positionManager.setFailureCurves(null);
       failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'fallback', reason: `cross_symbol_fallback_rejected_${executionMode}`, family_count: 0, fallback_used: true };
     }
     if (curvesFallbackUsed && executionMode === 'shadow') {
       console.warn(
-        `[STARTUP] Symbol-specific curves ${symbolCurvesPath} not found, using ${defaultCurvesPath}. ` +
-        `Build symbol-scoped curves to eliminate cross-symbol risk.`
+        `[STARTUP] Symbol-specific curves ${symbolCurvesPath.relativePath} not found, using ${curvesPath.relativePath}. ` +
+        `Bootstrap symbol-scoped curves to eliminate cross-symbol risk.`
       );
     }
     if (!failureCurvesStatus) {
-      const curves = loadCurves(curvesPath, executionMode !== 'shadow' ? contract.root : undefined);
+      const curves = loadCurves(
+        curvesPath.absolutePath,
+        executionMode !== 'shadow' ? contract.root : undefined,
+      );
       if (curves.size > 0) {
         positionManager.setFailureCurves(curves);
         const keys = Array.from(curves.keys()).join(', ');
-        console.log(`[STARTUP] Loaded failure-exit curves for families: ${keys}`);
+        console.log(
+          `[STARTUP] Loaded failure-exit curves from ${curvesPath.relativePath} for families: ${keys}`,
+        );
         failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'ok', reason: 'loaded', family_count: curves.size, fallback_used: curvesFallbackUsed };
       } else {
         // Explicitly disable Lane B — do NOT install empty map
