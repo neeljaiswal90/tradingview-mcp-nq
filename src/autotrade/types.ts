@@ -2000,6 +2000,11 @@ export interface IndicatorConfig {
    */
   multi_instrument?: import('./instrument-config.js').MultiInstrumentConfig;
   /**
+   * Startup source-selection policy for Bookmap/LOB vs TradingView fallback.
+   * Evaluated independently per instrument.
+   */
+  market_data?: import('./market-data-source.js').MarketDataConfig;
+  /**
    * Deprecated compatibility alias for one integration cycle.
    * Replaced by multi_instrument.enabled.
    */

@@ -217,10 +217,29 @@ if (-not $SkipPython) {
     Write-Step "Checking Bookmap data flow..."
     try {
         $lobHealth = Invoke-RestMethod -Uri "http://127.0.0.1:5010/lob/health" -TimeoutSec 3 -ErrorAction Stop
-        if ($lobHealth.source_connected -eq $true -and $lobHealth.bbo_fresh -eq $true) {
-            Write-OK "Bookmap data flowing. BBO fresh, primary quote authority active."
+        $sourceAlias = if ($lobHealth.PSObject.Properties.Name -contains 'source_alias') { $lobHealth.source_alias } else { $null }
+        $sourceRoot = if ($lobHealth.PSObject.Properties.Name -contains 'source_symbol_root') { $lobHealth.source_symbol_root } else { $null }
+        if ($lobHealth.source_connected -eq $true -and $lobHealth.bbo_fresh -eq $true -and $sourceRoot -eq 'MNQ') {
+            Write-OK "Bookmap data flowing. BBO fresh, source_root=MNQ, primary quote authority active."
+            if ($sourceAlias) {
+                Write-Host "         Source alias: $sourceAlias" -ForegroundColor DarkGray
+            }
+        } elseif ($lobHealth.source_connected -eq $true -and $lobHealth.bbo_fresh -eq $true -and -not $sourceRoot) {
+            Write-Warn "Bookmap sidecar is fresh but does not report source_symbol_root."
+            if ($sourceAlias) {
+                Write-Host "         Source alias: $sourceAlias" -ForegroundColor Yellow
+            }
+            Write-Host "         Runner may treat this as degraded and use TradingView fallback." -ForegroundColor Yellow
+        } elseif ($lobHealth.source_connected -eq $true -and $lobHealth.bbo_fresh -eq $true) {
+            Write-Warn "Bookmap sidecar is fresh but reports source_root=$sourceRoot instead of MNQ."
+            if ($sourceAlias) {
+                Write-Host "         Source alias: $sourceAlias" -ForegroundColor Yellow
+            }
         } elseif ($lobHealth.source_connected -eq $true) {
             Write-Warn "Bookmap connected but BBO stale (age: $($lobHealth.bbo_age_ms)ms)."
+            if ($sourceAlias) {
+                Write-Host "         Source alias: $sourceAlias" -ForegroundColor Yellow
+            }
             Write-Host "         Check that NQM6.CME@RITHMIC is subscribed in Bookmap." -ForegroundColor Yellow
         } else {
             Write-Warn "Sidecar running but Bookmap NOT connected."

@@ -10,6 +10,7 @@ import type { IndicatorConfig, IndicatorChangeRecord } from './types.js';
 import type { LogWriter } from './log-writer.js';
 import { DEFAULT_POSITION_TARGET_CONFIG } from './target-position.js';
 import { DEFAULT_MULTI_INSTRUMENT_CONFIG } from './instrument-config.js';
+import { DEFAULT_MARKET_DATA_CONFIG } from './market-data-source.js';
 
 /**
  * DEFAULT_CONFIG must stay in sync with config/indicator-config.json.
@@ -112,6 +113,7 @@ const DEFAULT_CONFIG: IndicatorConfig = {
   },
   position_target: DEFAULT_POSITION_TARGET_CONFIG,
   multi_instrument: DEFAULT_MULTI_INSTRUMENT_CONFIG,
+  market_data: DEFAULT_MARKET_DATA_CONFIG,
   runner_v2_enabled: false,
   runner_v2_shadow_only: false,
 };
@@ -205,6 +207,26 @@ export class IndicatorConfigManager {
         } else if (val < -10 || val > 10) {
           warnings.push(`scoring_weights.${key}=${val} is outside typical range [-10, 10]`);
         }
+      }
+    }
+
+    const marketData = this.config.market_data;
+    if (marketData) {
+      if (
+        marketData.lob_health_timeout_ms !== undefined
+        && (marketData.lob_health_timeout_ms < 100 || marketData.lob_health_timeout_ms > 10_000)
+      ) {
+        errors.push(
+          `market_data.lob_health_timeout_ms=${marketData.lob_health_timeout_ms} outside [100, 10000]`,
+        );
+      }
+      if (
+        marketData.lob_max_staleness_ms !== undefined
+        && (marketData.lob_max_staleness_ms < 100 || marketData.lob_max_staleness_ms > 30_000)
+      ) {
+        errors.push(
+          `market_data.lob_max_staleness_ms=${marketData.lob_max_staleness_ms} outside [100, 30000]`,
+        );
       }
     }
 

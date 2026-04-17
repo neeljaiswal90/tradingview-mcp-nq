@@ -562,6 +562,12 @@
   },
   "runner_v2_enabled": false,
   "execution_mode": "paper",
+  "market_data": {
+    "fallback_to_tradingview_on_unhealthy_lob": true,
+    "lob_health_timeout_ms": 2000,
+    "lob_max_staleness_ms": 1500,
+    "lob_required_feed": "depth"
+  },
   "runner_v2_shadow_only": false,
   "lane_timing": {
     "hard_risk_interval_ms": 500,
