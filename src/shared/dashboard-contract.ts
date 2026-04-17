@@ -231,6 +231,8 @@ export interface FreshnessMetadata {
   confidence_updated_at: string | null;
   analysis_interval_target_ms: number;
   last_analysis_duration_ms: number;
+  analysis_lane_segments_ms: Record<string, number>;
+  analysis_lane_unattributed_ms: number | null;
   htf_cache_hits: string[];
 }
 

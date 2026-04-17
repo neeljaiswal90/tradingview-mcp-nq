@@ -37,6 +37,7 @@ import type {
 import { DASHBOARD_VERSION } from './types.js';
 import type { ManagementMetrics } from '../management/types.js';
 import type { SessionInfo } from '../types.js';
+import type { LaneSegmentSnapshot } from '../lane-segment-timer.js';
 
 // ─── Phase 7 per-family telemetry constants ────────────────────────────────
 
@@ -183,6 +184,8 @@ export class DashboardStateManager extends EventEmitter {
   private confidenceUpdatedAt: string | null = null;
   private analysisIntervalTargetMs = 5_000;
   private lastAnalysisDurationMs = 0;
+  private analysisLaneSegmentsMs: Record<string, number> = {};
+  private analysisLaneUnattributedMs: number | null = null;
   private htfCacheHits: string[] = [];
 
   // ─── Setters (called by runner) ──────────────────────────────────────────
@@ -464,9 +467,15 @@ export class DashboardStateManager extends EventEmitter {
   }
 
   /** Update analysis duration from scheduler metrics. */
-  updateAnalysisTiming(durationMs: number, targetMs: number): void {
+  updateAnalysisTiming(
+    durationMs: number,
+    targetMs: number,
+    segmentSnapshot?: LaneSegmentSnapshot | null,
+  ): void {
     this.lastAnalysisDurationMs = durationMs;
     this.analysisIntervalTargetMs = targetMs;
+    this.analysisLaneSegmentsMs = segmentSnapshot ? { ...segmentSnapshot.segments } : {};
+    this.analysisLaneUnattributedMs = segmentSnapshot?.unattributed_ms ?? null;
   }
 
 
@@ -935,6 +944,8 @@ export class DashboardStateManager extends EventEmitter {
       confidence_updated_at: this.confidenceUpdatedAt,
       analysis_interval_target_ms: this.analysisIntervalTargetMs,
       last_analysis_duration_ms: this.lastAnalysisDurationMs,
+      analysis_lane_segments_ms: { ...this.analysisLaneSegmentsMs },
+      analysis_lane_unattributed_ms: this.analysisLaneUnattributedMs,
       htf_cache_hits: this.htfCacheHits,
     };
   }

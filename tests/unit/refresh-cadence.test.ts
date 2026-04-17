@@ -2,36 +2,67 @@
  * Tests for refresh cadence, freshness metadata, and scheduler behavior.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { Scheduler } from '../../src/autotrade/scheduler.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { LaneScheduler, type LaneConfig } from '../../src/autotrade/scheduler.js';
 import { DashboardStateManager } from '../../src/autotrade/dashboard/state-manager.js';
+
+function makeLaneScheduler(callback: () => Promise<void>, intervalMs = 500): LaneScheduler {
+  const lanes: LaneConfig[] = [
+    {
+      name: 'analysis',
+      intervalMs,
+      callback: async () => {
+        await callback();
+      },
+      activeWhen: 'flat',
+      priority: 40,
+      independentBusy: false,
+      overrunThresholdMs: 5000,
+    },
+  ];
+
+  return new LaneScheduler({
+    baseTickMs: 100,
+    isInPosition: () => false,
+    lanes,
+  });
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 // ─── Scheduler Tests ─────────────────────────────────────────────────────────
 
-describe('Scheduler', () => {
-  it('enforces minimum interval of 1000ms', () => {
-    const scheduler = new Scheduler(500);
-    const metrics = scheduler.getMetrics();
-    expect(metrics.cycle_count).toBe(0);
+describe('LaneScheduler', () => {
+  it('starts with zeroed metrics for the analysis lane', () => {
+    const scheduler = makeLaneScheduler(async () => {});
+    const metrics = scheduler.getLaneMetrics('analysis');
+    expect(metrics?.cycleCount).toBe(0);
+    expect(metrics?.skipCount).toBe(0);
   });
 
   it('accepts 5000ms (5s) analysis interval', () => {
-    const scheduler = new Scheduler(5000);
-    const metrics = scheduler.getMetrics();
-    expect(metrics.cycle_count).toBe(0);
-    expect(metrics.analysis_overrun_count).toBe(0);
+    const scheduler = makeLaneScheduler(async () => {}, 5000);
+    const metrics = scheduler.getLaneMetrics('analysis');
+    expect(metrics?.cycleCount).toBe(0);
+    expect(metrics?.overrunCount).toBe(0);
   });
 
   it('tracks metrics correctly after ticks', async () => {
-    const scheduler = new Scheduler(5000);
+    vi.useFakeTimers();
     let callCount = 0;
-    const promise = scheduler.run(async () => {
+    const scheduler = makeLaneScheduler(async () => {
       callCount++;
-      if (callCount >= 2) scheduler.stop();
-    });
+    }, 100);
+    const promise = scheduler.run();
+    await vi.advanceTimersByTimeAsync(350);
+    scheduler.stop();
+    await vi.advanceTimersByTimeAsync(150);
     await promise;
-    const metrics = scheduler.getMetrics();
-    expect(metrics.cycle_count).toBeGreaterThanOrEqual(2);
+    const metrics = scheduler.getLaneMetrics('analysis');
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    expect(metrics?.cycleCount).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -85,6 +116,28 @@ describe('DashboardStateManager — freshness metadata', () => {
     const snap = manager.getSnapshot();
     expect(snap.freshness.last_analysis_duration_ms).toBe(1200);
     expect(snap.freshness.analysis_interval_target_ms).toBe(5000);
+    expect(snap.freshness.analysis_lane_segments_ms).toEqual({});
+    expect(snap.freshness.analysis_lane_unattributed_ms).toBeNull();
+  });
+
+  it('tracks analysis lane segments when provided', () => {
+    manager.updateAnalysisTiming(1200, 5000, {
+      duration_ms: 1200,
+      segments: {
+        preflight: 75,
+        data_collect: 640,
+        signal_analysis: 320,
+      },
+      segments_sum_ms: 1035,
+      unattributed_ms: 165,
+    });
+    const snap = manager.getSnapshot();
+    expect(snap.freshness.analysis_lane_segments_ms).toEqual({
+      preflight: 75,
+      data_collect: 640,
+      signal_analysis: 320,
+    });
+    expect(snap.freshness.analysis_lane_unattributed_ms).toBe(165);
   });
 
   it('starts with null/empty freshness values', () => {
@@ -92,6 +145,8 @@ describe('DashboardStateManager — freshness metadata', () => {
     expect(snap.freshness.data_gathered_at).toBeNull();
     expect(snap.freshness.data_gather_duration_ms).toBeNull();
     expect(snap.freshness.confidence_updated_at).toBeNull();
+    expect(snap.freshness.analysis_lane_segments_ms).toEqual({});
+    expect(snap.freshness.analysis_lane_unattributed_ms).toBeNull();
     expect(snap.freshness.htf_cache_hits).toEqual([]);
   });
 });
@@ -107,9 +162,9 @@ describe('Analysis interval configuration', () => {
 
   it('analysis interval produces valid scheduler timing', () => {
     const intervalMs = 5 * 1000;
-    const scheduler = new Scheduler(intervalMs);
-    const metrics = scheduler.getMetrics();
-    expect(metrics.cycle_count).toBe(0);
-    expect(metrics.analysis_overrun_count).toBe(0);
+    const scheduler = makeLaneScheduler(async () => {}, intervalMs);
+    const metrics = scheduler.getLaneMetrics('analysis');
+    expect(metrics?.cycleCount).toBe(0);
+    expect(metrics?.overrunCount).toBe(0);
   });
 });
