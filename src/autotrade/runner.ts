@@ -75,6 +75,7 @@ import { IndicatorConfigManager } from './indicator-config-manager.js';
 import { PerformanceTracker } from './performance-tracker.js';
 import { LaneScheduler } from './scheduler.js';
 import type { LaneConfig } from './scheduler.js';
+import { LaneSegmentTimer } from './lane-segment-timer.js';
 import { ExecutionLock } from './execution-lock.js';
 import { createLaneSharedState } from './lane-state.js';
 import type { LaneSharedState } from './lane-state.js';
@@ -1395,6 +1396,40 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     try {
     cycleChangeNote = '';
     const analysisStartMs = Date.now();
+    const analysisLaneTimer = new LaneSegmentTimer();
+    const targetAnalysisIntervalMs = effectiveConfig.analysis_interval_seconds * 1000;
+    const finalizeAnalysisTiming = (phase: string): void => {
+      analysisLaneTimer.mark('dashboard_update');
+      const segmentSnapshot = analysisLaneTimer.finalize();
+      dashboardState.updateAnalysisTiming(
+        segmentSnapshot.duration_ms,
+        targetAnalysisIntervalMs,
+        segmentSnapshot,
+      );
+      logWriter.writeLaneMetrics({
+        record_type: 'analysis_segments',
+        timestamp: new Date().toISOString(),
+        session_id: sessionId,
+        lane: 'analysis',
+        phase,
+        cycle_number: cycleNumber,
+        duration_ms: segmentSnapshot.duration_ms,
+        target_interval_ms: targetAnalysisIntervalMs,
+        segments_ms: segmentSnapshot.segments,
+        segments_sum_ms: segmentSnapshot.segments_sum_ms,
+        unattributed_ms: segmentSnapshot.unattributed_ms,
+      });
+      if (cycleNumber % 10 === 1 || segmentSnapshot.duration_ms > targetAnalysisIntervalMs) {
+        const summary = Object.entries(segmentSnapshot.segments)
+          .map(([label, durationMs]) => `${label}:${durationMs}ms`)
+          .join(' ');
+        console.log(
+          `[LANE-TIMING] lane=analysis phase=${phase} total=${segmentSnapshot.duration_ms}ms ` +
+          `target=${targetAnalysisIntervalMs}ms unattributed=${segmentSnapshot.unattributed_ms}ms ` +
+          `segments=${summary || 'none'}`,
+        );
+      }
+    };
 
     const currentDay = new Date().getUTCDate();
     if (currentDay !== lastResetDay) {
@@ -1414,6 +1449,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       console.error('[RUNNER] âš ï¸  TradingView health check failed. Skipping cycle.');
       return;
     }
+    analysisLaneTimer.mark('preflight');
 
     let snap: MarketSnapshot;
     try {
@@ -1459,6 +1495,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         );
       }
     }
+    analysisLaneTimer.mark('data_collect');
 
     // â”€â”€ Phase-aware routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const phase = phaseManager.current();
@@ -1469,8 +1506,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         phaseManager.transitionTo('FLAT', 'cooldown_expired');
         lastCooldownActive = false;
       } else {
+        analysisLaneTimer.mark('phase_gate');
         dashboardState.updateEnginePhase(phaseManager.snapshot());
         dashboardState.incrementCycle();
+        finalizeAnalysisTiming('cooldown');
         dashboardState.flush();
         return;
       }
@@ -1553,14 +1592,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         });
       }
       // Dashboard updates for MANAGING phase
+      analysisLaneTimer.mark('manage_only');
       dashboardState.updateRisk(riskManager.getState());
       dashboardState.updatePosition(positionManager.getPosition());
       dashboardState.updatePerformance(perfTracker.getStats());
       dashboardState.updateEnginePhase(phaseManager.snapshot());
-      dashboardState.updateAnalysisTiming(
-        Date.now() - analysisStartMs,
-        effectiveConfig.analysis_interval_seconds * 1000,
-      );
+      finalizeAnalysisTiming('managing');
       dashboardState.flush();
       return; // Do NOT fall through to generateSignal() â€” no entry analysis in MANAGING
     }
@@ -1612,6 +1649,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     dashboardState.updateConfidenceTiming();
     totalSignals++;
     const signalId = `SIG_${sessionId}_${String(totalSignals).padStart(4, '0')}`;
+    analysisLaneTimer.mark('signal_analysis');
 
     const nearMissFilters: string[] = [...skipReasons];
     if (bestSetup && confidence >= effectiveConfig.min_confidence - 1.0 && !tradeAllowed) {
@@ -2449,6 +2487,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         event: snap.event,
       });
     }
+    analysisLaneTimer.mark('decisioning');
 
     const decision = !bestSetup ? 'NO TRADE'
       : !tradeAllowed ? 'NO TRADE'
@@ -2487,10 +2526,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
 
     // Track analysis timing for freshness metadata
-    dashboardState.updateAnalysisTiming(
-      Date.now() - analysisStartMs,
-      effectiveConfig.analysis_interval_seconds * 1000,
-    );
+    finalizeAnalysisTiming('flat');
 
     // â”€â”€â”€ Delta 6: CUSUM watchdog observation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Feed the cycle-to-cycle gap into the CUSUM tracker. Edge-triggered
@@ -3618,6 +3654,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         // Lane metrics heartbeat: every 3rd cycle (~15s at 5s interval)
         if (laneSchedulerRef && _cycle % 3 === 0 && _cycle > 0) {
           logWriter.writeLaneMetrics({
+            record_type: 'scheduler_metrics',
             timestamp: new Date().toISOString(),
             session_id: sessionId,
             metrics: laneSchedulerRef.getMetrics(),

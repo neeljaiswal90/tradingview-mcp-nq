@@ -101,7 +101,10 @@ export class LogWriter {
 
   /** Write periodic lane scheduler metrics. */
   writeLaneMetrics(record: unknown): void {
-    this.appendLine(this.laneMetricsPath, record);
+    const row = typeof record === 'object' && record !== null
+      ? withLogContract({ ...(record as object) })
+      : record;
+    this.appendLine(this.laneMetricsPath, row);
   }
 
   /** Write a structured execution lifecycle event (entry/exit submitted, filled, closed). */
