@@ -17,6 +17,7 @@ build-info.json
 logs/
 screenshots/
 tmp/
+.runtime/
 debug-*.log
 
 # Python
@@ -61,3 +62,6 @@ models/xgboost/*
 # Generated reports
 reports/*
 !reports/README.md
+
+# Generated paper-safe symbol artifacts
+config/failure_exit_curves*.json

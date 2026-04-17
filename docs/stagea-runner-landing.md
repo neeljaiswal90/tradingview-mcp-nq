@@ -19,6 +19,8 @@ Operational notes:
 - Initial pane assignment is deterministic: `MNQ -> pane 0`, `MES -> pane 1`
 - Only one active engine is allowed in this landing
 - Shadow engines generate telemetry but do not emit execution side effects
+- Repo-local MNQ paper artifacts can be bootstrapped with `npm run bootstrap:paper-artifacts -- --symbol MNQ`
+- Startup logs the repo-local `artifact_root`, refuses to borrow missing paper artifacts from another worktree, and fails clearly when symbol-scoped artifacts are absent
 
 Explicitly not flipped in this landing:
 

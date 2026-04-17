@@ -32,6 +32,7 @@
     "start:full": "powershell -NoLogo -ExecutionPolicy Bypass -File scripts/start-full-stack.ps1",
     "stop:full": "powershell -NoLogo -ExecutionPolicy Bypass -File scripts/stop-full-stack.ps1",
     "bootstrap": "npm ci && npm --prefix dashboard ci",
+    "bootstrap:paper-artifacts": "node scripts/bootstrap-paper-artifacts.mjs",
     "clean": "npm run clean:runtime",
     "clean:runtime": "node scripts/cleanup-project.mjs --runtime",
     "clean:deep": "node scripts/cleanup-project.mjs --deep",

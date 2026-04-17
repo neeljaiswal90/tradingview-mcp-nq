@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-04-13T19:02:23.446Z",
+  "source": {
+    "trades_path": "logs/archive/baseline-pre-failure-exit_20260410_080551/trades.jsonl",
+    "trade_path_path": "logs/archive/baseline-pre-failure-exit_20260410_080551/trade_path.jsonl",
+    "from": null,
+    "to": null,
+    "family_filter": null,
+    "symbol_filter": "MNQ"
+  },
+  "config": {
+    "min_n_per_bucket": 20,
+    "family_min_sample": 100,
+    "family_low_confidence_bucket_fraction": 0.5,
+    "t_max": 30
+  },
+  "curves": {}
+}
