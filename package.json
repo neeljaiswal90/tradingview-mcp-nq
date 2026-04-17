@@ -26,6 +26,8 @@
     "auto:signal": "cross-env MODE=signal_only node dist/autotrade/runner.js",
     "auto:live": "cross-env MODE=live LIVE_TRADING_ENABLED=true node dist/autotrade/runner.js",
     "historical:replay": "node dist/autotrade/historical/cli.js --config config/historical-config.json",
+    "analysis:scalper-shadow-health": "node scripts/analysis/check-scalper-shadow-health.mjs",
+    "analysis:scalper-rollout-gate": "node scripts/analysis/check-scalper-rollout-gate.mjs",
     "dashboard:install": "npm --prefix dashboard install",
     "dashboard:build": "npm --prefix dashboard run build",
     "dashboard:dev": "npm --prefix dashboard run dev",
