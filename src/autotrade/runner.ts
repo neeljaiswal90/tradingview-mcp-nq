@@ -74,6 +74,10 @@ import { getContractSpec, tryGetContractSpec, assertLiveTradingAllowed } from '.
 import { MultiInstrumentOrchestrator } from './multi-instrument-orchestrator.js';
 import { resolveRunnerLaunchMode } from './runner-launch.js';
 import {
+  isRunnerShutdownRequestMessage,
+  sendRunnerShutdownAck,
+} from './runner-ipc.js';
+import {
   normalizeExecutionMode,
   shouldAllowExecutionSideEffects,
   shouldRequireStrictSymbolArtifacts,
@@ -2549,6 +2553,8 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
   };
 
+  let laneSchedulerRef: LaneScheduler | null = null;
+
   // ─── V2 Multi-Lane Engine (canonical) ────────────────────────────────────
   {
     const laneTiming = effectiveConfig.lane_timing ?? {};
@@ -2558,9 +2564,6 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
     // Track last ML action execution time for cooldown gate
     let v2LastMlActionTimestamp = 0;
-
-    // Forward ref for lane metrics (assigned before scheduler.run(), read in callbacks)
-    let laneSchedulerRef: LaneScheduler | null = null;
 
     console.log(
       `[RUNNER] ▶️  V2 multi-lane engine ${shadowOnly ? '(SHADOW-ONLY — observation mode)' : '(ACTIVE)'}`,
@@ -3729,12 +3732,51 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     });
     laneSchedulerRef = laneScheduler;
 
-    await laneScheduler.run();
+    const onSigint = (): void => {
+      void requestRunnerShutdown('sigint');
+    };
+    const onSigterm = (): void => {
+      void requestRunnerShutdown('sigterm');
+    };
+    const onMessage = (message: unknown): void => {
+      if (!isRunnerShutdownRequestMessage(message)) return;
+      console.log(`[SHUTDOWN] shutdown_requested source=ipc reason=${message.reason}`);
+      void requestRunnerShutdown(message.reason, { acknowledge: true, exitCode: 0 });
+    };
+    const onUncaughtException = (err: unknown): void => {
+      console.error('[FATAL] Uncaught exception:', err);
+      void requestRunnerShutdown('uncaught_exception', { exitCode: 1 });
+    };
+    const onUnhandledRejection = (err: unknown): void => {
+      console.error('[FATAL] Unhandled rejection:', err);
+      void requestRunnerShutdown('unhandled_rejection', { exitCode: 1 });
+    };
+
+    process.once('SIGINT', onSigint);
+    process.once('SIGTERM', onSigterm);
+    process.on('message', onMessage);
+    process.once('uncaughtException', onUncaughtException);
+    process.once('unhandledRejection', onUnhandledRejection);
+
+    try {
+      await laneScheduler.run();
+    } finally {
+      process.off('SIGINT', onSigint);
+      process.off('SIGTERM', onSigterm);
+      process.off('message', onMessage);
+      process.off('uncaughtException', onUncaughtException);
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
   }
 
   // ── Ordered shutdown (explicit drains, not sleep-based) ─────────────────
   const SHUTDOWN_TIMEOUT_MS = 10_000;
   let shutdownPromise: Promise<void> | null = null;
+  let coordinatedShutdownPromise: Promise<void> | null = null;
+  let shutdownReason = 'user_stopped';
+  let shutdownAckRequested = false;
+  let shutdownAckSent = false;
+  let shutdownExitCode: number | null = null;
 
   async function gracefulShutdown(reason: string): Promise<void> {
     if (shutdownPromise) return shutdownPromise;
@@ -3838,19 +3880,55 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     console.log('[RUNNER] ✅ Session ended cleanly.');
   }
 
-  // Register gracefulShutdown on fatal paths (SIGINT/SIGTERM handled by scheduler)
-  process.once('uncaughtException', (err) => {
-    console.error('[FATAL] Uncaught exception:', err);
-    gracefulShutdown('uncaught_exception').finally(() => process.exit(1));
-  });
-  process.once('unhandledRejection', (err) => {
-    console.error('[FATAL] Unhandled rejection:', err);
-    gracefulShutdown('unhandled_rejection').finally(() => process.exit(1));
-  });
+  async function requestRunnerShutdown(
+    reason: string,
+    options: {
+      acknowledge?: boolean;
+      exitCode?: number | null;
+    } = {},
+  ): Promise<void> {
+    shutdownReason = reason;
+    if (options.acknowledge) {
+      shutdownAckRequested = true;
+    }
+    if (options.exitCode != null) {
+      shutdownExitCode = shutdownExitCode == null
+        ? options.exitCode
+        : Math.max(shutdownExitCode, options.exitCode);
+    }
 
-  // Normal shutdown: scheduler's SIGINT/SIGTERM handler stops the loop,
-  // then control falls through to gracefulShutdown here.
-  await gracefulShutdown('user_stopped');
+    laneSchedulerRef?.stop();
+
+    if (coordinatedShutdownPromise) {
+      return coordinatedShutdownPromise;
+    }
+
+    coordinatedShutdownPromise = (async () => {
+      await gracefulShutdown(reason);
+
+      if (shutdownAckRequested && !shutdownAckSent) {
+        try {
+          await sendRunnerShutdownAck(shutdownReason);
+          shutdownAckSent = true;
+        } catch (error) {
+          console.error('[SHUTDOWN] Failed to send shutdown ack:', error);
+        }
+      }
+
+      if (shutdownExitCode != null) {
+        process.exit(shutdownExitCode);
+      }
+    })();
+
+    return coordinatedShutdownPromise;
+  }
+
+  if (coordinatedShutdownPromise) {
+    await coordinatedShutdownPromise;
+    return;
+  }
+
+  await gracefulShutdown(shutdownReason);
 }
 
 async function main(): Promise<void> {
@@ -3876,10 +3954,51 @@ async function main(): Promise<void> {
   });
 
   let shutdownStarted = false;
-  const shutdown = async (reason: string): Promise<void> => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    await orchestrator.shutdown(reason);
+  let coordinatedShutdownPromise: Promise<void> | null = null;
+  let shutdownAckRequested = false;
+  let shutdownAckSent = false;
+  let shutdownExitCode: number | null = null;
+  const shutdown = async (
+    reason: string,
+    options: {
+      acknowledge?: boolean;
+      exitCode?: number | null;
+    } = {},
+  ): Promise<void> => {
+    if (options.acknowledge) {
+      shutdownAckRequested = true;
+    }
+    if (options.exitCode != null) {
+      shutdownExitCode = shutdownExitCode == null
+        ? options.exitCode
+        : Math.max(shutdownExitCode, options.exitCode);
+    }
+
+    if (coordinatedShutdownPromise) {
+      return coordinatedShutdownPromise;
+    }
+
+    coordinatedShutdownPromise = (async () => {
+      if (!shutdownStarted) {
+        shutdownStarted = true;
+        await orchestrator.shutdown(reason);
+      }
+
+      if (shutdownAckRequested && !shutdownAckSent) {
+        try {
+          await sendRunnerShutdownAck(reason);
+          shutdownAckSent = true;
+        } catch (error) {
+          console.error('[SHUTDOWN] Failed to send top-level shutdown ack:', error);
+        }
+      }
+
+      if (shutdownExitCode != null) {
+        process.exit(shutdownExitCode);
+      }
+    })();
+
+    return coordinatedShutdownPromise;
   };
 
   const onSigint = (): void => {
@@ -3888,9 +4007,15 @@ async function main(): Promise<void> {
   const onSigterm = (): void => {
     void shutdown('sigterm');
   };
+  const onMessage = (message: unknown): void => {
+    if (!isRunnerShutdownRequestMessage(message)) return;
+    console.log(`[SHUTDOWN] top_level_shutdown_requested source=ipc reason=${message.reason}`);
+    void shutdown(message.reason, { acknowledge: true, exitCode: 0 });
+  };
 
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigterm);
+  process.on('message', onMessage);
 
   try {
     await orchestrator.initialize();
@@ -3899,6 +4024,7 @@ async function main(): Promise<void> {
   } finally {
     process.off('SIGINT', onSigint);
     process.off('SIGTERM', onSigterm);
+    process.off('message', onMessage);
     await shutdown('orchestrator_complete');
   }
 }

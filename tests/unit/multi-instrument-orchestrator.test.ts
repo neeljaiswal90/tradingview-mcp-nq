@@ -1,13 +1,13 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
+import { dirname, join } from 'path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { MultiInstrumentOrchestrator } from '../../src/autotrade/multi-instrument-orchestrator.js';
-import { normalizeMultiInstrumentConfig } from '../../src/autotrade/instrument-config.js';
-import type { IndicatorConfig } from '../../src/autotrade/types.js';
 import type { AutotradeEnv } from '../../src/autotrade/env.js';
+import { normalizeMultiInstrumentConfig } from '../../src/autotrade/instrument-config.js';
+import { MultiInstrumentOrchestrator } from '../../src/autotrade/multi-instrument-orchestrator.js';
+import type { IndicatorConfig } from '../../src/autotrade/types.js';
 
 const tempDirs: string[] = [];
 
@@ -46,8 +46,24 @@ writeFileSync(join(logDir, 'fake_runner_manifest.json'), JSON.stringify({
   executionMode: config.execution_mode,
   forceLegacyRunner: process.env.FORCE_LEGACY_RUNNER,
 }, null, 2));
-console.log('[STARTUP] ✅ TradingView connected');
-console.log('[STARTUP] ✅ Chart configured');
+console.log('[STARTUP] TradingView connected');
+console.log('[STARTUP] Chart configured');
+let shutdownCount = 0;
+process.on('message', message => {
+  if (!message || message.type !== 'shutdown') {
+    return;
+  }
+  shutdownCount += 1;
+  writeFileSync(join(logDir, 'fake_runner_shutdown.json'), JSON.stringify({
+    reason: message.reason,
+    shutdownCount,
+  }, null, 2));
+  if (typeof process.send === 'function') {
+    process.send({ type: 'shutdownAck', reason: message.reason }, () => process.exit(0));
+    return;
+  }
+  process.exit(0);
+});
 setInterval(() => {}, 1000);
 `,
     'utf8',
@@ -112,6 +128,7 @@ async function launchSmoke(rootDir: string): Promise<Record<string, Record<strin
   }
 
   await orchestrator.shutdown('test_complete');
+  await orchestrator.shutdown('test_complete_duplicate');
   return manifests;
 }
 
@@ -145,6 +162,15 @@ describe('multi-instrument orchestrator smoke', () => {
     const mesRuntimeRoot = dirname(manifests['MES']!['configDir']!);
     expect(existsSync(mnqRuntimeRoot)).toBe(false);
     expect(existsSync(mesRuntimeRoot)).toBe(false);
+
+    const mnqShutdown = JSON.parse(
+      readFileSync(join(rootDir, 'logs-mnq', 'fake_runner_shutdown.json'), 'utf8'),
+    ) as { reason: string; shutdownCount: number };
+    const mesShutdown = JSON.parse(
+      readFileSync(join(rootDir, 'logs-mes', 'fake_runner_shutdown.json'), 'utf8'),
+    ) as { reason: string; shutdownCount: number };
+    expect(mnqShutdown).toEqual({ reason: 'test_complete', shutdownCount: 1 });
+    expect(mesShutdown).toEqual({ reason: 'test_complete', shutdownCount: 1 });
   });
 
   it('uses unique resolved temp config dirs across reruns', async () => {

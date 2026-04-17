@@ -5,6 +5,10 @@ import { fileURLToPath } from 'url';
 
 import type { AutotradeEnv } from './env.js';
 import type { MultiInstrumentConfig, ResolvedInstrumentRuntimeConfig } from './instrument-config.js';
+import {
+  forceTerminateChildProcess,
+  requestGracefulShutdown,
+} from './runner-ipc.js';
 import type { IndicatorConfig } from './types.js';
 
 const READY_TRADINGVIEW_CONNECTED = 'TradingView connected';
@@ -116,6 +120,7 @@ export class InstrumentEngine {
   private exitPromise: Promise<void> | null = null;
   private exited = false;
   private shutdownRequested = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(opts: InstrumentEngineOptions) {
     this.opts = opts;
@@ -181,7 +186,7 @@ export class InstrumentEngine {
     this.child = spawn(process.execPath, [this.runnerEntrypoint], {
       cwd: process.cwd(),
       env: this.prepared.childEnv,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       windowsHide: true,
     });
 
@@ -318,6 +323,15 @@ export class InstrumentEngine {
   }
 
   async shutdown(reason: string): Promise<void> {
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
+    }
+
+    this.shutdownPromise = this.doShutdown(reason);
+    return this.shutdownPromise;
+  }
+
+  private async doShutdown(reason: string): Promise<void> {
     const child = this.child;
     this.shutdownRequested = true;
     if (!child || this.exited) {
@@ -327,33 +341,27 @@ export class InstrumentEngine {
 
     this.log('SHUTDOWN', reason);
     try {
-      child.kill('SIGTERM');
-    } catch {
-      // Best-effort shutdown.
+      const outcome = await requestGracefulShutdown(child, reason, {
+        forceKill: () => {
+          forceTerminateChildProcess(child);
+        },
+      });
+      if (outcome === 'forced') {
+        this.log('SHUTDOWN', 'graceful IPC timed out; forced child termination');
+      }
+    } catch (error) {
+      this.log(
+        'SHUTDOWN',
+        `IPC shutdown failed; forcing child termination (${error instanceof Error ? error.message : String(error)})`,
+      );
+      forceTerminateChildProcess(child);
     }
 
-    const graceful = this.exitPromise ?? Promise.resolve();
-    const timeout = new Promise<void>(resolvePromise => {
-      const timer = setTimeout(() => {
-        try {
-          if (process.platform === 'win32' && child.pid) {
-            spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
-              windowsHide: true,
-              stdio: 'ignore',
-            });
-          } else {
-            child.kill('SIGKILL');
-          }
-        } catch {
-          // Best-effort hard stop.
-        }
-        resolvePromise();
-      }, 5_000);
-      timer.unref();
-    });
-
-    await Promise.race([graceful, timeout]);
-    this.cleanupPreparedRuntime();
+    try {
+      await (this.exitPromise ?? Promise.resolve());
+    } finally {
+      this.cleanupPreparedRuntime();
+    }
   }
 
   private cleanupPreparedRuntime(): void {
