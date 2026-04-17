@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from lob_features.schema import LobFeatureSnapshot
-from lob_features.rolling import RollingTradeBuffer, RollingDepthState, RollingMboAggregator
+from lob_features.rolling import RollingTradeBuffer, RollingDepthState, RollingMboAggregator, RollingScalpState
 from lob_features.advanced_mbo import AdvancedMboAnalyzer, RichMboEvent
 from lob_features.compute import compute_lob_features
 from lob_features.microstructure import (
@@ -157,6 +157,7 @@ class SidecarState:
         self.trade_buf = RollingTradeBuffer(max_window_sec=60.0)
         self.depth = RollingDepthState()
         self.mbo_agg = RollingMboAggregator(max_window_sec=60.0)
+        self.scalp_state = RollingScalpState(max_window_sec=3.0)
         self.advanced_mbo = AdvancedMboAnalyzer(max_window_sec=60.0)
 
         # MBO capability tracking
@@ -254,6 +255,7 @@ class SidecarState:
             large_trades=self.large_trades,
             volume_profile=self.volume_profile,
             current_price=self.mid,
+            scalp_state_tracker=self.scalp_state,
         )
 
     def get_cached_snapshot(self) -> dict:
@@ -392,6 +394,7 @@ async def bookmap_ingest(ws: WebSocket):
             state.ask = msg["ask"]
             state.bid_size = msg["bid_sz"]
             state.ask_size = msg["ask_sz"]
+            state.scalp_state.observe_bbo(ts_ms, state.bid, state.ask, state.bid_size, state.ask_size)
             state.last_bbo_ts = ts
             state.update_count += 1
             # Persist the exact top-of-book stream used by the offline

@@ -7,6 +7,7 @@ Shared between live sidecar and offline replay.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -113,6 +114,209 @@ class RollingDepthState:
             if abs(price - ref_price) <= range_pts and size >= threshold:
                 return True
         return False
+
+
+# â”€â”€â”€ Rolling scalp-state / BBO flow state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@dataclass
+class BboContribution:
+    ts_ms: int
+    e: float
+
+
+@dataclass
+class MidTickDelta:
+    ts_ms: int
+    delta_ticks: float
+
+
+class RollingScalpState:
+    """Rolling best-of-book state for the lob_mbo_scalp snapshot contract."""
+
+    def __init__(
+        self,
+        max_window_sec: float = 3.0,
+        z_warmup_samples: int = 30,
+        history_limit: int = 300,
+    ):
+        self.max_window_ms = int(max_window_sec * 1000)
+        self.z_warmup_samples = z_warmup_samples
+        self.history_limit = history_limit
+
+        self.last_ts_ms: Optional[int] = None
+        self.last_best_bid: Optional[float] = None
+        self.last_best_ask: Optional[float] = None
+        self.last_bid_size: Optional[int] = None
+        self.last_ask_size: Optional[int] = None
+
+        self.contributions: Deque[BboContribution] = deque()
+        self.mid_tick_deltas: Deque[MidTickDelta] = deque()
+        self.ofi_250ms_history: Deque[float] = deque()
+        self.ofi_1s_history: Deque[float] = deque()
+        self.ofi_3s_history: Deque[float] = deque()
+
+    def observe_bbo(
+        self,
+        ts_ms: int,
+        bid: float,
+        ask: float,
+        bid_size: int,
+        ask_size: int,
+    ) -> None:
+        if not self._valid_bbo(bid, ask, bid_size, ask_size):
+            return
+        if self.last_ts_ms is not None and ts_ms <= self.last_ts_ms:
+            return
+
+        prev_mid = None
+        if self.last_best_bid is not None and self.last_best_ask is not None:
+            prev_mid = (self.last_best_bid + self.last_best_ask) / 2.0
+
+        if (
+            self.last_best_bid is not None and
+            self.last_best_ask is not None and
+            self.last_bid_size is not None and
+            self.last_ask_size is not None
+        ):
+            e_k = self._compute_ofi_contribution(
+                self.last_best_bid,
+                self.last_best_ask,
+                self.last_bid_size,
+                self.last_ask_size,
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+            )
+            self.contributions.append(BboContribution(ts_ms=ts_ms, e=e_k))
+
+        current_mid = (bid + ask) / 2.0
+        if prev_mid is not None:
+            self.mid_tick_deltas.append(
+                MidTickDelta(ts_ms=ts_ms, delta_ticks=(current_mid - prev_mid) / NQ_TICK_SIZE)
+            )
+
+        self.last_ts_ms = ts_ms
+        self.last_best_bid = bid
+        self.last_best_ask = ask
+        self.last_bid_size = bid_size
+        self.last_ask_size = ask_size
+
+        self._expire(ts_ms)
+        self._append_history(self.ofi_250ms_history, self.window_total(250, ts_ms))
+        self._append_history(self.ofi_1s_history, self.window_total(1000, ts_ms))
+        self._append_history(self.ofi_3s_history, self.window_total(3000, ts_ms))
+
+    def current_features(self, now_ms: int | None = None) -> dict[str, Optional[float]]:
+        if now_ms is None:
+            now_ms = self.last_ts_ms
+        if now_ms is None:
+            return {
+                "ofi_250ms": None,
+                "ofi_1s": None,
+                "ofi_3s": None,
+                "z_ofi_250ms": None,
+                "z_ofi_1s": None,
+                "z_ofi_3s": None,
+                "sigma_1s_ticks": None,
+            }
+
+        self._expire(now_ms)
+        ofi_250ms = self.window_total(250, now_ms)
+        ofi_1s = self.window_total(1000, now_ms)
+        ofi_3s = self.window_total(3000, now_ms)
+
+        return {
+            "ofi_250ms": round(ofi_250ms, 4),
+            "ofi_1s": round(ofi_1s, 4),
+            "ofi_3s": round(ofi_3s, 4),
+            "z_ofi_250ms": self._zscore(self.ofi_250ms_history, ofi_250ms),
+            "z_ofi_1s": self._zscore(self.ofi_1s_history, ofi_1s),
+            "z_ofi_3s": self._zscore(self.ofi_3s_history, ofi_3s),
+            "sigma_1s_ticks": self._sigma_1s_ticks(now_ms),
+        }
+
+    def window_total(self, window_ms: int, now_ms: int) -> float:
+        cutoff = now_ms - window_ms
+        total = 0.0
+        for c in self.contributions:
+            if c.ts_ms >= cutoff:
+                total += c.e
+        return total
+
+    def _sigma_1s_ticks(self, now_ms: int) -> Optional[float]:
+        cutoff = now_ms - 1000
+        xs = [d.delta_ticks for d in self.mid_tick_deltas if d.ts_ms >= cutoff]
+        if not xs:
+            return None
+        mean = sum(xs) / len(xs)
+        variance = sum((x - mean) ** 2 for x in xs) / len(xs)
+        return round(math.sqrt(max(0.0, variance)), 4)
+
+    def _zscore(self, history: Deque[float], current: float) -> Optional[float]:
+        if len(history) < self.z_warmup_samples:
+            return None
+        mean = sum(history) / len(history)
+        variance = sum((x - mean) ** 2 for x in history) / len(history)
+        std = math.sqrt(max(0.0, variance))
+        if std <= 0:
+            return 0.0
+        return round((current - mean) / std, 4)
+
+    def _append_history(self, history: Deque[float], value: float) -> None:
+        history.append(value)
+        while len(history) > self.history_limit:
+            history.popleft()
+
+    def _expire(self, now_ms: int) -> None:
+        cutoff = now_ms - self.max_window_ms
+        while self.contributions and self.contributions[0].ts_ms < cutoff:
+            self.contributions.popleft()
+        sigma_cutoff = now_ms - 1000
+        while self.mid_tick_deltas and self.mid_tick_deltas[0].ts_ms < sigma_cutoff:
+            self.mid_tick_deltas.popleft()
+
+    @staticmethod
+    def _valid_bbo(
+        bid: float,
+        ask: float,
+        bid_size: int,
+        ask_size: int,
+    ) -> bool:
+        return (
+            isinstance(bid, (int, float)) and
+            isinstance(ask, (int, float)) and
+            isinstance(bid_size, int) and
+            isinstance(ask_size, int) and
+            bid > 0 and ask > bid and bid_size > 0 and ask_size > 0
+        )
+
+    @staticmethod
+    def _compute_ofi_contribution(
+        prev_bid: float,
+        prev_ask: float,
+        prev_bid_size: int,
+        prev_ask_size: int,
+        bid: float,
+        ask: float,
+        bid_size: int,
+        ask_size: int,
+    ) -> float:
+        if bid > prev_bid:
+            i_bid = bid_size
+        elif bid == prev_bid:
+            i_bid = bid_size - prev_bid_size
+        else:
+            i_bid = -prev_bid_size
+
+        if ask < prev_ask:
+            i_ask = ask_size
+        elif ask == prev_ask:
+            i_ask = ask_size - prev_ask_size
+        else:
+            i_ask = -prev_ask_size
+
+        return float(i_bid - i_ask)
 
 
 # ─── Rolling MBO Aggregator ──────────────────────────────────────────────────

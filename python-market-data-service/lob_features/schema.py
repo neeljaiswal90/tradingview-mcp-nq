@@ -10,6 +10,44 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+
+@dataclass
+class ScalpState:
+    """Compact book + flow state for the lob_mbo_scalp family."""
+
+    bid_px: Optional[list[float]] = None
+    ask_px: Optional[list[float]] = None
+    bid_sz: Optional[list[int]] = None
+    ask_sz: Optional[list[int]] = None
+
+    microprice: Optional[float] = None
+    microprice_edge_ticks: Optional[float] = None
+
+    qi_1: Optional[float] = None
+    qi_3: Optional[float] = None
+    qi_5: Optional[float] = None
+
+    ofi_250ms: Optional[float] = None
+    ofi_1s: Optional[float] = None
+    ofi_3s: Optional[float] = None
+    z_ofi_250ms: Optional[float] = None
+    z_ofi_1s: Optional[float] = None
+    z_ofi_3s: Optional[float] = None
+
+    # Deferred to a later sidecar extension. These stay null-safe on the wire.
+    afi_250ms: Optional[float] = None
+    afi_1s: Optional[float] = None
+    afi_3s: Optional[float] = None
+    hazard_bid_1s: Optional[float] = None
+    hazard_ask_1s: Optional[float] = None
+    abs_bid_1s: Optional[float] = None
+    abs_ask_1s: Optional[float] = None
+    refill_bid_1s: Optional[float] = None
+    refill_ask_1s: Optional[float] = None
+
+    sigma_1s_ticks: Optional[float] = None
+    spread_ticks: Optional[int] = None
+
 # ─── Feature Snapshot ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -97,6 +135,7 @@ class LobFeatureSnapshot:
     # ── Correlation context (set by caller) ───────────────────────────────────
     trade_id: Optional[str] = None
     signal_id: Optional[str] = None
+    scalp_state: Optional[ScalpState] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

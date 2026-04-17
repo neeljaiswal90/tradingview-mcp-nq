@@ -13,7 +13,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lob_features.schema import LobFeatureSnapshot, ALL_FEATURE_NAMES, MBO_FEATURE_NAMES
-from lob_features.rolling import RollingTradeBuffer, RollingDepthState, RollingMboAggregator
+from lob_features.rolling import RollingTradeBuffer, RollingDepthState, RollingMboAggregator, RollingScalpState
 from lob_features.compute import compute_lob_features, compute_mbo_features
 
 
@@ -145,6 +145,68 @@ def test_full_snapshot_with_all_sources():
     assert snap.depth_imbalance_5 is not None
     assert snap.cumulative_delta_10s is not None
     assert snap.cancel_add_ratio_10s is not None
+
+
+def test_snapshot_emits_scalp_state_contract():
+    buf = RollingTradeBuffer()
+    depth = RollingDepthState()
+    mbo = RollingMboAggregator()
+    scalp = RollingScalpState()
+    base_ms = int(time.time() * 1000)
+
+    last_bid = 24200.00
+    last_ask = 24200.25
+    last_bid_size = 12
+    last_ask_size = 10
+
+    for i in range(40):
+        ts_ms = base_ms + i * 100
+        bid = 24200.00 + (0.25 if i % 5 in (1, 2) else 0.0)
+        ask = bid + 0.25
+        bid_size = 10 + (i % 4) * 3
+        ask_size = 8 + ((i + 2) % 4) * 2
+
+        scalp.observe_bbo(ts_ms, bid, ask, bid_size, ask_size)
+
+        for level in range(5):
+            depth.update("bid", bid - (level * 0.25), bid_size + (5 - level), ts_ms / 1000.0)
+            depth.update("ask", ask + (level * 0.25), ask_size + (4 - level), ts_ms / 1000.0)
+
+        last_bid = bid
+        last_ask = ask
+        last_bid_size = bid_size
+        last_ask_size = ask_size
+
+    snap = compute_lob_features(
+        last_bid,
+        last_ask,
+        last_bid_size,
+        last_ask_size,
+        buf,
+        depth,
+        mbo,
+        now=(base_ms + 3900) / 1000.0,
+        scalp_state_tracker=scalp,
+    )
+
+    assert snap.scalp_state is not None
+    assert snap.scalp_state.spread_ticks == 1
+    assert len(snap.scalp_state.bid_px or []) >= 1
+    assert len(snap.scalp_state.ask_px or []) >= 1
+    assert snap.scalp_state.qi_1 is not None
+    assert snap.scalp_state.qi_3 is not None
+    assert snap.scalp_state.qi_5 is not None
+    assert snap.scalp_state.ofi_250ms is not None
+    assert snap.scalp_state.ofi_1s is not None
+    assert snap.scalp_state.ofi_3s is not None
+    assert snap.scalp_state.z_ofi_250ms is not None
+    assert snap.scalp_state.z_ofi_1s is not None
+    assert snap.scalp_state.z_ofi_3s is not None
+    assert snap.scalp_state.sigma_1s_ticks is not None
+
+    payload = snap.to_dict()
+    assert isinstance(payload.get("scalp_state"), dict)
+    assert payload["scalp_state"]["spread_ticks"] == 1
 
 
 def test_snapshot_schema_completeness():

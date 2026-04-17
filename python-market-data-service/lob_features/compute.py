@@ -12,8 +12,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from .schema import LobFeatureSnapshot
-from .rolling import RollingTradeBuffer, RollingDepthState, RollingMboAggregator
+from .schema import LobFeatureSnapshot, ScalpState
+from .rolling import RollingTradeBuffer, RollingDepthState, RollingMboAggregator, RollingScalpState
 from .advanced_mbo import AdvancedMboAnalyzer
 from .microstructure import (
     AbsorptionDetector, SweepDetector, FootprintTracker,
@@ -21,6 +21,88 @@ from .microstructure import (
 )
 
 NQ_TICK_SIZE = 0.25
+
+
+def _weighted_queue_imbalance(
+    bids: list[tuple[float, int]],
+    asks: list[tuple[float, int]],
+    levels: int,
+) -> Optional[float]:
+    if levels <= 0:
+        return None
+    weighted_bid = 0.0
+    weighted_ask = 0.0
+    total = 0.0
+    for idx in range(levels):
+        weight = 1.0 / float(idx + 1)
+        if idx < len(bids):
+            bid_sz = bids[idx][1]
+            weighted_bid += weight * bid_sz
+            total += weight * bid_sz
+        if idx < len(asks):
+            ask_sz = asks[idx][1]
+            weighted_ask += weight * ask_sz
+            total += weight * ask_sz
+    if total <= 0:
+        return None
+    return round((weighted_bid - weighted_ask) / total, 4)
+
+
+def _build_scalp_state(
+    bid: Optional[float],
+    ask: Optional[float],
+    bid_size: Optional[int],
+    ask_size: Optional[int],
+    depth: RollingDepthState,
+    scalp_state_tracker: Optional[RollingScalpState],
+    now_ms: int,
+    spread_ticks: Optional[int],
+) -> Optional[ScalpState]:
+    if bid is None or ask is None or bid_size is None or ask_size is None:
+        return None
+    if bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0:
+        return None
+
+    top_bids = depth.top_n_bid(5)
+    top_asks = depth.top_n_ask(5)
+    if not top_bids:
+        top_bids = [(bid, bid_size)]
+    if not top_asks:
+        top_asks = [(ask, ask_size)]
+
+    microprice = round((ask * bid_size + bid * ask_size) / float(bid_size + ask_size), 4)
+    mid = (bid + ask) / 2.0
+    microprice_edge_ticks = round((microprice - mid) / NQ_TICK_SIZE, 4)
+
+    flow = scalp_state_tracker.current_features(now_ms) if scalp_state_tracker is not None else {
+        "ofi_250ms": None,
+        "ofi_1s": None,
+        "ofi_3s": None,
+        "z_ofi_250ms": None,
+        "z_ofi_1s": None,
+        "z_ofi_3s": None,
+        "sigma_1s_ticks": None,
+    }
+
+    return ScalpState(
+        bid_px=[round(px, 2) for px, _ in top_bids],
+        ask_px=[round(px, 2) for px, _ in top_asks],
+        bid_sz=[int(sz) for _, sz in top_bids],
+        ask_sz=[int(sz) for _, sz in top_asks],
+        microprice=microprice,
+        microprice_edge_ticks=microprice_edge_ticks,
+        qi_1=_weighted_queue_imbalance(top_bids, top_asks, 1),
+        qi_3=_weighted_queue_imbalance(top_bids, top_asks, 3),
+        qi_5=_weighted_queue_imbalance(top_bids, top_asks, 5),
+        ofi_250ms=flow["ofi_250ms"],
+        ofi_1s=flow["ofi_1s"],
+        ofi_3s=flow["ofi_3s"],
+        z_ofi_250ms=flow["z_ofi_250ms"],
+        z_ofi_1s=flow["z_ofi_1s"],
+        z_ofi_3s=flow["z_ofi_3s"],
+        sigma_1s_ticks=flow["sigma_1s_ticks"],
+        spread_ticks=spread_ticks,
+    )
 
 
 def compute_lob_features(
@@ -42,6 +124,7 @@ def compute_lob_features(
     large_trades: Optional[LargeTradeTracker] = None,
     volume_profile: Optional[SessionVolumeProfile] = None,
     current_price: Optional[float] = None,
+    scalp_state_tracker: Optional[RollingScalpState] = None,
 ) -> LobFeatureSnapshot:
     """
     Compute the full feature snapshot from current state.
@@ -80,6 +163,17 @@ def compute_lob_features(
     else:
         snap.data_quality = "unavailable" if bid is None else "stale"
         snap.bbo_age_ms = 99999
+
+    snap.scalp_state = _build_scalp_state(
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        depth=depth,
+        scalp_state_tracker=scalp_state_tracker,
+        now_ms=snap.timestamp_ms,
+        spread_ticks=snap.spread_ticks,
+    )
 
     # ── Depth ─────────────────────────────────────────────────────────────────
     if depth.bids or depth.asks:
