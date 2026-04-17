@@ -14,7 +14,7 @@
  * Safety guarantees:
  *   - Concurrent ticks are prevented via a busy flag.
  *   - Errors are logged; the loop continues.
- *   - SIGINT/SIGTERM triggers a graceful stop.
+ *   - The parent runner can stop the loop explicitly via stop().
  *   - Tick duration is measured for observability.
  */
 
@@ -156,14 +156,6 @@ export class LaneScheduler {
         }
         this.tick();
       }, baseTickMs);
-
-      const cleanup = () => {
-        this.stopped = true;
-        clearInterval(interval);
-        resolve();
-      };
-      process.once('SIGINT', cleanup);
-      process.once('SIGTERM', cleanup);
     });
   }
 
@@ -254,4 +246,3 @@ export class LaneScheduler {
       });
   }
 }
-

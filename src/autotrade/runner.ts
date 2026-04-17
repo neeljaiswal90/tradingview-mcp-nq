@@ -1,6 +1,6 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
- * Autonomous NQ / MNQ Futures Trading Engine — Main Runner (paper-only).
+ * Autonomous NQ / MNQ Futures Trading Engine â€” Main Runner (paper-only).
  *
  * Startup sequence:
  *   1. Load env + indicator config
@@ -13,13 +13,13 @@
  * Usage:
  *   npm run auto             # paper mode (default)
  *   npm run auto:signal      # signal_only mode
- *   npm run auto:live        # live mode (DISABLED — futures live not implemented)
+ *   npm run auto:live        # live mode (DISABLED â€” futures live not implemented)
  */
 
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 
-// Feature schema version — must stay in sync with FEATURE_SCHEMA_VERSION in
+// Feature schema version â€” must stay in sync with FEATURE_SCHEMA_VERSION in
 // python-market-data-service/lob_features/ml_feature_registry.py.
 // Update this constant (and bump the registry version) whenever the feature set changes.
 const ML_FEATURE_SCHEMA_VERSION = 'v3_advanced_mbo';
@@ -73,6 +73,10 @@ import { EnginePhaseManager } from './engine-phase.js';
 import { getContractSpec, tryGetContractSpec, assertLiveTradingAllowed } from './contracts.js';
 import { MultiInstrumentOrchestrator } from './multi-instrument-orchestrator.js';
 import { resolveRunnerLaunchMode } from './runner-launch.js';
+import {
+  isRunnerShutdownRequestMessage,
+  sendRunnerShutdownAck,
+} from './runner-ipc.js';
 import {
   normalizeExecutionMode,
   shouldAllowExecutionSideEffects,
@@ -152,10 +156,10 @@ async function verifyConnection(retries = MAX_STARTUP_RETRIES): Promise<void> {
       if (!health['api_available']) {
         throw new Error(`TradingView API not available: ${JSON.stringify(health)}`);
       }
-      console.log(`[STARTUP] ✅ TradingView connected | Symbol: ${health['chart_symbol']} | TF: ${health['chart_resolution']}`);
+      console.log(`[STARTUP] âœ… TradingView connected | Symbol: ${health['chart_symbol']} | TF: ${health['chart_resolution']}`);
       return;
     } catch (err) {
-      console.error(`[STARTUP] ❌ Connection attempt ${attempt}/${retries} failed:`, err);
+      console.error(`[STARTUP] âŒ Connection attempt ${attempt}/${retries} failed:`, err);
       if (attempt < retries) {
         console.log(`[STARTUP] Retrying in ${STARTUP_RETRY_DELAY_MS / 1000}s...`);
         await sleep(STARTUP_RETRY_DELAY_MS);
@@ -363,17 +367,17 @@ function printCycleSummary(opts: {
   changeNote: string;
 }): void {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const modeTag = opts.mode === 'paper' ? '📋 PAPER' : opts.mode === 'live' ? '🔴 LIVE ' : '📡 SIG  ';
-  const posTag = opts.positionOpen ? '🟢 IN' : '⬜ OUT';
+  const modeTag = opts.mode === 'paper' ? 'ðŸ“‹ PAPER' : opts.mode === 'live' ? 'ðŸ”´ LIVE ' : 'ðŸ“¡ SIG  ';
+  const posTag = opts.positionOpen ? 'ðŸŸ¢ IN' : 'â¬œ OUT';
   const decTag =
-    opts.decision === 'SHORT' ? '🔴 SHORT' :
-    opts.decision === 'LONG'  ? '🟢 LONG ' :
-    '⬜ WAIT ';
+    opts.decision === 'SHORT' ? 'ðŸ”´ SHORT' :
+    opts.decision === 'LONG'  ? 'ðŸŸ¢ LONG ' :
+    'â¬œ WAIT ';
 
   console.log(
-    `\n${'═'.repeat(70)}\n` +
+    `\n${'â•'.repeat(70)}\n` +
     `  ${modeTag} | Cycle #${String(opts.cycle).padStart(3)} | ${ts} UTC\n` +
-    `${'─'.repeat(70)}\n` +
+    `${'â”€'.repeat(70)}\n` +
     `  Symbol:    ${opts.symbol}    Price: ${opts.price.toFixed(2)}\n` +
     `  Regime:    ${opts.regime.padEnd(25)}  Position: ${posTag}\n` +
     `  Session:   ${opts.sessionTag}\n` +
@@ -382,9 +386,9 @@ function printCycleSummary(opts: {
     `  Setup:     ${opts.setup}\n` +
     `  Decision:  ${decTag}   Confidence: ${opts.confidence}/10\n` +
     `  Config:    ${opts.configVersion}\n` +
-    (opts.executed ? `  ✅ ORDER EXECUTED\n` : '') +
-    (opts.changeNote ? `  ⚡ ${opts.changeNote}\n` : '') +
-    `${'═'.repeat(70)}`
+    (opts.executed ? `  âœ… ORDER EXECUTED\n` : '') +
+    (opts.changeNote ? `  âš¡ ${opts.changeNote}\n` : '') +
+    `${'â•'.repeat(70)}`
   );
 }
 
@@ -406,29 +410,29 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
   const contract = getContractSpec(env.SYMBOL);
   const instrumentSymbol = contract.app_symbol;
-  console.log(`\n🚀 ${contract.display} Autonomous Trading Engine starting (${env.MODE.toUpperCase()})…\n`);
+  console.log(`\nðŸš€ ${contract.display} Autonomous Trading Engine starting (${env.MODE.toUpperCase()})â€¦\n`);
   console.log(
     `[STARTUP] Contract: ${contract.display} (${contract.root}) | venue=${contract.venue} ` +
     `| tick=${contract.tick_size} pt_value=$${contract.point_value} tick_value=$${contract.tick_value}`,
   );
 
-  // ─── Legacy contract guard ─────────────────────────────────────────────────
+  // â”€â”€â”€ Legacy contract guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // NQ and ES remain in the registry for replay and log-parsing but are not
   // allowed for live/paper trading. Refuse startup if the selected symbol is
-  // one of those — signal_only and shadow are allowed for replay tooling.
+  // one of those â€” signal_only and shadow are allowed for replay tooling.
   if (env.MODE === 'paper' || env.MODE === 'live') {
     assertLiveTradingAllowed(contract);
   } else if (contract.live_trading_allowed !== true) {
     console.warn(
-      `[STARTUP] ⚠ Contract ${contract.root} is legacy/replay-only ` +
-      `(live_trading_allowed=false). Continuing in ${env.MODE} mode — ` +
+      `[STARTUP] âš  Contract ${contract.root} is legacy/replay-only ` +
+      `(live_trading_allowed=false). Continuing in ${env.MODE} mode â€” ` +
       `this runner will NOT submit live or paper orders.`,
     );
   }
 
   const sessionId = `SESSION_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${randomUUID().slice(0, 8)}`;
 
-  // ── Phase 0: Lock + Recovery Gate (before any other disk writes) ──────────
+  // â”€â”€ Phase 0: Lock + Recovery Gate (before any other disk writes) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (!existsSync(env.LOG_DIR)) {
     mkdirSync(env.LOG_DIR, { recursive: true });
   }
@@ -442,7 +446,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     console.error('[STARTUP] Another runner instance is active. Exiting.');
     process.exit(1);
   }
-  // Lock held — all early-exit paths must release it explicitly.
+  // Lock held â€” all early-exit paths must release it explicitly.
 
   runtimeState.cleanupStaleTmpFiles();
 
@@ -452,7 +456,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     const rawCfg = JSON.parse(readFileSync(join(configDir, 'indicator-config.json'), 'utf-8'));
     earlyBootCycleStallMs = typeof rawCfg.cycle_stall_threshold_ms === 'number'
       ? rawCfg.cycle_stall_threshold_ms : null;
-  } catch { /* use null — cycle stall detection disabled if config unreadable */ }
+  } catch { /* use null â€” cycle stall detection disabled if config unreadable */ }
 
   const tradeJournal = new TradeJournal(env.LOG_DIR, sessionId);
   const recoveryArtifacts = readRecoveryArtifacts(runtimeState, tradeJournal);
@@ -476,10 +480,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     console.warn(`[STARTUP_RECOVERY] outcome=${recoveryReport.outcome} trade_id=${recoveryReport.open_trade_id ?? 'none'} action=${recoveryReport.action_taken}`);
   }
 
-  // Recovery gate passed — safe to create LogWriter and proceed
+  // Recovery gate passed â€” safe to create LogWriter and proceed
   const logWriter = new LogWriter(env.LOG_DIR);
   logWriter.setOnCriticalDiskError((filePath, err) => {
-    console.error(`[RUNNER] [CRITICAL] Disk write failure on ${filePath} — audit trail compromised. ` +
+    console.error(`[RUNNER] [CRITICAL] Disk write failure on ${filePath} â€” audit trail compromised. ` +
       `Manual intervention required. Error: ${err}`);
   });
   logWriter.startFlushTimer();
@@ -488,7 +492,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   // candidate rows. The lob_mbo_scalp generator in
   // src/autotrade/strategies/lob-mbo-scalp.ts writes via a module-level
   // wrapper that looks up this registration. Rejection sampling rate
-  // defaults to 1 (no sampling, unbiased early shadow data) — Phase 6
+  // defaults to 1 (no sampling, unbiased early shadow data) â€” Phase 6
   // config wiring will let the user raise it via indicator-config.json
   // if volume becomes a concern.
   registerScalperLogWriter(logWriter);
@@ -523,25 +527,25 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
   runtimeState.initialize(sessionId, env.MODE, env.RESTART_MODE);
   runtimeState.startHeartbeat();
-  // 60s periodic session checkpoint — writes live session totals to sessions.jsonl
+  // 60s periodic session checkpoint â€” writes live session totals to sessions.jsonl
   // and performance.json so operators can monitor without waiting for shutdown.
   let perfCheckpointTimer: ReturnType<typeof setInterval> | null = null;
   const configManager = new IndicatorConfigManager(configDir);
 
   // Validate and print the canonical trading config.
-  // All strategy/risk params come from indicator-config.json — env vars are
+  // All strategy/risk params come from indicator-config.json â€” env vars are
   // operational only (mode, symbol, log_dir, adapter selection).
   const validation = configManager.validate();
   if (!validation.valid) {
-    for (const err of validation.errors) console.error(`[CONFIG] ❌ ${err}`);
-    throw new Error('indicator-config.json has invalid values — fix before starting');
+    for (const err of validation.errors) console.error(`[CONFIG] âŒ ${err}`);
+    throw new Error('indicator-config.json has invalid values â€” fix before starting');
   }
-  for (const warn of validation.warnings) console.warn(`[CONFIG] ⚠️  ${warn}`);
+  for (const warn of validation.warnings) console.warn(`[CONFIG] âš ï¸  ${warn}`);
   configManager.printEffectiveConfig();
 
   const effectiveConfig = configManager.getConfig();
 
-  // ─── Phase 6 scalper generator wiring ──────────────────────────────────────
+  // â”€â”€â”€ Phase 6 scalper generator wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   //
   // Closes the Phase 5 `missing_shadow_config` canary. The scalper
   // generator refuses to run with implicit defaults (Phase 5 "no
@@ -552,10 +556,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   //   2. Load the expectancy bucket table from the configured path
   //      (`reports/ml/lob_mbo_scalp/expectancy_buckets.json` by default).
   //   3. Resolve the coefs model directory via the standard chain
-  //      (LOB_MBO_SCALP_MODEL_DIR env → promoted.json → latest dir).
+  //      (LOB_MBO_SCALP_MODEL_DIR env â†’ promoted.json â†’ latest dir).
   //   4. Load + validate the six coefs files.
   //   5. Build a SYNC ML decider closure that runs in-process
-  //      `computeScalperLogisticInference` — no HTTP.
+  //      `computeScalperLogisticInference` â€” no HTTP.
   //   6. Register the options bag via `registerScalperGeneratorOptions`.
   //   7. Plumb the rejection sample rate from config into the writer.
   //
@@ -564,7 +568,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   // fail-SOFT on missing artifacts: if the expectancy table or coefs
   // are not yet built, we log a warning and leave the options bag
   // unregistered. The Phase 5 generator then emits
-  // `missing_shadow_config` for every scalper cycle — which is
+  // `missing_shadow_config` for every scalper cycle â€” which is
   // exactly the observable state we want during the bootstrap phase
   // before any model has been trained.
   try {
@@ -590,7 +594,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }).lob_mbo_scalp;
 
     if (!scalperCfg) {
-      console.warn('[SCALPER] No `lob_mbo_scalp` config block found — scalper shadow path stays cold.');
+      console.warn('[SCALPER] No `lob_mbo_scalp` config block found â€” scalper shadow path stays cold.');
     } else {
       // Rejection sample rate into the writer
       const rsr = scalperCfg.rejection_sample_rate ?? 1;
@@ -598,7 +602,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         setScalperRejectionSampleRate(rsr);
       }
 
-      // Typed shadow decision config — explicit fields, no optional chains
+      // Typed shadow decision config â€” explicit fields, no optional chains
       const shadowDecisionConfig: ScalperShadowDecisionConfig = {
         theta_p: scalperCfg.theta_p ?? 0.55,
         ev_floor_ticks: scalperCfg.ev_floor_ticks ?? 0.5,
@@ -607,7 +611,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         hybrid_gate: scalperCfg.hybrid_gate ?? false,
       };
 
-      // Deterministic gate thresholds — per-field overrides on top of
+      // Deterministic gate thresholds â€” per-field overrides on top of
       // DEFAULT_SCALPER_GATE_CONFIG. Missing fields fall through to the
       // defaults. MNQ operators should set spreadMaxTicks: 2 in config
       // (the default is 1, tuned for the parent NQ contract which
@@ -623,13 +627,13 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         hazardDiffMin: gt?.hazardDiffMin ?? DEFAULT_SCALPER_GATE_CONFIG.hazardDiffMin,
       };
 
-      // Expectancy bucket table — optional until a table is built
+      // Expectancy bucket table â€” optional until a table is built
       const bucketPath = scalperCfg.expectancy_bucket_table_path ?? 'reports/ml/lob_mbo_scalp/expectancy_buckets.json';
       const bucketResult = loadScalperExpectancyTable(bucketPath);
       console.log(`[SCALPER] Expectancy bucket load: status=${bucketResult.status} path=${bucketPath}`);
       console.log(`[SCALPER]   detail: ${bucketResult.detail}`);
 
-      // Coefs — optional until the Phase 4.4 trainer has run and produced a promoted version
+      // Coefs â€” optional until the Phase 4.4 trainer has run and produced a promoted version
       const modelDir = resolveScalperModelDir(process.cwd());
       let mlDecider: ReturnType<typeof buildScalperMlDecider> | null = null;
       if (modelDir) {
@@ -651,7 +655,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         console.warn('[SCALPER] No scalper model directory resolvable (no env / promoted.json / versions/*).');
       }
 
-      // Phase 8 Option B — ALWAYS register generator options, even when
+      // Phase 8 Option B â€” ALWAYS register generator options, even when
       // the expectancy bucket table and/or coefs are missing. The
       // fallback decider from `buildFallbackScalperMlDecider()` returns
       // `ready=false, reason='bootstrap_no_model'` on every call, so
@@ -665,7 +669,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       // evaluation writes a JSONL row with honest telemetry. Once
       // the operator accumulates enough data to build real artifacts,
       // promoting them and restarting switches the generator from
-      // the fallback to the real ML path — no code change.
+      // the fallback to the real ML path â€” no code change.
       //
       // Rows produced via the fallback are TELEMETRY-ONLY. Any
       // row whose `ml_decision.model_version === 'bootstrap_no_model'`
@@ -684,7 +688,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       const expectancyTag = bucketResult.status === 'loaded' ? 'real' : 'bootstrap_null';
       const mlTag = mlDecider !== null ? 'real' : 'bootstrap_fallback';
       console.log(
-        `[SCALPER] Generator options registered — ` +
+        `[SCALPER] Generator options registered â€” ` +
         `theta_p=${shadowDecisionConfig.theta_p} ` +
         `ev_floor_ticks=${shadowDecisionConfig.ev_floor_ticks} ` +
         `hybrid_gate=${shadowDecisionConfig.hybrid_gate} ` +
@@ -692,7 +696,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         `expectancy=${expectancyTag} ml=${mlTag}`,
       );
       console.log(
-        `[SCALPER] Deterministic gate thresholds — ` +
+        `[SCALPER] Deterministic gate thresholds â€” ` +
         `spreadMaxTicks=${deterministicConfig.spreadMaxTicks} ` +
         `qiMin=${deterministicConfig.qiMin} ` +
         `edgeMinTicks=${deterministicConfig.edgeMinTicks} ` +
@@ -703,7 +707,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       );
       if (expectancyTag === 'bootstrap_null' || mlTag === 'bootstrap_fallback') {
         console.warn(
-          `[SCALPER] Running in BOOTSTRAP MODE — telemetry rows will accumulate with ` +
+          `[SCALPER] Running in BOOTSTRAP MODE â€” telemetry rows will accumulate with ` +
           `ml_readiness_not_confirmed / ml_unavailable / expectancy_no_bucket_match reject reasons. ` +
           `Train artifacts and promote to exit bootstrap.`,
         );
@@ -713,7 +717,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     console.warn(`[SCALPER] Phase 6 wiring failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // ─── Canonical execution_mode normalization ────────────────────────────────
+  // â”€â”€â”€ Canonical execution_mode normalization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const executionMode = normalizeExecutionMode(effectiveConfig);
   const executionSideEffectsAllowed = shouldAllowExecutionSideEffects(executionMode);
 
@@ -766,7 +770,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     effectiveConfig.quote_poll_timeout_ms ?? 1_000,
   );
 
-  // ── Bookmap/Rithmic BBO provider (primary quote authority when available) ──
+  // â”€â”€ Bookmap/Rithmic BBO provider (primary quote authority when available) â”€â”€
   const lobServiceUrl = process.env['LOB_SERVICE_URL'] ?? 'http://127.0.0.1:5010';
   const lobClient = new LobClient(lobServiceUrl, 800);
   const bookmapProvider = new BookmapQuoteProvider(
@@ -780,17 +784,17 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   try { lobHealth = await lobClient.getHealth(); } catch { /* sidecar not running */ }
   const lobHealthy = lobHealth?.status === 'ok' && lobHealth.source_connected && lobHealth.bbo_fresh;
   if (lobHealthy) {
-    console.log(`[LOB] Bookmap/Rithmic sidecar connected at ${lobServiceUrl} — primary quote authority`);
+    console.log(`[LOB] Bookmap/Rithmic sidecar connected at ${lobServiceUrl} â€” primary quote authority`);
     console.log(formatMboStatusLine(lobHealth));
   } else {
-    console.log(`[LOB] Bookmap/Rithmic sidecar not available at ${lobServiceUrl} — using TradingView fallback`);
+    console.log(`[LOB] Bookmap/Rithmic sidecar not available at ${lobServiceUrl} â€” using TradingView fallback`);
   }
 
   const managementEngine = new ManagementDecisionEngine(
     contract,
     effectiveConfig.position_target ?? null,
   );
-  // Persists the latest management metrics across the onMonitor → writeTradePathPoint boundary
+  // Persists the latest management metrics across the onMonitor â†’ writeTradePathPoint boundary
   let lastMgmtMetrics: ManagementMetrics | null = null;
   let lastMlDecision: MlDecision | null = null;
   const mlConfig: MlManagementConfig = effectiveConfig.ml_management ?? DEFAULT_ML_CONFIG;
@@ -882,11 +886,11 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     code_sha: APP_BUILD_SHA,
   });
 
-  // ── Phase 8 Stage A: load expectancy bucket table once at startup ───
+  // â”€â”€ Phase 8 Stage A: load expectancy bucket table once at startup â”€â”€â”€
   //
   // The loader validates provenance (schema_version, bin edges,
   // backoff_order, horizon) against the engine's canonical constants.
-  // Any mismatch is LOUD — the runner logs the rejection reason and
+  // Any mismatch is LOUD â€” the runner logs the rejection reason and
   // continues with `null` table. Downstream (`lookupExpectancy`)
   // returns null-null estimates, which `deriveExpectancyVerdict`
   // converts to `no_data`, which Stage B treats as neutral
@@ -894,13 +898,13 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   // tables into live gate behavior").
   //
   // The table is loaded ONCE at runner startup, not per-cycle. A
-  // bucket-table refresh requires a runner restart — which is the
+  // bucket-table refresh requires a runner restart â€” which is the
   // correct operational boundary for a calibration change.
-  // ── Artifact gate (paper/live must have symbol-scoped ML artifacts) ──────
+  // â”€â”€ Artifact gate (paper/live must have symbol-scoped ML artifacts) â”€â”€â”€â”€â”€â”€
   //
   // Shadow and signal_only still tolerate cross-symbol fallback with a loud
   // warning (so the user can replay NQ history into an MNQ stack for
-  // diagnostics). paper and live MUST have symbol-scoped artifacts — the
+  // diagnostics). paper and live MUST have symbol-scoped artifacts â€” the
   // runner refuses to start otherwise. This is stricter than the previous
   // behavior, which only warned.
   const repoRoot = getRepoRoot();
@@ -935,7 +939,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       if (expectancyFallbackUsed && executionMode !== 'shadow') {
         console.warn(
           `[QUANT-ENGINE] Symbol-specific bucket table ${symbolTablePath.relativePath} not found. ` +
-          `Cross-symbol fallback rejected in ${executionMode} mode — marking non-eligible. ` +
+          `Cross-symbol fallback rejected in ${executionMode} mode â€” marking non-eligible. ` +
           `Bootstrap a symbol-scoped table with: npm run bootstrap:paper-artifacts -- --symbol ${contract.root}`
         );
         expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'cross_symbol_fallback', reason: `generic fallback rejected in ${executionMode} mode`, source_rows: 0, fallback_used: true };
@@ -962,10 +966,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           );
           expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'ok', reason: 'loaded', source_rows: loadResult.provenance.source_row_count ?? 0, fallback_used: expectancyFallbackUsed };
         } else if (loadResult.status === 'insufficient_data') {
-          // Table loads for telemetry/diagnostics only — NOT for execution gating.
+          // Table loads for telemetry/diagnostics only â€” NOT for execution gating.
           expectancyTable = loadResult.table;
           console.warn(
-            `[QUANT-ENGINE] ⚠ Bucket table has insufficient data for execution gating (telemetry-only mode). ` +
+            `[QUANT-ENGINE] âš  Bucket table has insufficient data for execution gating (telemetry-only mode). ` +
             `Detail: ${loadResult.detail}`
           );
           expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: 'insufficient_data', reason: loadResult.detail, source_rows: loadResult.provenance.source_row_count ?? 0, fallback_used: expectancyFallbackUsed };
@@ -973,19 +977,19 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           console.warn(
             `[QUANT-ENGINE] Bucket table NOT loaded (status=${loadResult.status}). ` +
             `Expectancy will be no_data for every candidate, which the ` +
-            `Phase 7 Stage B gate treats as neutral — NOT as a rejection. ` +
+            `Phase 7 Stage B gate treats as neutral â€” NOT as a rejection. ` +
             `Detail: ${loadResult.detail}`
           );
           expectancyTableStatus = { subsystem: 'expectancy_bucket_table', status: loadResult.status, reason: loadResult.detail, source_rows: 0, fallback_used: expectancyFallbackUsed };
         }
       }
     } else {
-      console.log('[QUANT-ENGINE] quant_entry.enabled=false — expectancy engine dormant (Phase 7 scaffold only)');
+      console.log('[QUANT-ENGINE] quant_entry.enabled=false â€” expectancy engine dormant (Phase 7 scaffold only)');
     }
   }
-  // ── Pre-seed orderflow buffer ────────────────────────────────────────
+  // â”€â”€ Pre-seed orderflow buffer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   //
-  // Strategy 1: Restore from persisted buffer state (shutdown → startup).
+  // Strategy 1: Restore from persisted buffer state (shutdown â†’ startup).
   // Strategy 2: Replay historical LOB snapshots from disk.
   // The persisted state is preferred because it retains the exact rolling
   // mean/std state, not just the raw contributions. If the persisted state
@@ -1008,7 +1012,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         `ready=${result.buffer_ready}, source=${result.restored_from}`
       );
     } else if (persistRestored === 0) {
-      console.log('[ORDERFLOW] No persisted state or LOB snapshots — z_ofi_blend will warm up from live data');
+      console.log('[ORDERFLOW] No persisted state or LOB snapshots â€” z_ofi_blend will warm up from live data');
     }
   }
 
@@ -1016,7 +1020,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   const extensionConfig: EntryExtensionFilterConfig = effectiveConfig.entry_extension_filters ?? DEFAULT_EXTENSION_FILTER_CONFIG;
   const execPolicy = new ExecutionPolicyEngine(execPolicyConfig);
 
-  // ─── Delta 6: CUSUM cycle watchdog ───────────────────────────────────────
+  // â”€â”€â”€ Delta 6: CUSUM cycle watchdog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Layered on top of the existing `cycle_stall_threshold_ms` hard threshold.
   // Detects small persistent drifts in cycle duration that would otherwise
   // accumulate below the hard threshold. Baseline is built from the first N
@@ -1029,7 +1033,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   const cycleCusum = new CycleCusumTracker(cusumConfig);
   let previousCycleStartMs: number | null = null;
 
-  // 480 × 1m bars = 8 hours — enough to span overnight into prior RTH
+  // 480 Ã— 1m bars = 8 hours â€” enough to span overnight into prior RTH
   // for prior_rth_high/low computation; also supports opening range caching.
   const dataCollector = new DataCollector({ bars1m: 480, bars5m: 60, bars15m: 30, bars1h: 24 });
   const riskManager = new RiskManager(effectiveConfig, contract);
@@ -1056,7 +1060,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     if (curvesFallbackUsed && executionMode !== 'shadow') {
       console.warn(
         `[STARTUP] Symbol-specific curves ${symbolCurvesPath.relativePath} not found. ` +
-        `Cross-symbol fallback rejected in ${executionMode} mode — Lane B disabled. ` +
+        `Cross-symbol fallback rejected in ${executionMode} mode â€” Lane B disabled. ` +
         `Bootstrap symbol-scoped curves with: npm run bootstrap:paper-artifacts -- --symbol ${contract.root}`
       );
       positionManager.setFailureCurves(null);
@@ -1081,15 +1085,15 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         );
         failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'ok', reason: 'loaded', family_count: curves.size, fallback_used: curvesFallbackUsed };
       } else {
-        // Explicitly disable Lane B — do NOT install empty map
+        // Explicitly disable Lane B â€” do NOT install empty map
         positionManager.setFailureCurves(null);
-        console.warn('[STARTUP] ⚠ Failure-exit curves are empty — Lane B of Dead-Trade Guard is DISABLED (fallback mode)');
+        console.warn('[STARTUP] âš  Failure-exit curves are empty â€” Lane B of Dead-Trade Guard is DISABLED (fallback mode)');
         failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'fallback', reason: 'empty_curves', family_count: 0, fallback_used: curvesFallbackUsed };
       }
     }
   } catch (err) {
     positionManager.setFailureCurves(null);
-    console.warn(`[STARTUP] ⚠ Failed to load failure-exit curves: ${(err as Error).message} — Lane B DISABLED`);
+    console.warn(`[STARTUP] âš  Failed to load failure-exit curves: ${(err as Error).message} â€” Lane B DISABLED`);
     failureCurvesStatus = { subsystem: 'failure_exit_curves', status: 'fallback', reason: 'load_error', family_count: 0, fallback_used: false };
   }
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
@@ -1098,17 +1102,17 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   const events = EventCalendar.load(configDir);
   console.log(`[STARTUP] Loaded event calendar: ${events.size()} events`);
 
-  // ── Artifact execution eligibility policy ──────────────────────────
+  // â”€â”€ Artifact execution eligibility policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   //
   //  Artifact                  | Missing/Empty (paper)    | Insufficient Data (paper) | Effect
-  //  ─────────────────────────-┼──────────────────────────┼───────────────────────────┼─────────────────────
+  //  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€-â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   //  failure_exit_curves       | ALLOWED (Lane B optional)| n/a                       | Lane B disabled
   //  expectancy_bucket_table   | NOT eligible             | NOT eligible (telemetry)  | No execution gating
   //
   //  all_checks_passed:      true only when ALL artifacts have execution_eligible=true
   //  paper_execution_safe:   true when all REQUIRED (non-optional) artifacts are eligible
-  //                          failure_exit_curves is optional → does not block paper_execution_safe
-  // ─────────────────────────────────────────────────────────────────────
+  //                          failure_exit_curves is optional â†’ does not block paper_execution_safe
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     const artifacts: Array<{
       name: string; symbol: string; load_status: string;
@@ -1141,7 +1145,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
 
     const allChecksPassed = artifacts.every(a => a.execution_eligible);
-    // Lane B (failure_exit_curves) is optional for paper execution — does not block paper_execution_safe.
+    // Lane B (failure_exit_curves) is optional for paper execution â€” does not block paper_execution_safe.
     const nonBlockingSubsystems = new Set(['failure_exit_curves']);
     const paperExecutionSafe = artifacts.every(
       a => a.execution_eligible || nonBlockingSubsystems.has(a.name),
@@ -1193,7 +1197,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   };
   logWriter.writeSession(session);
 
-  // ─── Dashboard ─────────────────────────────────────────────────────────────
+  // â”€â”€â”€ Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const dashboardState = new DashboardStateManager();
   dashboardState.setAppMeta(
     { symbol: instrumentSymbol, mode: env.MODE, session_id: sessionId },
@@ -1204,7 +1208,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
   // Phase 7: wire the scalper log writer to publish per-family metrics
   // into the dashboard state manager. One call per scalper candidate
-  // row. The observer is synchronous and must never throw — any error
+  // row. The observer is synchronous and must never throw â€” any error
   // is logged and suppressed inside writeLobMboScalpCandidate so a
   // buggy dashboard cannot corrupt the training log pipeline.
   registerScalperDashboardObserver((row) => {
@@ -1228,7 +1232,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     staticDir,
   });
   dashboardServer.start().catch(err => {
-    console.warn('[DASHBOARD] ⚠️ Failed to start dashboard server (non-fatal):', err);
+    console.warn('[DASHBOARD] âš ï¸ Failed to start dashboard server (non-fatal):', err);
   });
 
   console.log('\n[STARTUP] Verifying TradingView connection...');
@@ -1259,30 +1263,30 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
   let lastAlignmentScore: number | null = null;
   let lastConfidence: number | null = null;
   const recentEventLog: string[] = [];
-  // ── Engine phase state machine ────────────────────────────────────────────
+  // â”€â”€ Engine phase state machine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const phaseManager = new EnginePhaseManager();
   let lastSignal: DualDirectionResult | null = null;
   let lastCooldownActive: boolean | null = null;
 
-  // ── ML management health check ────────────────────────────────────────────
+  // â”€â”€ ML management health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (mlConfig.enabled) {
     const mlHealthy = await checkMlHealth(mlConfig.service_url, mlConfig.timeout_ms);
     if (mlHealthy) {
       console.log(`[ML] ML management service connected at ${mlConfig.service_url}`);
     } else {
-      console.warn(`[ML] ML management service NOT reachable at ${mlConfig.service_url} — ML decisions will be skipped`);
+      console.warn(`[ML] ML management service NOT reachable at ${mlConfig.service_url} â€” ML decisions will be skipped`);
     }
   } else {
     console.log('[ML] ML management disabled in config');
   }
 
   console.log(
-    `\n[RUNNER] ▶️  Starting hybrid loop in mode: ${env.MODE.toUpperCase()} ` +
+    `\n[RUNNER] â–¶ï¸  Starting hybrid loop in mode: ${env.MODE.toUpperCase()} ` +
     `(analysis=${effectiveConfig.analysis_interval_seconds}s, ` +
     `monitor=${effectiveConfig.in_position_monitor_seconds}s)\n`,
   );
 
-  // ─── Shadow / advisory signal (runs in MANAGING for analytics only) ─────────
+  // â”€â”€â”€ Shadow / advisory signal (runs in MANAGING for analytics only) â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const runShadowSignal = async (snap: MarketSnapshot | null, cycleNumber: number): Promise<void> => {
     if (!snap) return;
     const advisoryResult: DualDirectionResult = generateSignal(
@@ -1294,7 +1298,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       `| conf=${advisoryResult.confidence} | regime=${advisoryResult.regime}`,
     );
 
-    // Log as advisory signal — never used for execution
+    // Log as advisory signal â€” never used for execution
     const shadowId = `SHADOW_${sessionId}_${String(cycleNumber).padStart(4, '0')}`;
     const shadowSignal: Signal = {
       signal_id: shadowId,
@@ -1336,12 +1340,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     lastConfidence = advisoryResult.confidence;
   };
 
-  // ─── Zombie-trade watchdog state ──────────────────────────────────────────────
+  // â”€â”€â”€ Zombie-trade watchdog state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const ZOMBIE_THRESHOLD_MS = 60 * 60 * 1000;  // 60 minutes
   const ZOMBIE_LOG_INTERVAL_MS = 10 * 60 * 1000; // re-warn every 10 min
   let lastZombieWarningAt = 0;
 
-  // ─── Analysis cycle ─────────────────────────────────────────────────────────
+  // â”€â”€â”€ Analysis cycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const onAnalysis = async (cycleNumber: number): Promise<void> => {
     if (engineShuttingDown) return; // Block new analysis during shutdown
     runtimeState.updateCycleStart();
@@ -1351,20 +1355,20 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
     const currentDay = new Date().getUTCDate();
     if (currentDay !== lastResetDay) {
-      console.log('[RUNNER] 🔄 New UTC day — resetting daily risk counters');
+      console.log('[RUNNER] ðŸ”„ New UTC day â€” resetting daily risk counters');
       riskManager.resetDaily();
       lastResetDay = currentDay;
     }
 
     if (riskManager.isLocked()) {
       const lockReason = riskManager.getLockReason();
-      console.log(`[RUNNER] 🔒 Risk locked (${lockReason}). Monitoring only.`);
+      console.log(`[RUNNER] ðŸ”’ Risk locked (${lockReason}). Monitoring only.`);
       return;
     }
 
     const healthy = await quickHealthCheck();
     if (!healthy) {
-      console.error('[RUNNER] ⚠️  TradingView health check failed. Skipping cycle.');
+      console.error('[RUNNER] âš ï¸  TradingView health check failed. Skipping cycle.');
       return;
     }
 
@@ -1372,7 +1376,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     try {
       snap = await dataCollector.collect(instrumentSymbol);
     } catch (err) {
-      console.error('[RUNNER] ❌ Data collection failed:', err);
+      console.error('[RUNNER] âŒ Data collection failed:', err);
       return;
     }
     // attach event state
@@ -1383,7 +1387,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     // One-way warmup latch: transition to ready when data quality meets threshold
     if (!runtimeState.isWarmupComplete() && isWarmupComplete(snap.data_quality)) {
       runtimeState.markWarmupComplete();
-      console.log('[RUNNER] Warmup complete — sufficient bars and indicators available');
+      console.log('[RUNNER] Warmup complete â€” sufficient bars and indicators available');
     }
     dashboardState.updateMarketSnapshot(snap);
     dashboardState.incrementCycle();
@@ -1413,7 +1417,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       }
     }
 
-    // ── Phase-aware routing ──────────────────────────────────────────────
+    // â”€â”€ Phase-aware routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const phase = phaseManager.current();
 
     // COOLDOWN: check if expired, transition to FLAT; otherwise skip analysis
@@ -1429,12 +1433,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       }
     }
 
-    // MANAGING: position is open — V2 management lane handles exits.
+    // MANAGING: position is open â€” V2 management lane handles exits.
     // onAnalysis only logs trade-path and dashboard state when MANAGING.
     if (phase === 'MANAGING') {
       const pos = positionManager.getPosition();
       if (pos) {
-        const direction = pos.side === 'short' ? '🔴' : '🟢';
+        const direction = pos.side === 'short' ? 'ðŸ”´' : 'ðŸŸ¢';
         const pnlPts = pos.side === 'short' ? pos.entry_price - snap.price : snap.price - pos.entry_price;
         const pnlUsd = pnlPts * pos.quantity_remaining * contract.point_value;
         console.log(
@@ -1445,12 +1449,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         );
         const riskPts = Math.abs(pos.entry_price - pos.stop_initial);
         logWriter.writeTradePathPoint({
-          // ── Row schema ─────────────────────────────────────────────────────
+          // â”€â”€ Row schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           row_type: 'trade_path_point',
           schema_version: 2,
           owner: 'v1',
           source_lane: 'monitor',
-          // ── Core fields ────────────────────────────────────────────────────
+          // â”€â”€ Core fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           timestamp: new Date().toISOString(),
           trade_id: pos.trade_id,
           session_id: sessionId,
@@ -1469,14 +1473,14 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           mfe_pts: Math.round(pos.max_favorable_excursion * 100) / 100,
           mae_pts: Math.round(pos.max_adverse_excursion * 100) / 100,
           hold_seconds: Math.round((Date.now() - pos.entry_time_unix) / 1000),
-          // ── ML training enrichment fields ──────────────────────────────────
+          // â”€â”€ ML training enrichment fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           initial_risk_pts: riskPts,
           setup_type: pos.setup_type,
           regime: lastRegime,
           pop_t1_advisory: lastMgmtMetrics?.pop.pop_target1_before_stop ?? null,
           pop_t2_advisory: lastMgmtMetrics?.pop.pop_target2_before_stop ?? null,
           pop_model: lastMgmtMetrics?.pop.model_name ?? null,
-          // ── Management state enrichment ────────────────────────────────────
+          // â”€â”€ Management state enrichment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           management_profile: pos.management_params?.profile_name ?? null,
           pt1_done: pos.pt1_done,
           pt2_done: pos.pt2_done,
@@ -1484,7 +1488,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           pre_t1_trailing_active: pos.pre_t1_trailing_active,
           trail_distance_ticks: pos.trail_distance_ticks,
           atr_at_entry: pos.atr_at_entry,
-          // ── Position progression (Phase 10) ────────────────────────────────
+          // â”€â”€ Position progression (Phase 10) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           stop_initial: pos.stop_initial,
           trail_anchor_price: pos.trail_anchor_price,
           pt1_realized_pnl: pos.pt1_realized_pnl,
@@ -1495,7 +1499,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           mae_at_pt1_trigger: pos.mae_at_pt1_trigger,
           peak_r_before_first_partial: pos.peak_r_before_first_partial,
           management_state: lastMgmtMetrics?.management_state ?? null,
-          // ── ML advisory state ──────────────────────────────────────────────
+          // â”€â”€ ML advisory state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           ml_action: lastMlDecision?.action ?? null,
           ml_confidence: lastMlDecision?.confidence ?? null,
           ml_prob_hold: lastMlDecision?.prob_hold ?? null,
@@ -1515,10 +1519,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         effectiveConfig.analysis_interval_seconds * 1000,
       );
       dashboardState.flush();
-      return; // Do NOT fall through to generateSignal() — no entry analysis in MANAGING
+      return; // Do NOT fall through to generateSignal() â€” no entry analysis in MANAGING
     }
 
-    // ── FLAT phase: full analysis + entry evaluation ───────────────────────
+    // â”€â”€ FLAT phase: full analysis + entry evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     // Pre-fetch LOB snapshot for layered scoring (shadow or enabled)
     const lsConf = effectiveConfig.layered_scoring;
@@ -1531,11 +1535,11 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       generateSignal(snap, effectiveConfig, contract, undefined, preScoringLobSnap, expectancyTable);
     runtimeState.updateSignalDecision();
     const { regime, bias, bestSetup, tradeAllowed: baseTradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
-    // confidence is mutable — micro overlay may adjust it below
+    // confidence is mutable â€” micro overlay may adjust it below
     let confidence = dualResult.confidence;
     let tradeAllowed = baseTradeAllowed;
 
-    // Phase 2 — registry status gate (final execution eligibility).
+    // Phase 2 â€” registry status gate (final execution eligibility).
     // compareSides() picked a winner on score alone; shadow strategies can
     // win but must never execute. Resolve the effective registry status
     // here so it can be threaded into the primary candidate log (so
@@ -1553,7 +1557,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       if (!skipReasons.includes(_shadowReason!)) skipReasons.push(_shadowReason!);
       console.log(
         `[SHADOW] winner ${bestSetup!.direction} ${bestSetup!.setup_type} ` +
-        `(status=${_shadowEffStatus}) — telemetry only, no execution`,
+        `(status=${_shadowEffStatus}) â€” telemetry only, no execution`,
       );
     }
     lastRegime = regime;
@@ -1573,7 +1577,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
     const biasStr = `1h:${bias['1h']} 15m:${bias['15m']} 5m:${bias['5m']} 1m:${bias['1m']} (${bias.alignment_score}/4)`;
     const setupStr = bestSetup
-      ? `${bestSetup.setup_type} ${bestSetup.direction} @ ${bestSetup.entry_low.toFixed(2)}–${bestSetup.entry_high.toFixed(2)}`
+      ? `${bestSetup.setup_type} ${bestSetup.direction} @ ${bestSetup.entry_low.toFixed(2)}â€“${bestSetup.entry_high.toFixed(2)}`
       : 'none';
 
     const signal: Signal = {
@@ -1608,7 +1612,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       dual_score_margin: dualMargin,
     };
 
-    // ── Cooldown & same-bar reversal safety (delegated to EnginePhaseManager) ──
+    // â”€â”€ Cooldown & same-bar reversal safety (delegated to EnginePhaseManager) â”€â”€
     let cooldownBlock: string | null = null;
     if (tradeAllowed && bestSetup) {
       cooldownBlock = phaseManager.getCooldownBlock(
@@ -1621,14 +1625,14 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         signal.reason_for_skip = (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') + cooldownBlock;
         signal.trade_allowed = false;
         signal.no_trade = true;
-        console.log(`[RUNNER] ⏳ Safety block: ${cooldownBlock}`);
+        console.log(`[RUNNER] â³ Safety block: ${cooldownBlock}`);
       }
     }
     lastCooldownActive = cooldownBlock !== null;
 
     let executed = false;
 
-    // ── Log candidate signal + compute extension features ────────────────
+    // â”€â”€ Log candidate signal + compute extension features â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let extensionFeatures: ExtensionFeatures | null = null;
     let extensionVetoed = false;
     let extensionVetoReasons: string[] = [];
@@ -1639,7 +1643,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       ? (preScoringLobSnap ?? await lobClient.getSnapshot().catch(() => null))
       : null;
 
-    // Microstructure score overlay — computed for every candidate, logged always
+    // Microstructure score overlay â€” computed for every candidate, logged always
     const microOverlayConfig: MicrostructureOverlayConfig = {
       ...DEFAULT_MICROSTRUCTURE_OVERLAY_CONFIG,
       ...effectiveConfig.microstructure_overlay,
@@ -1648,7 +1652,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     let microAdj: MicroAdjustmentResult | null = null;
     let microInfluencedSelection = false;
 
-    // Dynamic reward plan — the upstream plan from generateSignal() handles the
+    // Dynamic reward plan â€” the upstream plan from generateSignal() handles the
     // canonical family+regime RR gate. Here we refine it with extension/micro data.
     const dynamicRewardConfig: DynamicRewardConfig = {
       ...DEFAULT_DYNAMIC_REWARD_CONFIG,
@@ -1679,10 +1683,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       // Extract MBO diagnostics from LOB snapshot (all-null when unavailable)
       const mboDiagnostics = extractMboDiagnostics(candidateLobSnap);
 
-      // ── Microstructure score overlay ──────────────────────────────────────
+      // â”€â”€ Microstructure score overlay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       // Computed for every candidate. When enabled, this ACTUALLY adjusts
       // bestSetup.confidence and the downstream confidence/tradeAllowed flags.
-      // This is NOT just telemetry — it enters the decision path.
+      // This is NOT just telemetry â€” it enters the decision path.
       microScore = computeMicrostructureScore(
         candidateLobSnap,
         bestSetup.direction as 'long' | 'short',
@@ -1706,7 +1710,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           const confSkipPattern = /^confidence_[\d.]+_below_threshold_[\d.]+$/;
           const onlyConfidenceBlock = skipReasons.length === 1 && confSkipPattern.test(skipReasons[0] ?? '');
           if (onlyConfidenceBlock && confidence >= effectiveConfig.min_confidence) {
-            // Micro boost promoted this above threshold — allow it
+            // Micro boost promoted this above threshold â€” allow it
             skipReasons.length = 0;
             signal.reason_for_skip = null;
             signal.trade_allowed = true;
@@ -1727,17 +1731,17 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
         console.log(
           `[MICRO] ${bestSetup.direction} ${bestSetup.setup_type} ` +
-          `conf ${baseConf}→${confidence} (${microAdj.reason}) ` +
+          `conf ${baseConf}â†’${confidence} (${microAdj.reason}) ` +
           `[${microScore.setup_family}] ${microScore.reasons.join(', ') || 'neutral'}` +
-          (microInfluencedSelection ? ' ★ INFLUENCED SELECTION' : ''),
+          (microInfluencedSelection ? ' â˜… INFLUENCED SELECTION' : ''),
         );
       }
 
-      // ── Dynamic reward plan: two-stage design ────────────────────────────
+      // â”€â”€ Dynamic reward plan: two-stage design â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       //
       // Stage 1 ("strategy_base"): Built inside generateSignal() per-candidate.
       //   Uses: setup family + market regime. No extension/micro data yet.
-      //   Purpose: canonical upstream RR gate — decides which candidates survive.
+      //   Purpose: canonical upstream RR gate â€” decides which candidates survive.
       //
       // Stage 2 ("runner_refined"): Rebuilt here with full context.
       //   Uses: family + regime + extension features + microstructure score.
@@ -1752,7 +1756,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           extensionFeatures, microScore, dynamicRewardConfig,
         );
       } else if (!rewardPlan) {
-        // Fallback: no upstream plan (dynamic explicitly disabled) — build legacy
+        // Fallback: no upstream plan (dynamic explicitly disabled) â€” build legacy
         rewardPlan = buildLegacyRewardPlan(bestSetup, effectiveConfig, snap);
       }
 
@@ -1764,7 +1768,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         );
       }
 
-      // Log candidate signal to canonical log (ALWAYS — whether taken or not)
+      // Log candidate signal to canonical log (ALWAYS â€” whether taken or not)
       logWriter.writeCandidateSignal({
         _event: 'candidate',
         candidate_id: signalId,
@@ -1787,7 +1791,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         actually_executed: false, // updated below if executed
         // Delta 3: selection vs execution floor split
         selection_only: dualResult.selection_only === true,
-        // execution_allowed_final reflects registry status — if the winner
+        // execution_allowed_final reflects registry status â€” if the winner
         // is a shadow/disabled strategy, it is ALWAYS false regardless of
         // what the strategy layer decided.
         execution_allowed_final: dualResult.execution_allowed_final === true && !_shadowBlocked,
@@ -1805,7 +1809,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         ema_21: snap.indicators_1m.ema_21,
         supertrend_dir: snap.indicators_1m.supertrend_direction,
         alignment_score: bias.alignment_score,
-        // MBO diagnostics (compact — all null when MBO absent)
+        // MBO diagnostics (compact â€” all null when MBO absent)
         ...mboDiagnostics,
         // Microstructure score overlay diagnostics
         micro_score_total: microScore.total,
@@ -1839,9 +1843,9 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         dynamic_rr_stage: (extensionFeatures || microScore) ? 'runner_refined' : 'strategy_base',
       });
 
-      // ── Phase 3: candidate_scores_v2.jsonl (one row per evaluation) ─────
+      // â”€â”€ Phase 3: candidate_scores_v2.jsonl (one row per evaluation) â”€â”€â”€â”€â”€
       // See src/shared/app-version.ts and the plan file for field semantics.
-      // This is the ONLY writeCandidateScoreV2() call — shadow-blocked
+      // This is the ONLY writeCandidateScoreV2() call â€” shadow-blocked
       // winners, extension-vetoed candidates, and executed trades all share
       // this single v2 row, distinguished only by the selected_for_execution
       // and execution_allowed_final booleans.
@@ -1862,10 +1866,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         const layered = chosenCand?.layered;
         const breakdown = chosenCand?.scoreBreakdown;
         const final_live_score = confidence;
-        // Phase 4: structure/timing/payoff are sourced from score-v2 — a
+        // Phase 4: structure/timing/payoff are sourced from score-v2 â€” a
         // dedicated Structure/Timing/Payoff decomposition. Field names
         // match Phase 3 exactly; only the upstream source changed. SHADOW
-        // ONLY — this never touches the live execution path.
+        // ONLY â€” this never touches the live execution path.
         const scoreV2Result = computeScoreV2({
           setup: bestSetup,
           snap,
@@ -1963,7 +1967,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
 
     if (tradeAllowed && !cooldownBlock && !extensionVetoed && !positionManager.hasOpenPosition() && bestSetup) {
-      // ── ML entry confirmation gate (before risk check) ──────────────────
+      // â”€â”€ ML entry confirmation gate (before risk check) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       let entryMlDecision: EntryMlDecision | null = null;
       try {
         if (entryMlConfig.mode !== 'off') {
@@ -2024,7 +2028,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
             signal.no_trade = true;
             console.log(
               `[ENTRY-ML] Rejected (${entryMlDecision.bypass_code}): ` +
-              `${bestSetup.direction} ${bestSetup.setup_type} — ${entryMlDecision.reason}`,
+              `${bestSetup.direction} ${bestSetup.setup_type} â€” ${entryMlDecision.reason}`,
             );
             logWriter.writeCandidateSignal({
               _event: 'ml_rejected',
@@ -2055,7 +2059,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           } else if (entryMlDecision.confirmed) {
             console.log(
               `[ENTRY-ML] Bypass (${entryMlDecision.bypass_code}): ` +
-              `${bestSetup.direction} ${bestSetup.setup_type} — ${entryMlDecision.reason}`,
+              `${bestSetup.direction} ${bestSetup.setup_type} â€” ${entryMlDecision.reason}`,
             );
           }
         } else {
@@ -2106,7 +2110,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
           console.log(
             `[ENTRY-ML] Bypass (${entryMlDecision.bypass_code}): ` +
-            `${bestSetup.direction} ${bestSetup.setup_type} â€” ${entryMlDecision.reason}`,
+            `${bestSetup.direction} ${bestSetup.setup_type} Ã¢â‚¬â€ ${entryMlDecision.reason}`,
           );
         }
       } catch (err) {
@@ -2114,26 +2118,26 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         console.warn(`[ENTRY-ML] Error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
       }
 
-      // ── Phase 7 Stage A telemetry + Stage B hybrid-gate scaffold ───
+      // â”€â”€ Phase 7 Stage A telemetry + Stage B hybrid-gate scaffold â”€â”€â”€
       //
       // Rebuilds `bestSetup.quant_shadow_decision` now that entry_ml
       // has run, so the combined verdict reflects the actual entry_ml
       // outcome instead of the Phase 1-6 stub.
       //
-      // Stage gating (plan §5 Phase 7):
-      //   - `quant_entry.enabled = false` → skip entirely. Logs stay
+      // Stage gating (plan Â§5 Phase 7):
+      //   - `quant_entry.enabled = false` â†’ skip entirely. Logs stay
       //     diff-free versus the post-Phase-6 baseline.
-      //   - `enabled = true, hybrid_gate = false` → telemetry-only.
+      //   - `enabled = true, hybrid_gate = false` â†’ telemetry-only.
       //     The rebuilt decision lands on the candidate, but this
       //     block does NOT touch `signal.no_trade` or
       //     `signal.reason_for_skip`. Legacy entry_ml gating still
       //     runs independently below.
-      //   - `enabled = true, hybrid_gate = true` → Stage B AND-gate.
+      //   - `enabled = true, hybrid_gate = true` â†’ Stage B AND-gate.
       //     Only `combined_verdict = 'pass'` lets execution proceed.
       //     Other verdicts set `signal.no_trade = true` and append
       //     the combined reason to `signal.reason_for_skip`. Legacy
       //     `stop` / `target_*` / `rr_*` / `confidence` fields are
-      //     NEVER rewritten — plan §3 no-overwrite rule.
+      //     NEVER rewritten â€” plan Â§3 no-overwrite rule.
       const quantCfgRunner = resolveQuantEntryConfig(effectiveConfig.quant_entry);
       if (
         quantCfgRunner.enabled &&
@@ -2174,12 +2178,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           noDataContext: noDataCtx,
         });
 
-        // Stage B gate enforcement — dead path unless both flags are true.
+        // Stage B gate enforcement â€” dead path unless both flags are true.
         if (quantCfgRunner.hybrid_gate) {
           const decision = bestSetup.quant_shadow_decision;
           const combined = decision.combined_verdict;
           // Only 'pass' lets execution proceed. 'no_data' is treated
-          // as neutral — explicitly NOT a rejection, per the plan's
+          // as neutral â€” explicitly NOT a rejection, per the plan's
           // "no helpful fallback that silently turns missing bucket
           // tables into live gate behavior" rule.
           if (combined !== 'pass' && combined !== 'no_data') {
@@ -2190,7 +2194,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
             signal.no_trade = true;
             console.log(
               `[QUANT-SHADOW] Stage B reject: ${bestSetup.direction} ` +
-              `${bestSetup.setup_type} — ${reason}`,
+              `${bestSetup.setup_type} â€” ${reason}`,
             );
           }
         }
@@ -2199,16 +2203,16 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       // If ML rejected in confirm_only mode, skip to logging.
       // Shadow-status block is enforced earlier via tradeAllowed (see the
       // _shadowBlocked check right after bestSetup is resolved), so this
-      // code path never runs for a shadow-selected winner — no duplicate
+      // code path never runs for a shadow-selected winner â€” no duplicate
       // candidate event is produced here.
       if (entryMlDecision && !entryMlDecision.confirmed && entryMlConfig.mode === 'confirm_only') {
-        // Entry blocked by ML — falls through to signal logging below
+        // Entry blocked by ML â€” falls through to signal logging below
       } else if (signal.no_trade === true) {
-        // Phase 7 Stage B gate blocked execution — fall through to logging
+        // Phase 7 Stage B gate blocked execution â€” fall through to logging
       } else {
-      // ── Risk check + entry execution ───────────────────────────────────
+      // â”€â”€ Risk check + entry execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       // Pass dynamic min RR from reward plan so the risk manager uses the
-      // same canonical gate as applyHardGates() — no more duplicate fixed checks.
+      // same canonical gate as applyHardGates() â€” no more duplicate fixed checks.
       // Pass current open qty so the risk manager can enforce invariant I2
       // (MAX_NET_POSITION_PER_SYMBOL). Today this is always 0 because the
       // runner already gates on !hasOpenPosition() upstream, but plumbing the
@@ -2229,7 +2233,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         riskManager.logTargetSizingDecision(sizingDetail, bestSetup.direction as 'long' | 'short', contract.root, false);
         signal.reason_for_skip = (signal.reason_for_skip ? signal.reason_for_skip + '; ' : '') + riskBlock;
         signal.no_trade = true;
-        console.log(`[RUNNER] 🚫 Risk check blocked trade: ${riskBlock}`);
+        console.log(`[RUNNER] ðŸš« Risk check blocked trade: ${riskBlock}`);
         logWriter.writeCandidateSignal({
           _event: 'risk_rejected',
           candidate_id: signalId,
@@ -2299,7 +2303,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
             policy_mode: executionIntentPolicyStamp(),
           });
 
-          // ── Resolve management profile for this setup type ─────────────
+          // â”€â”€ Resolve management profile for this setup type â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           // The profile provides trailing, BE, time-stop parameters.
           // PT1/PT2 offsets are unified with the reward plan when available,
           // so entry validation and live management use the same targets.
@@ -2307,7 +2311,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           const mgmtProfile = getManagementProfile(bestSetup.setup_type, regime, effectiveConfig);
           const resolvedMgmt = resolveProfile(mgmtProfile, atrAtEntry, contract);
 
-          // ── Unify PT1/PT2 with reward plan (canonical target truth) ─────
+          // â”€â”€ Unify PT1/PT2 with reward plan (canonical target truth) â”€â”€â”€â”€â”€
           // When the reward plan provides PT offsets, override the resolved
           // management PT1/PT2 so the position manager uses the same values
           // that the RR gate validated. Trail/BE/time-stop stay profile-driven.
@@ -2322,7 +2326,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
                 Math.abs(profilePt2 - rewardPlan.mgmt_pt2_offset_pts) > 0.01) {
               console.log(
                 `[MGMT] PT unified: profile PT1=${profilePt1.toFixed(1)} PT2=${profilePt2.toFixed(1)} ` +
-                `→ reward_plan PT1=${rewardPlan.mgmt_pt1_offset_pts.toFixed(1)} PT2=${rewardPlan.mgmt_pt2_offset_pts.toFixed(1)}`,
+                `â†’ reward_plan PT1=${rewardPlan.mgmt_pt1_offset_pts.toFixed(1)} PT2=${rewardPlan.mgmt_pt2_offset_pts.toFixed(1)}`,
               );
             }
           }
@@ -2389,7 +2393,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
               mgmt_pt2_pts: rewardPlan.mgmt_pt2_offset_pts,
               rr_components: rewardPlan.rr_components,
             } : null,
-            // Unified target diagnostics — confirms entry and management are aligned
+            // Unified target diagnostics â€” confirms entry and management are aligned
             target_truth: {
               source: targetTruthSource,
               live_pt1_offset_pts: resolvedMgmt.pt1_offset_pts,
@@ -2401,7 +2405,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           });
 
           cycleChangeNote = `NEW TRADE: ${bestSetup.direction.toUpperCase()} ${sizing.quantity} ${contract.root} @ ${entryResult.fill_price} | Stop: ${bestSetup.stop} | T1: ${bestSetup.target_1} (${bestSetup.rr_t1}R)`;
-          console.log(`[RUNNER] 🎯 Trade opened: ${tradeId}`);
+          console.log(`[RUNNER] ðŸŽ¯ Trade opened: ${tradeId}`);
           dashboardState.updatePosition(positionManager.getPosition());
           // Seed ML config so dashboard shows "enabled / awaiting" before first inference
           if (mlConfig?.enabled) {
@@ -2411,13 +2415,13 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           } // end if (_sizingApproved)
           } // end executionSideEffectsAllowed
         } catch (entryErr) {
-          console.error(`[RUNNER] ❌ Entry failed, reverting to FLAT:`, entryErr);
+          console.error(`[RUNNER] âŒ Entry failed, reverting to FLAT:`, entryErr);
           phaseManager.transitionTo('FLAT', `entry_failed:${entryErr}`);
         }
       }
       } // end ML confirmation else-block
     } else if (!tradeAllowed && skipReasons.length > 0) {
-      console.log(`[RUNNER] ⏭  No trade: ${skipReasons[0]}`);
+      console.log(`[RUNNER] â­  No trade: ${skipReasons[0]}`);
     }
 
     logWriter.writeSignal(signal);
@@ -2472,11 +2476,11 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       ? (snap.event.is_event_window ? snap.event.suppression_reason : 'clear')
       : 'n/a';
 
-    // ── Dashboard updates ────────────────────────────────────────────────
+    // â”€â”€ Dashboard updates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     dashboardState.updateRisk(riskManager.getState());
     dashboardState.updatePosition(positionManager.getPosition());
     dashboardState.updatePerformance(perfTracker.getStats());
-    // Update session info from snap — use canonical session module (single call)
+    // Update session info from snap â€” use canonical session module (single call)
     if (snap.session) {
       const sess = classifySession();
       const or = snap.key_levels;
@@ -2500,7 +2504,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       effectiveConfig.analysis_interval_seconds * 1000,
     );
 
-    // ─── Delta 6: CUSUM watchdog observation ─────────────────────────────
+    // â”€â”€â”€ Delta 6: CUSUM watchdog observation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Feed the cycle-to-cycle gap into the CUSUM tracker. Edge-triggered
     // stall/recovered events are logged via the main log writer; level
     // state ("still degraded") is only surfaced via the tracker snapshot.
@@ -2510,13 +2514,13 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       for (const event of events) {
         if (event.kind === 'stall') {
           console.warn(
-            `[CYCLE-CUSUM] stall detected — S+=${event.s_plus.toFixed(2)} duration=${event.duration_ms}ms z=${event.z.toFixed(2)}`,
+            `[CYCLE-CUSUM] stall detected â€” S+=${event.s_plus.toFixed(2)} duration=${event.duration_ms}ms z=${event.z.toFixed(2)}`,
           );
         } else if (event.kind === 'recovered') {
-          console.log(`[CYCLE-CUSUM] recovered — S+=${event.s_plus.toFixed(2)}`);
+          console.log(`[CYCLE-CUSUM] recovered â€” S+=${event.s_plus.toFixed(2)}`);
         } else if (event.kind === 'baseline_ready') {
           console.log(
-            `[CYCLE-CUSUM] baseline ready — mean=${event.mean_ms.toFixed(0)}ms std=${event.std_ms.toFixed(0)}ms`,
+            `[CYCLE-CUSUM] baseline ready â€” mean=${event.mean_ms.toFixed(0)}ms std=${event.std_ms.toFixed(0)}ms`,
           );
         }
       }
@@ -2549,7 +2553,161 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
   };
 
-  // ─── V2 Multi-Lane Engine (canonical) ────────────────────────────────────
+  let laneSchedulerRef: LaneScheduler | null = null;
+  const SHUTDOWN_TIMEOUT_MS = 10_000;
+  let shutdownPromise: Promise<void> | null = null;
+  let coordinatedShutdownPromise: Promise<void> | null = null;
+  let shutdownReason = 'user_stopped';
+  let shutdownAckRequested = false;
+  let shutdownAckSent = false;
+  let shutdownExitCode: number | null = null;
+
+  async function gracefulShutdown(reason: string): Promise<void> {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = doShutdown(reason);
+    return shutdownPromise;
+  }
+
+  async function doShutdown(reason: string): Promise<void> {
+    const forceExit = setTimeout(() => {
+      console.error('[SHUTDOWN] Timed out after 10s, forcing exit.');
+      runtimeState.releaseLock();
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref();
+
+    try {
+      console.log('\n[RUNNER] Shutting down...');
+      if (perfCheckpointTimer) { clearInterval(perfCheckpointTimer); perfCheckpointTimer = null; }
+      const finalStats = perfTracker.getStats();
+      engineShuttingDown = true;
+      await sleep(250);
+
+      if (!env.AUTOTRADE_RUNTIME_STATE_HARDENING) {
+        logWriter.flushAll();
+        runtimeState.writeOpenTradeState(positionManager.getPosition());
+        logWriter.updateSessionEnd(sessionId, {
+          timestamp_end: new Date().toISOString(),
+          total_signals: totalSignals,
+          total_trades: finalStats.total_trades,
+          wins: finalStats.wins,
+          losses: finalStats.losses,
+          scratches: finalStats.scratches,
+          total_pnl_usd: finalStats.total_pnl_usd,
+          daily_loss_pct: riskManager.getState().daily_loss_pct,
+          shutdown_reason: reason,
+        });
+        dashboardState.setEngineRunning(false);
+        dashboardServer.stop();
+        runtimeState.markCleanShutdown(reason);
+        perfTracker.printSelfReview();
+        logWriter.destroy();
+      } else {
+        const runStep = async (label: string, action: () => void | Promise<void>): Promise<void> => {
+          try {
+            await action();
+          } catch (err) {
+            console.error(`[SHUTDOWN] ${label} failed:`, err);
+          }
+        };
+
+        await runStep('flush logs', () => {
+          logWriter.flushAll();
+        });
+        await runStep('persist open trade state', () => {
+          runtimeState.writeOpenTradeState(positionManager.getPosition());
+        });
+        await runStep('write session end', () => {
+          logWriter.updateSessionEnd(sessionId, {
+            timestamp_end: new Date().toISOString(),
+            total_signals: totalSignals,
+            total_trades: finalStats.total_trades,
+            wins: finalStats.wins,
+            losses: finalStats.losses,
+            scratches: finalStats.scratches,
+            total_pnl_usd: finalStats.total_pnl_usd,
+            daily_loss_pct: riskManager.getState().daily_loss_pct,
+            shutdown_reason: reason,
+          });
+        });
+        await runStep('mark dashboard stopped', () => {
+          dashboardState.setEngineRunning(false);
+        });
+        await runStep('stop dashboard server', () => dashboardServer.stop());
+        await runStep('persist orderflow buffer', () => {
+          try {
+            persistOrderflowBuffersToDisk(env.LOG_DIR);
+            console.log('[ORDERFLOW] Buffer state persisted to disk for next startup');
+          } catch (err) {
+            console.warn('[ORDERFLOW] Failed to persist buffer state:', err);
+          }
+        });
+        await runStep('mark clean shutdown', () => {
+          runtimeState.markCleanShutdown(reason);
+        });
+        await runStep('print self review', () => {
+          perfTracker.printSelfReview();
+        });
+        await runStep('destroy log writer', () => {
+          logWriter.destroy();
+        });
+      }
+    } catch (err) {
+      console.error('[SHUTDOWN] Error during teardown:', err);
+    } finally {
+      clearTimeout(forceExit);
+      runtimeState.releaseLock();
+    }
+    if (lobClient.contextErrors > 0) {
+      console.warn(`[LOB] Ã¢Å¡Â Ã¯Â¸Â ${lobClient.contextErrors} context management errors during session (trade/signal context start/end failures)`);
+    }
+    console.log('[RUNNER] Ã¢Å“â€¦ Session ended cleanly.');
+  }
+
+  async function requestRunnerShutdown(
+    reason: string,
+    options: {
+      acknowledge?: boolean;
+      exitCode?: number | null;
+    } = {},
+  ): Promise<void> {
+    shutdownReason = reason;
+    if (options.acknowledge) {
+      shutdownAckRequested = true;
+    }
+    if (options.exitCode != null) {
+      shutdownExitCode = shutdownExitCode == null
+        ? options.exitCode
+        : Math.max(shutdownExitCode, options.exitCode);
+    }
+
+    laneSchedulerRef?.stop();
+
+    if (coordinatedShutdownPromise) {
+      return coordinatedShutdownPromise;
+    }
+
+    coordinatedShutdownPromise = (async () => {
+      await gracefulShutdown(reason);
+
+      if (shutdownAckRequested && !shutdownAckSent) {
+        try {
+          await sendRunnerShutdownAck(shutdownReason);
+          shutdownAckSent = true;
+        } catch (error) {
+          console.error('[SHUTDOWN] Failed to send shutdown ack:', error);
+        }
+      }
+
+      if (shutdownExitCode != null) {
+        process.exit(shutdownExitCode);
+      }
+    })();
+
+    return coordinatedShutdownPromise;
+  }
+
+  // â”€â”€â”€ V2 Multi-Lane Engine (canonical) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     const laneTiming = effectiveConfig.lane_timing ?? {};
     const shadowOnly = executionMode === 'shadow';
@@ -2559,14 +2717,11 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     // Track last ML action execution time for cooldown gate
     let v2LastMlActionTimestamp = 0;
 
-    // Forward ref for lane metrics (assigned before scheduler.run(), read in callbacks)
-    let laneSchedulerRef: LaneScheduler | null = null;
-
     console.log(
-      `[RUNNER] ▶️  V2 multi-lane engine ${shadowOnly ? '(SHADOW-ONLY — observation mode)' : '(ACTIVE)'}`,
+      `[RUNNER] â–¶ï¸  V2 multi-lane engine ${shadowOnly ? '(SHADOW-ONLY â€” observation mode)' : '(ACTIVE)'}`,
     );
 
-    // ── Hard Risk Lane (500ms) ────────────────────────────────────────────
+    // â”€â”€ Hard Risk Lane (500ms) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const onHardRisk = async (_cycle: number): Promise<void> => {
       if (!positionManager.hasOpenPosition()) return;
       const pos = positionManager.getPosition();
@@ -2618,7 +2773,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       const staleStopOnly = laneTiming.hard_risk_stale_stop_only_ms ?? 3000;
 
       if (quoteAge > staleStopOnly) {
-        // Too stale — degraded mode, stop-hit defense only
+        // Too stale â€” degraded mode, stop-hit defense only
         if (sharedState.degradedSince === null) {
           sharedState.degradedSince = Date.now();
           console.log(`[HARD-RISK] DEGRADED: no fresh quote for ${quoteAge}ms. Stop-hit only mode. Last price=${price}`);
@@ -2654,7 +2809,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
               source_lane: 'hard_risk',
               timestamp: new Date().toISOString(),
               trade_id: pos.trade_id,
-              // ── v1 live state at this instant ──
+              // â”€â”€ v1 live state at this instant â”€â”€
               v1_stop_current: pos.stop_current,
               v1_stop_initial: pos.stop_initial,
               v1_trailing_active: pos.trailing_active,
@@ -2662,17 +2817,17 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
               v1_pre_t1_be_triggered: pos.pre_t1_be_triggered,
               v1_pt1_done: pos.pt1_done,
               v1_pt2_done: pos.pt2_done,
-              // ── v2 proposed state ──
+              // â”€â”€ v2 proposed state â”€â”€
               v2_proposed_stop: v2ProposedStop,
               v2_would_exit: result.shouldExit,
               v2_exit_reason: result.exitDecision?.reason ?? null,
               v2_would_move_be: result.proposedMutations.moveStopToBE,
               v2_would_activate_trail: result.proposedMutations.activatePreT1Trail,
               v2_proposed_trail_anchor: result.proposedMutations.newTrailAnchor,
-              // ── shared context ──
+              // â”€â”€ shared context â”€â”€
               price,
               quote_age_ms: quoteAge,
-              // ── divergence summary ──
+              // â”€â”€ divergence summary â”€â”€
               divergence_type: exitDisagrees ? 'exit' : 'stop',
               stop_delta: v2ProposedStop !== null ? v2ProposedStop - pos.stop_current : null,
             });
@@ -2767,7 +2922,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       }
     };
 
-    // ── Management Lane (2000ms) ──────────────────────────────────────────
+    // â”€â”€ Management Lane (2000ms) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const onManagement = async (_cycle: number): Promise<void> => {
       if (!positionManager.hasOpenPosition()) return;
       const pos = positionManager.getPosition();
@@ -2776,7 +2931,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       const price = sharedState.lastPrice;
       if (price === null) return; // no quote yet
 
-      // ── Zombie-trade watchdog (ported from V1 onMonitor) ─────────────────
+      // â”€â”€ Zombie-trade watchdog (ported from V1 onMonitor) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       const holdMs = Date.now() - new Date(pos.entry_time_iso).getTime();
       if (holdMs > ZOMBIE_THRESHOLD_MS && Date.now() - lastZombieWarningAt > ZOMBIE_LOG_INTERVAL_MS) {
         lastZombieWarningAt = Date.now();
@@ -2812,7 +2967,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       sharedState.lastMgmtMetrics = mgmtMetrics;
       dashboardState.updateManagement(mgmtMetrics);
 
-      // ── Target-position REDUCE consumer ─────────────────────────────────
+      // â”€â”€ Target-position REDUCE consumer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       // When the target-position layer has requested a partial reduce via
       // management_state === 'REDUCE' with a requested_qty_to_exit, execute
       // it through the same partial-exit path the ML layer uses. EXIT_NOW
@@ -2840,7 +2995,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           const outcome = normalizeExitOutcome(exitResult, qtyToExit);
           if (outcome.accepted) {
             // 1. Apply the partial to local state (updates quantity_remaining).
-            //    IMPORTANT: use outcome.filledQty, NOT qtyToExit — if a future
+            //    IMPORTANT: use outcome.filledQty, NOT qtyToExit â€” if a future
             //    broker adapter returns a partial fill, we must decrement by
             //    what actually filled, not what we asked for.
             try {
@@ -2852,10 +3007,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
                 exitResult.slippage_pts,
                 effectiveConfig,
               );
-              // 2. Notify the engine — starts cooldown, resets persistence counter.
+              // 2. Notify the engine â€” starts cooldown, resets persistence counter.
               managementEngine.notifyReduceApplied();
               console.log(
-                `[TARGET_POS][execute] ✅ REDUCE ${outcome.filledQty} ${contract.root} @ ${outcome.fillPrice ?? price} ` +
+                `[TARGET_POS][execute] âœ… REDUCE ${outcome.filledQty} ${contract.root} @ ${outcome.fillPrice ?? price} ` +
                 `(status=${outcome.status} ${mgmtMetrics.management_state_reason})`,
               );
               dashboardState.updatePosition(positionManager.getPosition());
@@ -2870,15 +3025,15 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
             }
           } else {
             console.log(
-              `[TARGET_POS][execute] 🚫 REDUCE ${qtyToExit} rejected (${outcome.reason ?? 'unknown'})`,
+              `[TARGET_POS][execute] ðŸš« REDUCE ${qtyToExit} rejected (${outcome.reason ?? 'unknown'})`,
             );
           }
         } catch (execErr) {
-          console.error(`[TARGET_POS][execute] ❌ REDUCE failed:`, execErr);
+          console.error(`[TARGET_POS][execute] âŒ REDUCE failed:`, execErr);
         }
       }
 
-      // ── Target-position FLATTEN / DUST-RESIDUAL consumer ────────────────
+      // â”€â”€ Target-position FLATTEN / DUST-RESIDUAL consumer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       // EXIT_NOW driven by target-position (flatten-on-zero-target or
       // dust-residual) routes to the full-exit path. The management-state
       // reason string begins with 'target_position_' so we can disambiguate
@@ -2968,13 +3123,13 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           lastMgmtMetrics = null;
           dashboardState.recordTrade(tradeRecord);
           console.log(
-            `[TARGET_POS][execute] ✅ ${exitReason.toUpperCase()} closed trade_id=${exitPos.trade_id} ` +
+            `[TARGET_POS][execute] âœ… ${exitReason.toUpperCase()} closed trade_id=${exitPos.trade_id} ` +
               `pnl=$${tradeRecord.pnl_realized.toFixed(2)}`,
           );
         }, { isPartial: false, skipIfExitInFlight: true });
       }
 
-      // ML inference — gated by resolved `ml_policy` / legacy `ml_management`.
+      // ML inference â€” gated by resolved `ml_policy` / legacy `ml_management`.
       if (resolvedMlPolicy.inference_enabled && positionManager.hasOpenPosition()) {
         const mlInterval = laneTiming.ml_management_interval_ms ?? 8000;
         const sinceLastMl = Date.now() - sharedState.lastMlCallAt;
@@ -3071,7 +3226,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
             const phaseDecision = decideAction({
               prob_hold_raw: mlDec.prob_hold ?? 1.0,
-              // Release 1: prob_hold_cal is NOT populated — the service does not yet
+              // Release 1: prob_hold_cal is NOT populated â€” the service does not yet
               // return a separate calibrated field. Leave undefined so decideAction()
               // falls back to prob_hold_raw.
               prob_hold_cal: undefined,
@@ -3304,7 +3459,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
                           actionExecuted = true;
                         } else {
                           console.log(
-                            `[ML_EXIT_PARTIAL] 🚫 rejected qty=${qtyToExit} (${outcome.reason ?? 'unknown'})`,
+                            `[ML_EXIT_PARTIAL] ðŸš« rejected qty=${qtyToExit} (${outcome.reason ?? 'unknown'})`,
                           );
                         }
                       }
@@ -3335,7 +3490,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           _type: 'v2_shadow_management',
           timestamp: new Date().toISOString(),
           trade_id: pos.trade_id,
-          exit_eval_skipped: true,     // deliberately skipped — not "evaluated and no exit"
+          exit_eval_skipped: true,     // deliberately skipped â€” not "evaluated and no exit"
           management_state: mgmtMetrics.management_state,
           quote_age_ms: quoteAge,
           price,
@@ -3377,12 +3532,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       dashboardState.flush();
     };
 
-    // ── Context Refresh Lane (5000ms) ─────────────────────────────────────
+    // â”€â”€ Context Refresh Lane (5000ms) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const onContextRefresh = async (_cycle: number): Promise<void> => {
       if (!positionManager.hasOpenPosition()) return;
 
       try {
-        // ── Key-levels recompute: run full collect() instead of lite ──
+        // â”€â”€ Key-levels recompute: run full collect() instead of lite â”€â”€
         // Throttle: at most once per 60s to prevent repeated full-collect loops
         const keyLevelRecomputeMinIntervalMs = 60_000;
         if (sharedState.needsKeyLevelRecompute
@@ -3461,11 +3616,11 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
           });
         }
 
-        // Check if key_levels need refresh — set flag once, log once
+        // Check if key_levels need refresh â€” set flag once, log once
         if (liteSnap.key_levels_age_ms > 120_000 || liteSnap.key_levels_age_ms < 0) {
           if (!sharedState.needsKeyLevelRecompute) {
             sharedState.needsKeyLevelRecompute = true;
-            console.log(`[CTX-REFRESH] Key levels stale (${liteSnap.key_levels_age_ms}ms) — will recompute on next tick`);
+            console.log(`[CTX-REFRESH] Key levels stale (${liteSnap.key_levels_age_ms}ms) â€” will recompute on next tick`);
             sharedState.keyLevelsStaleLogged = true;
           }
         }
@@ -3493,12 +3648,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       const pnlUsd = pnlPts * pos.quantity_remaining * contract.point_value;
       const riskPts = Math.abs(pos.entry_price - pos.stop_initial);
       logWriter.writeTradePathPoint({
-        // ── Row schema ─────────────────────────────────────────────────────
+        // â”€â”€ Row schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         row_type: 'trade_path_point',
         schema_version: 2,
         owner: 'v2',
         source_lane: sourceLane,
-        // ── Core fields ────────────────────────────────────────────────────
+        // â”€â”€ Core fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         timestamp: new Date().toISOString(),
         trade_id: pos.trade_id,
         session_id: sessionId,
@@ -3533,7 +3688,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         pre_t1_trailing_active: pos.pre_t1_trailing_active,
         trail_distance_ticks: pos.trail_distance_ticks,
         atr_at_entry: pos.atr_at_entry,
-        // ── Position progression (Phase 10) ────────────────────────────────
+        // â”€â”€ Position progression (Phase 10) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         stop_initial: pos.stop_initial,
         trail_anchor_price: pos.trail_anchor_price,
         pt1_realized_pnl: pos.pt1_realized_pnl,
@@ -3544,7 +3699,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         mae_at_pt1_trigger: pos.mae_at_pt1_trigger,
         peak_r_before_first_partial: pos.peak_r_before_first_partial,
         management_state: lastMgmtMetrics?.management_state ?? null,
-        // ── ML advisory state ──────────────────────────────────────────────
+        // â”€â”€ ML advisory state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ml_action: lastMlDecision?.action ?? null,
         ml_confidence: lastMlDecision?.confidence ?? null,
         ml_prob_hold: lastMlDecision?.prob_hold ?? null,
@@ -3645,7 +3800,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       }
     };
 
-    // ── Phase-aware interval override ─────────────────────────────────────
+    // â”€â”€ Phase-aware interval override â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const getPhaseInterval = (lane: string): number | null => {
       const sess = classifySession();
       const minsSinceOpen = sess.minutes_since_rth_open ?? -1;
@@ -3663,7 +3818,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       return null;
     };
 
-    // ── Build lane configs ────────────────────────────────────────────────
+    // â”€â”€ Build lane configs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const lanes: LaneConfig[] = [
       {
         name: 'hardRisk',
@@ -3708,7 +3863,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         callback: async (cycle) => {
           // Shadow signal requires full MarketSnapshot (5m/15m/1h data).
           // lastSnap is from the analysis lane and is stale when in-position,
-          // but shadow is advisory-only — tolerate up to 5min staleness.
+          // but shadow is advisory-only â€” tolerate up to 5min staleness.
           const shadowStaleMs = laneTiming.shadow_snap_stale_ms ?? 300_000;
           if (lastSnap && (Date.now() - lastSnap.timestamp_unix < shadowStaleMs)) {
             await runShadowSignal(lastSnap, cycle);
@@ -3729,128 +3884,50 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     });
     laneSchedulerRef = laneScheduler;
 
-    await laneScheduler.run();
-  }
+    const onSigint = (): void => {
+      void requestRunnerShutdown('sigint');
+    };
+    const onSigterm = (): void => {
+      void requestRunnerShutdown('sigterm');
+    };
+    const onMessage = (message: unknown): void => {
+      if (!isRunnerShutdownRequestMessage(message)) return;
+      console.log(`[SHUTDOWN] shutdown_requested source=ipc reason=${message.reason}`);
+      void requestRunnerShutdown(message.reason, { acknowledge: true, exitCode: 0 });
+    };
+    const onUncaughtException = (err: unknown): void => {
+      console.error('[FATAL] Uncaught exception:', err);
+      void requestRunnerShutdown('uncaught_exception', { exitCode: 1 });
+    };
+    const onUnhandledRejection = (err: unknown): void => {
+      console.error('[FATAL] Unhandled rejection:', err);
+      void requestRunnerShutdown('unhandled_rejection', { exitCode: 1 });
+    };
 
-  // ── Ordered shutdown (explicit drains, not sleep-based) ─────────────────
-  const SHUTDOWN_TIMEOUT_MS = 10_000;
-  let shutdownPromise: Promise<void> | null = null;
-
-  async function gracefulShutdown(reason: string): Promise<void> {
-    if (shutdownPromise) return shutdownPromise;
-    shutdownPromise = doShutdown(reason);
-    return shutdownPromise;
-  }
-
-  async function doShutdown(reason: string): Promise<void> {
-    const forceExit = setTimeout(() => {
-      console.error('[SHUTDOWN] Timed out after 10s, forcing exit.');
-      runtimeState.releaseLock();
-      process.exit(1);
-    }, SHUTDOWN_TIMEOUT_MS);
-    forceExit.unref();
+    process.once('SIGINT', onSigint);
+    process.once('SIGTERM', onSigterm);
+    process.on('message', onMessage);
+    process.once('uncaughtException', onUncaughtException);
+    process.once('unhandledRejection', onUnhandledRejection);
 
     try {
-      console.log('\n[RUNNER] Shutting down...');
-      if (perfCheckpointTimer) { clearInterval(perfCheckpointTimer); perfCheckpointTimer = null; }
-      const finalStats = perfTracker.getStats();
-      engineShuttingDown = true;
-      await sleep(250);
-
-      if (!env.AUTOTRADE_RUNTIME_STATE_HARDENING) {
-        logWriter.flushAll();
-        runtimeState.writeOpenTradeState(positionManager.getPosition());
-        logWriter.updateSessionEnd(sessionId, {
-          timestamp_end: new Date().toISOString(),
-          total_signals: totalSignals,
-          total_trades: finalStats.total_trades,
-          wins: finalStats.wins,
-          losses: finalStats.losses,
-          scratches: finalStats.scratches,
-          total_pnl_usd: finalStats.total_pnl_usd,
-          daily_loss_pct: riskManager.getState().daily_loss_pct,
-          shutdown_reason: reason,
-        });
-        dashboardState.setEngineRunning(false);
-        dashboardServer.stop();
-        runtimeState.markCleanShutdown(reason);
-        perfTracker.printSelfReview();
-        logWriter.destroy();
-      } else {
-        const runStep = async (label: string, action: () => void | Promise<void>): Promise<void> => {
-          try {
-            await action();
-          } catch (err) {
-            console.error(`[SHUTDOWN] ${label} failed:`, err);
-          }
-        };
-
-        await runStep('flush logs', () => {
-          logWriter.flushAll();
-        });
-        await runStep('persist open trade state', () => {
-          runtimeState.writeOpenTradeState(positionManager.getPosition());
-        });
-        await runStep('write session end', () => {
-          logWriter.updateSessionEnd(sessionId, {
-            timestamp_end: new Date().toISOString(),
-            total_signals: totalSignals,
-            total_trades: finalStats.total_trades,
-            wins: finalStats.wins,
-            losses: finalStats.losses,
-            scratches: finalStats.scratches,
-            total_pnl_usd: finalStats.total_pnl_usd,
-            daily_loss_pct: riskManager.getState().daily_loss_pct,
-            shutdown_reason: reason,
-          });
-        });
-        await runStep('mark dashboard stopped', () => {
-          dashboardState.setEngineRunning(false);
-        });
-        await runStep('stop dashboard server', () => dashboardServer.stop());
-        await runStep('persist orderflow buffer', () => {
-          try {
-            persistOrderflowBuffersToDisk(env.LOG_DIR);
-            console.log('[ORDERFLOW] Buffer state persisted to disk for next startup');
-          } catch (err) {
-            console.warn('[ORDERFLOW] Failed to persist buffer state:', err);
-          }
-        });
-        await runStep('mark clean shutdown', () => {
-          runtimeState.markCleanShutdown(reason);
-        });
-        await runStep('print self review', () => {
-          perfTracker.printSelfReview();
-        });
-        await runStep('destroy log writer', () => {
-          logWriter.destroy();
-        });
-      }
-    } catch (err) {
-      console.error('[SHUTDOWN] Error during teardown:', err);
+      await laneScheduler.run();
     } finally {
-      clearTimeout(forceExit);
-      runtimeState.releaseLock();                                       // 11. ALWAYS last
+      process.off('SIGINT', onSigint);
+      process.off('SIGTERM', onSigterm);
+      process.off('message', onMessage);
+      process.off('uncaughtException', onUncaughtException);
+      process.off('unhandledRejection', onUnhandledRejection);
     }
-    if (lobClient.contextErrors > 0) {
-      console.warn(`[LOB] ⚠️ ${lobClient.contextErrors} context management errors during session (trade/signal context start/end failures)`);
-    }
-    console.log('[RUNNER] ✅ Session ended cleanly.');
   }
 
-  // Register gracefulShutdown on fatal paths (SIGINT/SIGTERM handled by scheduler)
-  process.once('uncaughtException', (err) => {
-    console.error('[FATAL] Uncaught exception:', err);
-    gracefulShutdown('uncaught_exception').finally(() => process.exit(1));
-  });
-  process.once('unhandledRejection', (err) => {
-    console.error('[FATAL] Unhandled rejection:', err);
-    gracefulShutdown('unhandled_rejection').finally(() => process.exit(1));
-  });
+  // â”€â”€ Ordered shutdown (explicit drains, not sleep-based) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  if (coordinatedShutdownPromise) {
+    await coordinatedShutdownPromise;
+    return;
+  }
 
-  // Normal shutdown: scheduler's SIGINT/SIGTERM handler stops the loop,
-  // then control falls through to gracefulShutdown here.
-  await gracefulShutdown('user_stopped');
+  await gracefulShutdown(shutdownReason);
 }
 
 async function main(): Promise<void> {
@@ -3876,10 +3953,51 @@ async function main(): Promise<void> {
   });
 
   let shutdownStarted = false;
-  const shutdown = async (reason: string): Promise<void> => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    await orchestrator.shutdown(reason);
+  let coordinatedShutdownPromise: Promise<void> | null = null;
+  let shutdownAckRequested = false;
+  let shutdownAckSent = false;
+  let shutdownExitCode: number | null = null;
+  const shutdown = async (
+    reason: string,
+    options: {
+      acknowledge?: boolean;
+      exitCode?: number | null;
+    } = {},
+  ): Promise<void> => {
+    if (options.acknowledge) {
+      shutdownAckRequested = true;
+    }
+    if (options.exitCode != null) {
+      shutdownExitCode = shutdownExitCode == null
+        ? options.exitCode
+        : Math.max(shutdownExitCode, options.exitCode);
+    }
+
+    if (coordinatedShutdownPromise) {
+      return coordinatedShutdownPromise;
+    }
+
+    coordinatedShutdownPromise = (async () => {
+      if (!shutdownStarted) {
+        shutdownStarted = true;
+        await orchestrator.shutdown(reason);
+      }
+
+      if (shutdownAckRequested && !shutdownAckSent) {
+        try {
+          await sendRunnerShutdownAck(reason);
+          shutdownAckSent = true;
+        } catch (error) {
+          console.error('[SHUTDOWN] Failed to send top-level shutdown ack:', error);
+        }
+      }
+
+      if (shutdownExitCode != null) {
+        process.exit(shutdownExitCode);
+      }
+    })();
+
+    return coordinatedShutdownPromise;
   };
 
   const onSigint = (): void => {
@@ -3888,9 +4006,15 @@ async function main(): Promise<void> {
   const onSigterm = (): void => {
     void shutdown('sigterm');
   };
+  const onMessage = (message: unknown): void => {
+    if (!isRunnerShutdownRequestMessage(message)) return;
+    console.log(`[SHUTDOWN] top_level_shutdown_requested source=ipc reason=${message.reason}`);
+    void shutdown(message.reason, { acknowledge: true, exitCode: 0 });
+  };
 
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigterm);
+  process.on('message', onMessage);
 
   try {
     await orchestrator.initialize();
@@ -3899,6 +4023,7 @@ async function main(): Promise<void> {
   } finally {
     process.off('SIGINT', onSigint);
     process.off('SIGTERM', onSigterm);
+    process.off('message', onMessage);
     await shutdown('orchestrator_complete');
   }
 }
