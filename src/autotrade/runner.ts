@@ -52,10 +52,12 @@ import { PositionManager } from './position-manager.js';
 import { getManagementProfile, resolveProfile } from './management-profiles.js';
 import {
   LogWriter,
+  formatCandidateScoreV2StatusLine,
   registerScalperLogWriter,
   setScalperRejectionSampleRate,
   registerScalperDashboardObserver,
 } from './log-writer.js';
+import { writeCandidateScoreV2Telemetry } from './candidate-score-v2.js';
 import { registerScalperGeneratorOptions } from './strategies/lob-mbo-scalp.js';
 import { loadScalperExpectancyTable } from './features/scalper-expectancy-loader.js';
 import {
@@ -1891,10 +1893,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       // this single v2 row, distinguished only by the selected_for_execution
       // and execution_allowed_final booleans.
       {
-        const chosenDir = bestSetup.direction;
-        const chosenCand = chosenDir === 'long' ? bestLong : bestShort;
-        const barMs = Date.parse(snap.timestamp_iso);
-        const replayKey = `${Number.isFinite(barMs) ? barMs : 0}:${bestSetup.setup_type}:${chosenDir}:0`;
+        const chosenCand = bestSetup.direction === 'long' ? bestLong : bestShort;
         const veto_flags: string[] = [];
         if (extensionVetoed) veto_flags.push(...extensionVetoReasons.map((r) => `extension:${r}`));
         if (chosenCand && !chosenCand.passedHardGates) {
@@ -1904,83 +1903,31 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         const reason_codes: string[] = [];
         if (dualResult.decision_reason_primary) reason_codes.push(dualResult.decision_reason_primary);
         if (chosenCand?.rejection_reason_primary) reason_codes.push(chosenCand.rejection_reason_primary);
-        const layered = chosenCand?.layered;
-        const breakdown = chosenCand?.scoreBreakdown;
-        const final_live_score = confidence;
-        // Phase 4: structure/timing/payoff are sourced from score-v2 â€” a
-        // dedicated Structure/Timing/Payoff decomposition. Field names
-        // match Phase 3 exactly; only the upstream source changed. SHADOW
-        // ONLY â€” this never touches the live execution path.
-        const scoreV2Result = computeScoreV2({
-          setup: bestSetup,
+        writeCandidateScoreV2Telemetry({
+          logWriter,
+          signalId,
+          sessionId,
+          symbol: instrumentSymbol,
           snap,
           bias,
           regime,
-          scoringWeights: DEFAULT_SCORING_WEIGHTS,
+          bestSetup,
+          chosenCandidate: chosenCand,
           indicatorConfig: effectiveConfig,
+          scoringWeights: DEFAULT_SCORING_WEIGHTS,
           extension: extensionFeatures,
           microstructure: microScore,
           lob: candidateLobSnap,
           rewardPlan: rewardPlan ?? null,
-        });
-        const structure_score = scoreV2Result.structure;
-        const timing_score = scoreV2Result.timing;
-        const payoff_score = scoreV2Result.payoff;
-        // Phase 4: final_rank_100 is re-sourced from score-v2.composite.
-        const final_rank_100 = scoreV2Result.rank_100;
-        logWriter.writeCandidateScoreV2({
-          candidate_scores_schema_version: 'v2',
-          // identity
-          candidate_id: signalId,
-          candidate_replay_key: replayKey,
-          app_version: APP_VERSION,
-          build_sha: APP_BUILD_SHA,
-          config_hash: CONFIG_HASH_SHORT,
-          session_id: sessionId,
-          strategy_id: bestSetup.setup_type,
-          direction: chosenDir,
-          regime,
-          timestamp: snap.timestamp_iso,
-          symbol: instrumentSymbol,
-          // live decision
-          selected_for_execution: true, // bestSetup is the winner by definition
-          execution_allowed_final: (dualResult.execution_allowed_final === true) && !_shadowBlocked,
-          shadow_reason: _shadowReason,
-          registry_effective_status: _shadowEffStatus,
-          hard_gate_pass: chosenCand?.passedHardGates ?? false,
-          veto_flags,
-          reason_codes,
-          // legacy scoring (unchanged, what lives today)
-          raw_flat_score: breakdown?.total ?? final_live_score,
-          flat_score_components: breakdown ?? null,
-          final_live_score,
-          // shadow decomposition (Phase 3 placeholders, Phase 4 replaces them)
-          structure_score,
-          timing_score,
-          payoff_score,
-          layered_shadow_score: layered?.final_rank ?? null,
-          // Phase 4 provenance: flags that structure/timing/payoff were
-          // sourced from score-v2 rather than the Phase 3 placeholders.
-          score_v2_source: 'score_v2',
-          score_v2_composite: scoreV2Result.composite,
-          score_v2_components: scoreV2Result.components,
-          microstructure_overlay: microScore
-            ? {
-                total: microScore.total,
-                directional: microScore.directional,
-                imbalance: microScore.imbalance,
-                absorption: microScore.absorption,
-                queue: microScore.queue,
-                sweep: microScore.sweep,
-                profile: microScore.profile,
-              }
-            : null,
-          // dynamic RR
-          dynamic_rr_value: rewardPlan?.dynamic_min_rr ?? null,
-          dynamic_rr_gate_pass: rewardPlan?.rr_gate_pass ?? null,
-          dynamic_rr_components: rewardPlan?.rr_components ?? null,
-          // display rank (reporting only)
-          final_rank_100,
+          appVersion: APP_VERSION,
+          buildSha: APP_BUILD_SHA,
+          configHash: CONFIG_HASH_SHORT,
+          selectedForExecution: true,
+          executionAllowedFinal: (dualResult.execution_allowed_final === true) && !_shadowBlocked,
+          shadowReason: _shadowReason,
+          registryEffectiveStatus: _shadowEffStatus,
+          vetoFlags: veto_flags,
+          reasonCodes: reason_codes,
         });
       }
 
@@ -2643,6 +2590,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         runtimeState.markCleanShutdown(reason);
         perfTracker.printSelfReview();
         logWriter.destroy();
+        console.log(formatCandidateScoreV2StatusLine(logWriter.getCandidateScoreV2Status()));
       } else {
         const runStep = async (label: string, action: () => void | Promise<void>): Promise<void> => {
           try {
@@ -2692,6 +2640,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         await runStep('destroy log writer', () => {
           logWriter.destroy();
         });
+        console.log(formatCandidateScoreV2StatusLine(logWriter.getCandidateScoreV2Status()));
       }
     } catch (err) {
       console.error('[SHUTDOWN] Error during teardown:', err);

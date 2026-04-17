@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs';
+import { appendFileSync, mkdirSync, existsSync, statSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
 import type {
   Signal,
@@ -12,8 +12,31 @@ import type { ExecutionIntentRecord } from './execution-intent-types.js';
 
 const LOG_CONTRACT_V2 = 'contract_v2' as const;
 
+export type CandidateScoreV2FileState =
+  | 'never_opened'
+  | 'opened_empty'
+  | 'written_successfully';
+
+export interface CandidateScoreV2FileStatus {
+  path: string;
+  state: CandidateScoreV2FileState;
+  file_exists: boolean;
+  file_size_bytes: number;
+  buffered_rows: number;
+  flushed_rows: number;
+}
+
 function withLogContract<T extends object>(record: T): T & { log_contract: typeof LOG_CONTRACT_V2 } {
   return { ...record, log_contract: LOG_CONTRACT_V2 };
+}
+
+export function formatCandidateScoreV2StatusLine(status: CandidateScoreV2FileStatus): string {
+  return (
+    `[CANDIDATE_SCORE_V2] state=${status.state} ` +
+    `buffered_rows=${status.buffered_rows} flushed_rows=${status.flushed_rows} ` +
+    `file_exists=${status.file_exists} file_size_bytes=${status.file_size_bytes} ` +
+    `path=${status.path}`
+  );
 }
 
 export class LogWriter {
@@ -29,12 +52,16 @@ export class LogWriter {
   private readonly laneMetricsPath: string;
   private readonly executionIntentsPath: string;
   private readonly lobMboScalpCandidatesPath: string;
+  private readonly candidateScoresV2Path: string;
 
   /** Monotonic sequence counter for all records in trade_path.jsonl. */
   private tradePathSeq = 0;
 
   /** Optional callback invoked when appendLineImmediate (critical-path write) fails. */
   private onCriticalDiskError?: (filePath: string, err: unknown) => void;
+  private candidateScoreV2BufferedRows = 0;
+  private candidateScoreV2FlushedRows = 0;
+  private candidateScoreV2Opened = false;
 
   constructor(logDir: string) {
     this.logDir = logDir;
@@ -52,6 +79,7 @@ export class LogWriter {
     this.laneMetricsPath = join(logDir, 'lane_metrics.jsonl');
     this.executionIntentsPath = join(logDir, 'execution_intents.jsonl');
     this.lobMboScalpCandidatesPath = join(logDir, 'lob_mbo_scalp_candidates.jsonl');
+    this.candidateScoresV2Path = join(logDir, 'candidate_scores_v2.jsonl');
   }
 
   /** Register a callback for critical-path disk write failures (trade fills, execution intents). */
@@ -212,7 +240,30 @@ export class LogWriter {
    * `candidate_replay_key` that is deterministic across replays.
    */
   writeCandidateScoreV2(record: unknown): void {
-    this.appendLine(join(this.logDir, 'candidate_scores_v2.jsonl'), record);
+    this.touchCandidateScoreV2File();
+    this.candidateScoreV2BufferedRows++;
+    this.appendLine(this.candidateScoresV2Path, record);
+  }
+
+  getCandidateScoreV2Status(): CandidateScoreV2FileStatus {
+    const fileExists = existsSync(this.candidateScoresV2Path);
+    const fileSizeBytes = fileExists ? statSync(this.candidateScoresV2Path).size : 0;
+    let state: CandidateScoreV2FileState;
+    if (!this.candidateScoreV2Opened && !fileExists) {
+      state = 'never_opened';
+    } else if (fileSizeBytes > 0) {
+      state = 'written_successfully';
+    } else {
+      state = 'opened_empty';
+    }
+    return {
+      path: this.candidateScoresV2Path,
+      state,
+      file_exists: fileExists,
+      file_size_bytes: fileSizeBytes,
+      buffered_rows: this.candidateScoreV2BufferedRows,
+      flushed_rows: this.candidateScoreV2FlushedRows,
+    };
   }
 
   // ── Buffered write infrastructure ─────────────────────────────────────────
@@ -271,6 +322,9 @@ export class LogWriter {
     if (!buf || buf.length === 0) return;
     try {
       appendFileSync(filePath, buf.join(''), 'utf8');
+      if (filePath === this.candidateScoresV2Path) {
+        this.candidateScoreV2FlushedRows += buf.length;
+      }
       this.writeBuffers.set(filePath, []);
     } catch (err) {
       console.error(`[LOG] Flush failed for ${filePath}:`, err);
@@ -291,6 +345,16 @@ export class LogWriter {
       this.flushTimer = null;
     }
     this.flushAll();
+  }
+
+  private touchCandidateScoreV2File(): void {
+    if (this.candidateScoreV2Opened) return;
+    try {
+      appendFileSync(this.candidateScoresV2Path, '', 'utf8');
+      this.candidateScoreV2Opened = true;
+    } catch (err) {
+      console.error(`[LOG] Failed to open ${this.candidateScoresV2Path}:`, err);
+    }
   }
 }
 

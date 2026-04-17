@@ -31,14 +31,17 @@ import {
   type ExitTrigger,
   type EntryFillResult,
 } from './fills.js';
-import { generateSignal } from '../strategy.js';
+import { DEFAULT_SCORING_WEIGHTS, generateSignal } from '../strategy.js';
 import { RiskManager } from '../risk.js';
-import { LogWriter } from '../log-writer.js';
+import { formatCandidateScoreV2StatusLine, LogWriter } from '../log-writer.js';
 import { IndicatorConfigManager } from '../indicator-config-manager.js';
 import { PerformanceTracker } from '../performance-tracker.js';
 import { getContractSpec, roundToTick, ticksToPrice } from '../contracts.js';
 import { EventCalendar } from '../events.js';
 import { exportSignalDataset, exportTradeDataset } from './dataset-export.js';
+import { computeExtensionFeatures } from '../features/extension.js';
+import { writeCandidateScoreV2Telemetry } from '../candidate-score-v2.js';
+import { APP_BUILD_SHA, APP_VERSION, computeConfigHash } from '../../shared/app-version.js';
 
 import type { Signal, TradeRecord, SessionRecord, MarketRegime, SessionState, ExitLeg } from '../types.js';
 import { computeExitReasonDetailed, isStoppedOut } from '../exit-labeling.js';
@@ -166,10 +169,12 @@ export async function runHistoricalReplay(cfg: HistoricalConfig): Promise<Histor
   // ── Wire up strategy components ──
   const configMgr = new IndicatorConfigManager('./config');
   const effectiveConfig = { ...configMgr.getConfig() };
+  const configHashShort = computeConfigHash().short;
   const riskManager = new RiskManager(effectiveConfig, contract);
   const events = EventCalendar.load('./config', { historical: true });
   const sessionId = `HIST_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${randomUUID().slice(0, 8)}`;
   const logWriter = new LogWriter(cfg.output_dir);
+  logWriter.startFlushTimer();
   const perfTracker = new PerformanceTracker(sessionId, logWriter, effectiveConfig.account_equity);
 
   const session: SessionRecord = {
@@ -559,7 +564,7 @@ export async function runHistoricalReplay(cfg: HistoricalConfig): Promise<Histor
       }
 
       const dualResult = generateSignal(snap, effectiveConfig, contract);
-      const { regime, bias, bestSetup, confidence, tradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, scoreMargin: dualMargin } = dualResult;
+      const { regime, bias, bestSetup, confidence, tradeAllowed, skipReasons, mlFeatures, decision: dualDecision, bestLong, bestShort, chosen, scoreMargin: dualMargin } = dualResult;
       totalSignals++;
       const signalId = `HSIG_${sessionId}_${String(totalSignals).padStart(6, '0')}`;
 
@@ -622,6 +627,50 @@ export async function runHistoricalReplay(cfg: HistoricalConfig): Promise<Histor
         }
       }
 
+      if (bestSetup) {
+        const entryMid = (bestSetup.entry_low + bestSetup.entry_high) / 2;
+        const chosenCand = chosen ?? (bestSetup.direction === 'long' ? bestLong : bestShort);
+        const vetoFlags: string[] = [];
+        if (cooldownBlock) vetoFlags.push(cooldownBlock);
+        if (chosenCand && !chosenCand.passedHardGates) {
+          vetoFlags.push(...chosenCand.hardGateFailures.map((failure) => `hard_gate:${failure}`));
+        }
+        const reasonCodes: string[] = [];
+        if (dualResult.decision_reason_primary) reasonCodes.push(dualResult.decision_reason_primary);
+        if (chosenCand?.rejection_reason_primary) reasonCodes.push(chosenCand.rejection_reason_primary);
+        writeCandidateScoreV2Telemetry({
+          logWriter,
+          signalId,
+          sessionId,
+          symbol: cfg.symbol,
+          snap,
+          bias,
+          regime,
+          bestSetup,
+          chosenCandidate: chosenCand,
+          indicatorConfig: effectiveConfig,
+          scoringWeights: DEFAULT_SCORING_WEIGHTS,
+          extension: computeExtensionFeatures(
+            snap,
+            entryMid,
+            bestSetup.direction as 'long' | 'short',
+            effectiveConfig.normalization,
+          ),
+          microstructure: null,
+          lob: null,
+          rewardPlan: chosenCand?.rewardPlan ?? null,
+          appVersion: APP_VERSION,
+          buildSha: APP_BUILD_SHA,
+          configHash: configHashShort,
+          selectedForExecution: true,
+          executionAllowedFinal: tradeAllowed && !cooldownBlock,
+          shadowReason: cooldownBlock,
+          registryEffectiveStatus: tradeAllowed && !cooldownBlock ? 'active' : 'selection_only',
+          vetoFlags,
+          reasonCodes,
+        });
+      }
+
       if (tradeAllowed && !cooldownBlock && bestSetup) {
         signal.execution_occurred = true;
         signal.no_trade = false;
@@ -677,6 +726,8 @@ export async function runHistoricalReplay(cfg: HistoricalConfig): Promise<Histor
     shutdown_reason: 'replay_complete',
   });
   perfTracker.printSelfReview();
+  logWriter.destroy();
+  console.log(formatCandidateScoreV2StatusLine(logWriter.getCandidateScoreV2Status()));
 
   // ── Dataset exports ──
   const outSignalCsv = join(cfg.output_dir, `historical_signal_dataset_${sessionId}.csv`);
