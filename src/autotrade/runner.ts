@@ -1398,8 +1398,15 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     const analysisStartMs = Date.now();
     const analysisLaneTimer = new LaneSegmentTimer();
     const targetAnalysisIntervalMs = effectiveConfig.analysis_interval_seconds * 1000;
-    const finalizeAnalysisTiming = (phase: string): void => {
-      analysisLaneTimer.mark('dashboard_update');
+    let analysisTimingPhase = 'aborted';
+    const finalizeAnalysisTiming = (
+      phase: string,
+      options?: { markDashboardUpdate?: boolean },
+    ): void => {
+      if (analysisLaneTimer.finalized) return;
+      if (options?.markDashboardUpdate) {
+        analysisLaneTimer.mark('dashboard_update');
+      }
       const segmentSnapshot = analysisLaneTimer.finalize();
       dashboardState.updateAnalysisTiming(
         segmentSnapshot.duration_ms,
@@ -1431,6 +1438,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       }
     };
 
+    try {
     const currentDay = new Date().getUTCDate();
     if (currentDay !== lastResetDay) {
       console.log('[RUNNER] ðŸ”„ New UTC day â€” resetting daily risk counters');
@@ -1439,6 +1447,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
 
     if (riskManager.isLocked()) {
+      analysisTimingPhase = 'risk_locked';
       const lockReason = riskManager.getLockReason();
       console.log(`[RUNNER] ðŸ”’ Risk locked (${lockReason}). Monitoring only.`);
       return;
@@ -1446,6 +1455,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
 
     const healthy = await quickHealthCheck();
     if (!healthy) {
+      analysisTimingPhase = 'health_check_failed';
       console.error('[RUNNER] âš ï¸  TradingView health check failed. Skipping cycle.');
       return;
     }
@@ -1455,6 +1465,7 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     try {
       snap = await dataCollector.collect(instrumentSymbol);
     } catch (err) {
+      analysisTimingPhase = 'data_collect_failed';
       console.error('[RUNNER] âŒ Data collection failed:', err);
       return;
     }
@@ -1507,9 +1518,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
         lastCooldownActive = false;
       } else {
         analysisLaneTimer.mark('phase_gate');
+        analysisTimingPhase = 'cooldown';
         dashboardState.updateEnginePhase(phaseManager.snapshot());
         dashboardState.incrementCycle();
-        finalizeAnalysisTiming('cooldown');
+        finalizeAnalysisTiming('cooldown', { markDashboardUpdate: true });
         dashboardState.flush();
         return;
       }
@@ -1593,11 +1605,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       }
       // Dashboard updates for MANAGING phase
       analysisLaneTimer.mark('manage_only');
+      analysisTimingPhase = 'managing';
       dashboardState.updateRisk(riskManager.getState());
       dashboardState.updatePosition(positionManager.getPosition());
       dashboardState.updatePerformance(perfTracker.getStats());
       dashboardState.updateEnginePhase(phaseManager.snapshot());
-      finalizeAnalysisTiming('managing');
+      finalizeAnalysisTiming('managing', { markDashboardUpdate: true });
       dashboardState.flush();
       return; // Do NOT fall through to generateSignal() â€” no entry analysis in MANAGING
     }
@@ -2526,7 +2539,8 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     }
 
     // Track analysis timing for freshness metadata
-    finalizeAnalysisTiming('flat');
+    analysisTimingPhase = 'flat';
+    finalizeAnalysisTiming('flat', { markDashboardUpdate: true });
 
     // â”€â”€â”€ Delta 6: CUSUM watchdog observation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Feed the cycle-to-cycle gap into the CUSUM tracker. Edge-triggered
@@ -2572,6 +2586,12 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       configVersion: effectiveConfig.version,
       changeNote: cycleChangeNote,
     });
+    } catch (err) {
+      analysisTimingPhase = 'error';
+      throw err;
+    } finally {
+      finalizeAnalysisTiming(analysisTimingPhase);
+    }
     } finally {
       runtimeState.updateCycleComplete();
     }

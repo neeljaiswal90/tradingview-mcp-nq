@@ -24,6 +24,7 @@ export class LaneSegmentTimer {
     }
     const now = Date.now();
     const delta = now - this.lastMarkAt;
+    // Duplicate labels accumulate so callers can bracket the same phase more than once.
     this.segments[label] = (this.segments[label] ?? 0) + delta;
     this.lastMarkAt = now;
   }

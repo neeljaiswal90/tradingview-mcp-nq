@@ -43,4 +43,17 @@ describe('LaneSegmentTimer', () => {
 
     vi.useRealTimers();
   });
+
+  it('throws when mark is called after finalize', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-17T12:00:00Z'));
+
+    const timer = new LaneSegmentTimer();
+    vi.advanceTimersByTime(20);
+    timer.finalize();
+
+    expect(() => timer.mark('late')).toThrow(/called after finalize/);
+
+    vi.useRealTimers();
+  });
 });
