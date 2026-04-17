@@ -394,6 +394,20 @@ async def bookmap_ingest(ws: WebSocket):
             state.ask_size = msg["ask_sz"]
             state.last_bbo_ts = ts
             state.update_count += 1
+            # Persist the exact top-of-book stream used by the offline
+            # scalper readiness labeler. Without this file, shadow sessions
+            # produce unpairable candidate logs that cannot be labeled later.
+            append_jsonl(
+                "lob_top_of_book.jsonl",
+                {
+                    "ts_ms": ts_ms,
+                    "bid": state.bid,
+                    "ask": state.ask,
+                    "bid_sz": state.bid_size,
+                    "ask_sz": state.ask_size,
+                    "source_alias": state.source_alias,
+                },
+            )
             now_fresh = state.is_fresh
             if was_fresh != now_fresh:
                 state._prev_is_fresh = now_fresh
