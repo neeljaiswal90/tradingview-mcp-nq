@@ -3455,6 +3455,31 @@ export function generateSignal(
   }
 
   const tradeAllowed = skipReasons.length === 0 && bestSetup !== null;
+  const rejectionsBySetup: Record<string, string[]> = {};
+  const rejectionCounts = new Map<string, number>();
+  let countRejectionsThisCycle = 0;
+  for (const diag of generatorDiagnostics) {
+    if (diag.rejection_reason_all.length > 0) {
+      rejectionsBySetup[diag.setup_type] = [...diag.rejection_reason_all];
+    }
+    if (!diag.accepted) {
+      countRejectionsThisCycle += 1;
+    }
+    if (diag.rejection_reason_primary) {
+      rejectionCounts.set(
+        diag.rejection_reason_primary,
+        (rejectionCounts.get(diag.rejection_reason_primary) ?? 0) + 1,
+      );
+    }
+  }
+  let topRejectionReason: string | null = null;
+  let topRejectionCount = -1;
+  for (const [reasonKey, count] of rejectionCounts.entries()) {
+    if (count > topRejectionCount) {
+      topRejectionReason = reasonKey;
+      topRejectionCount = count;
+    }
+  }
 
   // ── Step 5: ML features ──────────────────────────────────────────────────
   const mlFeatures = buildMlFeatures(snap, bias, regime, bestSetup, chosen);
@@ -3477,6 +3502,10 @@ export function generateSignal(
     selection_only: selectionOnly,
     execution_allowed_final: executionAllowedFinal,
     decision_reason_primary: decisionReasonPrimary ?? null,
+    rejections_by_setup: rejectionsBySetup,
+    top_rejection_reason: topRejectionReason,
+    count_rejections_this_cycle: countRejectionsThisCycle,
+    candidate_diagnostics: generatorDiagnostics,
     dynamicRrUpstreamActive: drpConfig !== null,
     dynamicRrSource: drpSource,
   };

@@ -28,6 +28,7 @@
     "historical:replay": "node dist/autotrade/historical/cli.js --config config/historical-config.json",
     "analysis:scalper-shadow-health": "node scripts/analysis/check-scalper-shadow-health.mjs",
     "analysis:scalper-rollout-gate": "node scripts/analysis/check-scalper-rollout-gate.mjs",
+    "analysis:scalper-candidate-capture": "node scripts/analysis/check-scalper-candidate-capture.mjs",
     "analysis:scalper-label": "node scripts/run-lob-mbo-forward-labeler.mjs",
     "analysis:scalper-build-expectancy": "node scripts/build-scalper-expectancy-bucket-table.mjs",
     "analysis:scalper-build-dataset": "python scripts/ml/build_lob_mbo_scalp_dataset.py",

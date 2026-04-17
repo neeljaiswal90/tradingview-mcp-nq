@@ -1657,6 +1657,24 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     lastAlignmentScore = bias.alignment_score;
     lastConfidence = confidence;
     lastSignal = dualResult;
+    const scalperDiagnostics = dualResult.candidate_diagnostics?.filter(
+      (diag) => diag.setup_family === 'lob_mbo_scalp',
+    ) ?? [];
+    if (
+      scalperDiagnostics.length > 0 &&
+      scalperDiagnostics.every((diag) => diag.accepted === false) &&
+      cycleNumber % 10 === 1
+    ) {
+      const blockerCounts = new Map<string, number>();
+      for (const diag of scalperDiagnostics) {
+        const blocker = diag.rejection_reason_primary ?? 'unknown';
+        blockerCounts.set(blocker, (blockerCounts.get(blocker) ?? 0) + 1);
+      }
+      const blockerSummary = [...blockerCounts.entries()]
+        .map(([reasonKey, count]) => `${reasonKey}:${count}`)
+        .join(',');
+      console.warn(`[SCALPER-DIAG] candidate_generation_blocked reasons=${blockerSummary}`);
+    }
     dashboardState.updateRegime(regime);
     dashboardState.updateDirectionalSignal(dualResult);
     dashboardState.updateConfidenceTiming();
@@ -1696,6 +1714,10 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
       execution_occurred: false,
       no_trade: !tradeAllowed || positionManager.hasOpenPosition(),
       near_miss_filters_failed: nearMissFilters,
+      candidate_diagnostics: dualResult.candidate_diagnostics,
+      rejections_by_setup: dualResult.rejections_by_setup,
+      top_rejection_reason: dualResult.top_rejection_reason,
+      count_rejections_this_cycle: dualResult.count_rejections_this_cycle,
       ml_features: mlFeatures,
       outcome_label: null,
       config_type: effectiveConfig.type,

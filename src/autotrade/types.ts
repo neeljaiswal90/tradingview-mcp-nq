@@ -1248,6 +1248,7 @@ export interface Signal {
   rejections_by_setup?: Record<string, string[]>;
   top_rejection_reason?: string | null;
   count_rejections_this_cycle?: number;
+  candidate_diagnostics?: CandidateGeneratorDiagnostic[];
   score_pre_context?: number | null;
   score_post_context?: number | null;
   vwap_soft_penalty?: number | null;
