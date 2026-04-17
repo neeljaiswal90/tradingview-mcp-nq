@@ -50,7 +50,9 @@ describe('Quote authority / fallback', () => {
   });
 
   it('failover reason is logged', () => {
-    expect(runnerSource).toContain('failover_reason');
+    const marketDataSource = readFileSync('src/autotrade/market-data-source.ts', 'utf8');
+    expect(marketDataSource).toContain('fallback_reason');
+    expect(marketDataSource).toContain('market_data_source_selected');
   });
 });
 

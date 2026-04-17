@@ -25,6 +25,9 @@ export interface LobHealthResult {
   active_signal_id: string | null;
   recording_context: string;
   uptime_sec: number;
+  source_alias?: string | null;
+  source_symbol_root?: string | null;
+  feed_provider?: string | null;
 }
 
 /**

@@ -46,6 +46,7 @@ from lob_features.microstructure import (
 )
 
 NQ_TICK_SIZE = 0.25
+SUPPORTED_ROOTS = ("MNQ", "MES", "NQ", "ES")
 
 # ─── JSONL Writer ─────────────────────────────────────────────────────────────
 
@@ -150,6 +151,7 @@ class SidecarState:
         self.update_count: int = 0
         self.trade_count: int = 0
         self.last_heartbeat_ts: float = 0.0
+        self.source_alias: Optional[str] = None
 
         # Rolling buffers (shared computation module)
         self.trade_buf = RollingTradeBuffer(max_window_sec=60.0)
@@ -223,6 +225,16 @@ class SidecarState:
         if self.trade_end_ts and (time.time() - self.trade_end_ts) < 30:
             return "post_exit"
         return "session"
+
+    @property
+    def source_symbol_root(self) -> Optional[str]:
+        if not self.source_alias:
+            return None
+        alias_upper = self.source_alias.upper()
+        for root in SUPPORTED_ROOTS:
+            if alias_upper.startswith(root):
+                return root
+        return None
 
     def compute_snapshot(self) -> LobFeatureSnapshot:
         return compute_lob_features(
@@ -369,6 +381,9 @@ async def bookmap_ingest(ws: WebSocket):
         msg_type = msg.get("type")
         ts_ms = msg.get("ts", int(time.time() * 1000))
         ts = ts_ms / 1000.0
+        alias = msg.get("alias")
+        if isinstance(alias, str) and alias.strip():
+            state.source_alias = alias.strip()
 
         if msg_type == "bbo":
             # Detect freshness transitions for cache invalidation
@@ -498,6 +513,9 @@ class HealthResponse(BaseModel):
     active_signal_id: Optional[str]
     recording_context: str
     uptime_sec: float
+    source_alias: Optional[str]
+    source_symbol_root: Optional[str]
+    feed_provider: str
 
 
 @app.get("/lob/health", response_model=HealthResponse)
@@ -520,6 +538,9 @@ def lob_health():
         active_signal_id=state.active_signal_id,
         recording_context=state.recording_context,
         uptime_sec=round(time.time() - START_TIME, 1),
+        source_alias=state.source_alias,
+        source_symbol_root=state.source_symbol_root,
+        feed_provider="bookmap_rithmic",
     )
 
 

@@ -29,6 +29,13 @@ import * as tvPane from '../core/tradingview/pane.js';
 import { tvUiLock } from '../core/tradingview/tv-ui-lock.js';
 import { QuoteService, BookmapQuoteProvider } from './quote-service.js';
 import { LobClient } from './lob-client.js';
+import {
+  formatMarketDataDetailLine,
+  formatMarketDataStartupFailure,
+  formatMarketDataStartupLine,
+  resolveMarketDataConfig,
+  resolveMarketDataStartupSelection,
+} from './market-data-source.js';
 
 import { loadEnv, printEnv } from './env.js';
 import type { AutotradeEnv } from './env.js';
@@ -770,24 +777,58 @@ async function runLegacySingleInstrumentRunner(options: LegacyRunnerOptions = {}
     effectiveConfig.quote_poll_timeout_ms ?? 1_000,
   );
 
-  // â”€â”€ Bookmap/Rithmic BBO provider (primary quote authority when available) â”€â”€
+  // Bookmap/LOB startup source selection.
   const lobServiceUrl = process.env['LOB_SERVICE_URL'] ?? 'http://127.0.0.1:5010';
   const lobClient = new LobClient(lobServiceUrl, 800);
+  const marketDataConfig = resolveMarketDataConfig(effectiveConfig.market_data);
+  const startupLobClient = new LobClient(
+    lobServiceUrl,
+    marketDataConfig.lob_health_timeout_ms,
+  );
   const bookmapProvider = new BookmapQuoteProvider(
     lobClient,
     effectiveConfig.max_quote_age_ms_for_management ?? 3_000,
   );
-  quoteService.addProvider(bookmapProvider);
+  const marketDataSelection = await resolveMarketDataStartupSelection({
+    client: startupLobClient,
+    instrument: contract.root,
+    configuredLobUrl: lobServiceUrl,
+    expectedSymbolRoot: contract.root,
+    config: marketDataConfig,
+  });
+  console.log(formatMarketDataStartupLine(marketDataSelection));
+  console.log(formatMarketDataDetailLine(marketDataSelection));
+  try {
+    if (!existsSync(env.LOG_DIR)) mkdirSync(env.LOG_DIR, { recursive: true });
+    writeFileSync(
+      join(env.LOG_DIR, 'startup_market_data_health.json'),
+      JSON.stringify({
+        generated_at: new Date().toISOString(),
+        instrument: contract.root,
+        configured_lob_url: lobServiceUrl,
+        market_data: marketDataConfig,
+        selection: marketDataSelection,
+      }, null, 2),
+      'utf8',
+    );
+  } catch (err) {
+    console.warn(`[MARKET-DATA] Failed to write startup market-data health: ${(err as Error).message}`);
+  }
 
-  // Check LOB sidecar at startup (including MBO capability)
-  let lobHealth: Awaited<ReturnType<typeof lobClient.getHealth>> | null = null;
-  try { lobHealth = await lobClient.getHealth(); } catch { /* sidecar not running */ }
-  const lobHealthy = lobHealth?.status === 'ok' && lobHealth.source_connected && lobHealth.bbo_fresh;
-  if (lobHealthy) {
-    console.log(`[LOB] Bookmap/Rithmic sidecar connected at ${lobServiceUrl} â€” primary quote authority`);
-    console.log(formatMboStatusLine(lobHealth));
+  if (marketDataSelection.startup_action === 'use_bookmap') {
+    quoteService.clearProviders();
+    quoteService.addProvider(bookmapProvider);
+    console.log(`[LOB] Bookmap/Rithmic sidecar healthy at ${lobServiceUrl} â€” using Bookmap quote authority`);
+    if (marketDataSelection.lob_health.health_payload) {
+      console.log(formatMboStatusLine(marketDataSelection.lob_health.health_payload));
+    }
+  } else if (marketDataSelection.startup_action === 'fallback_to_tradingview') {
+    console.log(
+      `[LOB] Bookmap/Rithmic sidecar not healthy at ${lobServiceUrl} â€” using TradingView fallback ` +
+      `(reason=${marketDataSelection.fallback_reason ?? 'unknown'})`,
+    );
   } else {
-    console.log(`[LOB] Bookmap/Rithmic sidecar not available at ${lobServiceUrl} â€” using TradingView fallback`);
+    throw new Error(formatMarketDataStartupFailure(marketDataSelection));
   }
 
   const managementEngine = new ManagementDecisionEngine(

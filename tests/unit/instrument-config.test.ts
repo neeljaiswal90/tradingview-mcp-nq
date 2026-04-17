@@ -31,6 +31,9 @@ describe('multi-instrument config resolution', () => {
             layered_scoring: {
               enabled: true,
             },
+            market_data: {
+              fallback_to_tradingview_on_unhealthy_lob: false,
+            },
           },
         },
         MES: {
@@ -49,6 +52,8 @@ describe('multi-instrument config resolution', () => {
 
     expect(mnq?.effectiveConfig.layered_scoring?.enabled).toBe(true);
     expect(mnq?.effectiveConfig.layered_scoring?.shadow_log).toBe(true);
+    expect(mnq?.effectiveConfig.market_data?.fallback_to_tradingview_on_unhealthy_lob).toBe(false);
+    expect(mes?.effectiveConfig.market_data?.fallback_to_tradingview_on_unhealthy_lob).toBe(true);
     expect(mes?.effectiveConfig.execution_mode).toBe('shadow');
     expect(mnq?.effectiveConfig.execution_mode).toBe('paper');
     expect(mnq?.paneIndex).toBe(0);

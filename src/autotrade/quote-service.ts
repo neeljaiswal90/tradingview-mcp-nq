@@ -1,14 +1,14 @@
 /**
- * QuoteService — multi-source quote aggregator for the in-position monitor loop.
+ * QuoteService — quote provider chain for the in-position monitor loop.
  *
- * Quote priority chain (first healthy source wins):
- *   1. Bookmap/Rithmic BBO (via LOB bridge sidecar) — primary authority
- *   2. TradingView live DOM header price — migration fallback
- *   3. TradingView bar close — stale fallback
- *   4. Defensive fallback (lastSnap.price) — last resort
+ * The runner decides which providers to register at startup. In the default
+ * legacy path that is usually TradingView only; when a Bookmap sidecar is
+ * selected it can register Bookmap as the sole quote authority for the
+ * session. The chain below simply tries registered providers in priority
+ * order and returns the first fresh quote.
  *
- * The priority chain is traversed top-to-bottom. Each provider either returns
- * a fresh quote or throws/returns null, causing the next provider to be tried.
+ * Each provider either returns a fresh quote or throws/returns null, causing
+ * the next provider to be tried.
  * Failover reasons are logged for every tick.
  */
 
@@ -167,6 +167,10 @@ export class QuoteService {
     this.providers.push(provider);
     this.providers.sort((a, b) => a.priority - b.priority);
     console.log(`[QUOTE] Provider registered: ${provider.name} (priority=${provider.priority})`);
+  }
+
+  clearProviders(): void {
+    this.providers.length = 0;
   }
 
   /**
